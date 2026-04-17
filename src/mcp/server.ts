@@ -18,6 +18,7 @@ import {
   getVectorSearchAvailability,
   vectorSearchWiki,
 } from "./vector-search.js"
+import { resolveProjectDiscoveryRoot } from "./project-discovery.js"
 
 const DEFAULT_WORKSPACE_ROOT = process.env.LLM_WIKI_ROOT
   ? path.resolve(process.env.LLM_WIKI_ROOT)
@@ -48,16 +49,16 @@ const CONTEXT_SCHEMA = z.object({
 
 const server = new McpServer({
   name: "llm-wiki-mcp-server",
-  version: "0.3.1",
+  version: "0.3.2",
 })
 
 server.registerTool(
   "llm_wiki_list_projects",
   {
     title: "List LLM Wiki Projects",
-    description: "Discover LLM Wiki projects under a workspace root. Use this first when you do not know which project_path to pass to other tools.",
+    description: "Discover LLM Wiki projects under a workspace root. Leave root_path unset unless the user explicitly asks to scan a different directory.",
     inputSchema: {
-      root_path: z.string().optional().describe("Workspace root to scan. Defaults to the LLM_WIKI_ROOT env var or the current working directory."),
+      root_path: z.string().optional().describe("Optional override directory to scan. Leave unset to use LLM_WIKI_ROOT. Only pass this when the user explicitly wants a different root."),
     },
     outputSchema: {
       workspaceRoot: z.string(),
@@ -74,8 +75,8 @@ server.registerTool(
     },
   },
   async ({ root_path }) => {
-    const workspaceRoot = path.resolve(root_path ?? DEFAULT_WORKSPACE_ROOT)
-    const projects = await listWikiProjects(workspaceRoot)
+    const discovery = await resolveProjectDiscoveryRoot(root_path, DEFAULT_WORKSPACE_ROOT)
+    const { workspaceRoot, projects, fallbackUsed } = discovery
     const structuredContent = { workspaceRoot, projects }
 
     if (projects.length === 0) {
@@ -92,6 +93,9 @@ server.registerTool(
       content: [{
         type: "text",
         text: [
+          ...(fallbackUsed
+            ? [`No projects were found under ${path.resolve(root_path!)}. Falling back to LLM_WIKI_ROOT: ${workspaceRoot}.`]
+            : []),
           `Found ${projects.length} LLM Wiki project(s) under ${workspaceRoot}:`,
           ...projects.map((project) => `- ${project.name}: ${project.path}`),
         ].join("\n"),
