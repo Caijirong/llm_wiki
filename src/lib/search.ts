@@ -1,74 +1,17 @@
 import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
+import {
+  type RetrievalSearchResult,
+  getEffectiveTokens,
+  makeSearchResultFromContent,
+} from "@/lib/retrieval-core"
+export { tokenizeQuery } from "@/lib/retrieval-text"
 
-export interface SearchResult {
-  path: string
-  title: string
-  snippet: string
-  titleMatch: boolean
-  score: number
-}
+export type SearchResult = RetrievalSearchResult
 
 const MAX_RESULTS = 20
-const SNIPPET_CONTEXT = 80
 const TITLE_MATCH_BONUS = 10
-
-const STOP_WORDS = new Set([
-  "的", "是", "了", "什么", "在", "有", "和", "与", "对", "从",
-  "the", "is", "a", "an", "what", "how", "are", "was", "were",
-  "do", "does", "did", "be", "been", "being", "have", "has", "had",
-  "it", "its", "in", "on", "at", "to", "for", "of", "with", "by",
-  "this", "that", "these", "those",
-])
-
-export function tokenizeQuery(query: string): string[] {
-  // Split by whitespace and punctuation
-  const rawTokens = query
-    .toLowerCase()
-    .split(/[\s,，。！？、；：""''（）()\-_/\\·~～…]+/)
-    .filter((t) => t.length > 1)
-    .filter((t) => !STOP_WORDS.has(t))
-
-  const tokens: string[] = []
-
-  for (const token of rawTokens) {
-    // Check if token contains CJK characters
-    const hasCJK = /[\u4e00-\u9fff\u3400-\u4dbf]/.test(token)
-
-    if (hasCJK && token.length > 2) {
-      // For CJK text: split into individual characters AND overlapping bigrams
-      // "默会知识" → ["默会", "会知", "知识", "默", "会", "知", "识"]
-      const chars = [...token]
-      // Add bigrams (most useful for Chinese)
-      for (let i = 0; i < chars.length - 1; i++) {
-        tokens.push(chars[i] + chars[i + 1])
-      }
-      // Also add individual chars (for single-char matches)
-      for (const ch of chars) {
-        if (!STOP_WORDS.has(ch)) {
-          tokens.push(ch)
-        }
-      }
-      // Keep the original token too (for exact phrase match)
-      tokens.push(token)
-    } else {
-      tokens.push(token)
-    }
-  }
-
-  // Deduplicate
-  return [...new Set(tokens)]
-}
-
-function tokenMatchScore(text: string, tokens: readonly string[]): number {
-  const lower = text.toLowerCase()
-  let score = 0
-  for (const token of tokens) {
-    if (lower.includes(token)) score += 1
-  }
-  return score
-}
 
 function flattenMdFiles(nodes: FileNode[]): FileNode[] {
   const files: FileNode[] = []
@@ -82,33 +25,6 @@ function flattenMdFiles(nodes: FileNode[]): FileNode[] {
   return files
 }
 
-function extractTitle(content: string, fileName: string): string {
-  // Try YAML frontmatter title
-  const frontmatterMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
-  if (frontmatterMatch) return frontmatterMatch[1].trim()
-
-  // Try first heading
-  const headingMatch = content.match(/^#\s+(.+)$/m)
-  if (headingMatch) return headingMatch[1].trim()
-
-  // Fall back to filename
-  return fileName.replace(/\.md$/, "").replace(/-/g, " ")
-}
-
-function buildSnippet(content: string, query: string): string {
-  const lower = content.toLowerCase()
-  const lowerQuery = query.toLowerCase()
-  const idx = lower.indexOf(lowerQuery)
-  if (idx === -1) return content.slice(0, SNIPPET_CONTEXT * 2).replace(/\n/g, " ")
-
-  const start = Math.max(0, idx - SNIPPET_CONTEXT)
-  const end = Math.min(content.length, idx + query.length + SNIPPET_CONTEXT)
-  let snippet = content.slice(start, end).replace(/\n/g, " ")
-  if (start > 0) snippet = "..." + snippet
-  if (end < content.length) snippet = snippet + "..."
-  return snippet
-}
-
 export async function searchWiki(
   projectPath: string,
   query: string,
@@ -116,9 +32,7 @@ export async function searchWiki(
   if (!query.trim()) return []
   const pp = normalizePath(projectPath)
 
-  const tokens = tokenizeQuery(query)
-  // Fallback: if all tokens were filtered out, use the trimmed query as a single token
-  const effectiveTokens = tokens.length > 0 ? tokens : [query.trim().toLowerCase()]
+  const effectiveTokens = getEffectiveTokens(query)
   const results: SearchResult[] = []
 
   // Search wiki pages
@@ -180,14 +94,16 @@ export async function searchWiki(
             if (existingPaths.has(tryPath)) break
             try {
               const content = await readFile(tryPath)
-              const title = extractTitle(content, `${vr.id}.md`)
-              results.push({
-                path: tryPath,
-                title,
-                snippet: buildSnippet(content, query),
-                titleMatch: false,
-                score: vr.score * 5,
-              })
+              const built = makeSearchResultFromContent(
+                tryPath,
+                `${vr.id}.md`,
+                content,
+                effectiveTokens,
+                query,
+                TITLE_MATCH_BONUS,
+              )
+              if (!built) break
+              results.push({ ...built, titleMatch: false, score: vr.score * 5 })
               existingPaths.add(tryPath)
               added++
               break
@@ -228,30 +144,15 @@ async function searchFiles(
     } catch {
       continue
     }
-
-    const title = extractTitle(content, file.name)
-    const titleText = `${title} ${file.name}`
-
-    const titleScore = tokenMatchScore(titleText, tokens)
-    const contentScore = tokenMatchScore(content, tokens)
-
-    if (titleScore === 0 && contentScore === 0) continue
-
-    const isTitleMatch = titleScore > 0
-    const score = contentScore + (isTitleMatch ? TITLE_MATCH_BONUS : 0)
-
-    const firstMatchingToken = tokens.find((t) =>
-      content.toLowerCase().includes(t),
-    ) ?? query
-    const snippet = buildSnippet(content, firstMatchingToken)
-
-    results.push({
-      path: file.path,
-      title,
-      snippet,
-      titleMatch: isTitleMatch,
-      score,
-    })
+    const built = makeSearchResultFromContent(
+      file.path,
+      file.name,
+      content,
+      tokens,
+      query,
+      TITLE_MATCH_BONUS,
+    )
+    if (built) results.push(built)
   }
 }
 
