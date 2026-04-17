@@ -392,11 +392,17 @@ npm run tauri build    # Production build
 
 ### MCP Server for External Agents
 
-Build and launch the local stdio MCP server:
+For local development in this repo, build and launch the stdio MCP server:
 
 ```bash
 npm install
 npm run mcp
+```
+
+After publishing the MCP package, external agents can connect through:
+
+```bash
+npx -y @haowan36/llm-wiki-mcp
 ```
 
 By default the server uses `LLM_WIKI_ROOT` if set, otherwise the current working directory. It exposes four read-only tools:
@@ -408,7 +414,7 @@ By default the server uses `LLM_WIKI_ROOT` if set, otherwise the current working
 Example:
 
 ```bash
-LLM_WIKI_ROOT=/absolute/path/to/workspace npm run mcp
+LLM_WIKI_ROOT=/absolute/path/to/workspace npx -y @haowan36/llm-wiki-mcp
 ```
 
 For semantic or hybrid retrieval, also set embedding config so the server can embed the query and search the existing LanceDB index under `.llm-wiki/lancedb`:
@@ -418,7 +424,7 @@ LLM_WIKI_ROOT=/absolute/path/to/workspace \
 LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
 LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
 LLM_WIKI_EMBEDDING_API_KEY=optional-key \
-npm run mcp
+npx -y @haowan36/llm-wiki-mcp
 ```
 
 `llm_wiki_search` and `llm_wiki_get_context` support `mode: "keyword" | "semantic" | "hybrid"`. `hybrid` is the recommended default. If embedding config is missing, hybrid falls back to keyword-only retrieval.

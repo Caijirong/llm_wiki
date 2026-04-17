@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rootDir": "../../src",
+    "outDir": "./dist",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": [
+    "../../src/mcp/**/*.ts",
+    "../../src/lib/wiki-query.ts",
+    "../../src/lib/retrieval-core.ts",
+    "../../src/lib/retrieval-graph-core.ts",
+    "../../src/lib/retrieval-text.ts",
+    "../../src/lib/path-utils.ts",
+    "../../src/types/wiki.ts"
+  ]
+}

@@ -392,11 +392,17 @@ npm run tauri build    # 生产构建
 
 ### 给外部 Agent 用的 MCP Server
 
-构建并启动本地 stdio MCP 服务：
+仓库内本地开发时，构建并启动 stdio MCP 服务：
 
 ```bash
 npm install
 npm run mcp
+```
+
+发布 npm 包后，外部 Agent 可直接通过：
+
+```bash
+npx -y @haowan36/llm-wiki-mcp
 ```
 
 默认优先使用环境变量 `LLM_WIKI_ROOT`，否则使用当前工作目录。当前暴露 4 个只读工具：
@@ -408,7 +414,7 @@ npm run mcp
 示例：
 
 ```bash
-LLM_WIKI_ROOT=/absolute/path/to/workspace npm run mcp
+LLM_WIKI_ROOT=/absolute/path/to/workspace npx -y @haowan36/llm-wiki-mcp
 ```
 
 如果你要启用语义检索或混合检索，还需要提供 embedding 配置。服务会把 query 转成 embedding，并查询 `.llm-wiki/lancedb` 下已有的向量索引：
@@ -418,7 +424,7 @@ LLM_WIKI_ROOT=/absolute/path/to/workspace \
 LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
 LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
 LLM_WIKI_EMBEDDING_API_KEY=optional-key \
-npm run mcp
+npx -y @haowan36/llm-wiki-mcp
 ```
 
 `llm_wiki_search` 和 `llm_wiki_get_context` 支持 `mode: "keyword" | "semantic" | "hybrid"`。推荐默认使用 `hybrid`。如果没有 embedding 配置，`hybrid` 会自动降级为纯关键词检索。

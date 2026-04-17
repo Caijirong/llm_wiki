@@ -3,11 +3,14 @@
   "private": true,
   "version": "0.3.1",
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && npm run build:mcp",
-    "build:mcp": "tsc -p tsconfig.mcp.json",
-    "mcp": "npm run build:mcp && node dist/mcp/mcp/server.js",
+    "build:mcp": "npm run build --workspace @haowan36/llm-wiki-mcp",
+    "mcp": "npm run build:mcp && npm run start --workspace @haowan36/llm-wiki-mcp",
     "preview": "vite preview",
     "test": "vitest run",
     "tauri": "tauri"
