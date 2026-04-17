@@ -37,7 +37,7 @@ async function createWikiProject(root: string): Promise<void> {
       'title: "Alpha Entity"',
       "---",
       "# Alpha Entity",
-      "Alpha explains semantic retrieval for external agents.",
+      "Alpha explains semantic retrieval for external agents and links to [[beta]].",
     ].join("\n"),
   )
   await writeText(
@@ -166,8 +166,9 @@ describe("buildWikiContext", () => {
     expect(context.purpose).toContain("Answer from the wiki")
     expect(context.schema).toContain("Rules")
     expect(context.index).toContain("[[alpha]]")
-    expect(context.pages).toHaveLength(2)
+    expect(context.pages.length).toBeGreaterThanOrEqual(2)
     expect(context.pages[0]?.title).toBe("Alpha Entity")
+    expect(context.pages.some((page) => page.title === "Beta Concept")).toBe(true)
   })
 
   it("uses hybrid mode when requested and includes semantically retrieved pages", async () => {
@@ -180,5 +181,14 @@ describe("buildWikiContext", () => {
     })
 
     expect(context.pages.some((page) => page.title === "Beta Concept")).toBe(true)
+  })
+
+  it("includes graph-expanded wiki pages in the context bundle", async () => {
+    const projectRoot = await makeTempDir()
+    await createWikiProject(projectRoot)
+
+    const context = await buildWikiContext(projectRoot, "alpha retrieval", 3)
+
+    expect(context.pages.map((page) => page.title)).toContain("Beta Concept")
   })
 })

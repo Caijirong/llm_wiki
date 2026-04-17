@@ -1,18 +1,25 @@
 import path from "node:path"
 import { readdir, readFile, stat } from "node:fs/promises"
+import type { FileNode } from "../types/wiki.js"
+import {
+  buildRetrievalContextBundle,
+  getEffectiveTokens,
+  makeSearchResultFromContent,
+  type RetrievalSearchResult,
+} from "./retrieval-core.js"
+import { buildSnippet, extractTitle } from "./retrieval-text.js"
+import {
+  buildRetrievalGraphWithAdapter,
+  getRelatedNodes,
+} from "./retrieval-graph-core.js"
 
 export interface WikiProjectInfo {
   name: string
   path: string
 }
 
-export interface WikiSearchResult {
-  path: string
+export interface WikiSearchResult extends RetrievalSearchResult {
   relativePath: string
-  title: string
-  snippet: string
-  titleMatch: boolean
-  score: number
 }
 
 export interface VectorSearchResult {
@@ -45,16 +52,8 @@ export interface WikiContextBundle {
 }
 
 const MAX_RESULTS = 20
-const SNIPPET_CONTEXT = 80
 const TITLE_MATCH_BONUS = 10
 const DEFAULT_DISCOVERY_DEPTH = 5
-const STOP_WORDS = new Set([
-  "的", "是", "了", "什么", "在", "有", "和", "与", "对", "从",
-  "the", "is", "a", "an", "what", "how", "are", "was", "were",
-  "do", "does", "did", "be", "been", "being", "have", "has", "had",
-  "it", "its", "in", "on", "at", "to", "for", "of", "with", "by",
-  "this", "that", "these", "those",
-])
 
 const SKIP_DIRECTORIES = new Set([
   ".git",
@@ -66,41 +65,7 @@ const SKIP_DIRECTORIES = new Set([
   "target",
 ])
 
-export function tokenizeQuery(query: string): string[] {
-  const rawTokens = query
-    .toLowerCase()
-    .split(/[\s,，。！？、；：""''（）()\-_/\\·~～…]+/)
-    .filter((token) => token.length > 1)
-    .filter((token) => !STOP_WORDS.has(token))
-
-  const tokens: string[] = []
-
-  for (const token of rawTokens) {
-    const hasCjk = /[\u4e00-\u9fff\u3400-\u4dbf]/.test(token)
-
-    if (hasCjk && token.length > 2) {
-      const chars = [...token]
-      for (let window = 2; window <= Math.min(chars.length, 4); window += 1) {
-        for (let i = 0; i <= chars.length - window; i += 1) {
-          const ngram = chars.slice(i, i + window).join("")
-          if (!STOP_WORDS.has(ngram)) {
-            tokens.push(ngram)
-          }
-        }
-      }
-      for (const ch of chars) {
-        if (!STOP_WORDS.has(ch)) {
-          tokens.push(ch)
-        }
-      }
-      continue
-    }
-
-    tokens.push(token)
-  }
-
-  return [...new Set(tokens)]
-}
+export { tokenizeQuery } from "./retrieval-text.js"
 
 export async function isWikiProject(projectPath: string): Promise<boolean> {
   const requiredPaths = [
@@ -158,29 +123,24 @@ export async function searchWikiFiles(
 
   const wikiRoot = path.join(projectPath, "wiki")
   const files = await getMarkdownFiles(wikiRoot)
-  const tokens = tokenizeQuery(query)
-  const effectiveTokens = tokens.length > 0 ? tokens : [query.trim().toLowerCase()]
+  const effectiveTokens = getEffectiveTokens(query)
   const results: WikiSearchResult[] = []
 
   for (const filePath of files) {
     const content = await readFile(filePath, "utf8")
-    const title = extractTitle(content, path.basename(filePath))
-    const titleScore = tokenMatchScore(`${title} ${path.basename(filePath)}`, effectiveTokens)
-    const contentScore = tokenMatchScore(content, effectiveTokens)
-
-    if (titleScore === 0 && contentScore === 0) continue
-
-    const firstMatchingToken = effectiveTokens.find((token) =>
-      content.toLowerCase().includes(token),
-    ) ?? query
+    const built = makeSearchResultFromContent(
+      filePath,
+      path.basename(filePath),
+      content,
+      effectiveTokens,
+      query,
+      TITLE_MATCH_BONUS,
+    )
+    if (!built) continue
 
     results.push({
-      path: filePath,
+      ...built,
       relativePath: path.relative(wikiRoot, filePath),
-      title,
-      snippet: buildSnippet(content, firstMatchingToken),
-      titleMatch: titleScore > 0,
-      score: contentScore + (titleScore > 0 ? TITLE_MATCH_BONUS : 0),
     })
   }
 
@@ -249,16 +209,60 @@ export async function buildWikiContext(
     }),
   ])
 
-  const pages = await Promise.all(
-    results.map((result) => readWikiPage(projectPath, result.relativePath)),
+  const graph = await buildRetrievalGraphWithAdapter(
+    path.join(projectPath, "wiki"),
+    {
+      listDirectory: async (dirPath) => listFileTree(dirPath),
+      readText: async (filePath) => readTextIfExists(filePath),
+    },
   )
+
+  const expandedIds = new Set<string>()
+  const searchHitPaths = new Set(results.map((result) => result.path))
+  const graphExpansions: Array<{ title: string; path: string; relevance: number }> = []
+
+  for (const result of results) {
+    const nodeId = path.basename(result.path).replace(/\.md$/, "")
+    const related = getRelatedNodes(nodeId, graph, 3)
+    for (const { node, relevance } of related) {
+      if (relevance < 2.0) continue
+      if (searchHitPaths.has(node.path)) continue
+      if (expandedIds.has(node.id)) continue
+      expandedIds.add(node.id)
+      graphExpansions.push({
+        title: node.title,
+        path: node.path,
+        relevance,
+      })
+    }
+  }
+
+  graphExpansions.sort((a, b) => b.relevance - a.relevance)
+
+  const bundle = await buildRetrievalContextBundle({
+    projectPath,
+    query,
+    maxContextSize: 204800,
+    index,
+    purpose,
+    searchResults: results,
+    graphExpansions,
+    overviewPath: path.join(projectPath, "wiki", "overview.md"),
+    readText: async (filePath) => readTextIfExists(filePath),
+  })
 
   return {
     projectPath,
-    purpose,
+    purpose: bundle.purpose,
     schema,
-    index,
-    pages: pages.filter((page) => page.exists),
+    index: bundle.index,
+    pages: bundle.pages.map((page) => ({
+      exists: true,
+      path: path.join(projectPath, page.path),
+      relativePath: page.path.replace(/^wiki\//, ""),
+      title: page.title,
+      content: page.content,
+    })),
   }
 }
 
@@ -301,48 +305,8 @@ async function mergeSearchResults(
     .slice(0, limit)
 }
 
-function buildSnippet(content: string, query: string): string {
-  const lower = content.toLowerCase()
-  const lowerQuery = query.toLowerCase()
-  const index = lower.indexOf(lowerQuery)
-
-  if (index === -1) {
-    return content.slice(0, SNIPPET_CONTEXT * 2).replace(/\n/g, " ")
-  }
-
-  const start = Math.max(0, index - SNIPPET_CONTEXT)
-  const end = Math.min(content.length, index + query.length + SNIPPET_CONTEXT)
-  let snippet = content.slice(start, end).replace(/\n/g, " ")
-  if (start > 0) snippet = `...${snippet}`
-  if (end < content.length) snippet = `${snippet}...`
-  return snippet
-}
-
-function extractTitle(content: string, fileName: string): string {
-  const frontmatterMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
-  if (frontmatterMatch) return frontmatterMatch[1].trim()
-
-  const headingMatch = content.match(/^#\s+(.+)$/m)
-  if (headingMatch) return headingMatch[1].trim()
-
-  return fileName.replace(/\.md$/, "").replace(/-/g, " ")
-}
-
 function normalizeRelativePagePath(pagePathOrId: string): string {
   return pagePathOrId.replace(/^wiki\//, "").replace(/\\/g, "/")
-}
-
-function tokenMatchScore(text: string, tokens: readonly string[]): number {
-  const lower = text.toLowerCase()
-  let score = 0
-
-  for (const token of tokens) {
-    if (lower.includes(token)) {
-      score += 1
-    }
-  }
-
-  return score
 }
 
 async function resolvePagePath(wikiRoot: string, pagePathOrId: string): Promise<string | null> {
@@ -372,30 +336,50 @@ async function resolveVectorResult(
 }
 
 async function getMarkdownFiles(rootPath: string): Promise<string[]> {
+  const tree = await listFileTree(rootPath)
   const files: string[] = []
 
-  async function walk(currentPath: string): Promise<void> {
-    let entries
-    try {
-      entries = await readdir(currentPath, { withFileTypes: true })
-    } catch {
-      return
-    }
-
-    for (const entry of entries) {
-      const entryPath = path.join(currentPath, entry.name)
-      if (entry.isDirectory()) {
-        await walk(entryPath)
-        continue
-      }
-      if (entry.isFile() && entry.name.endsWith(".md")) {
-        files.push(entryPath)
+  function walk(nodes: FileNode[]): void {
+    for (const node of nodes) {
+      if (node.is_dir && node.children) {
+        walk(node.children)
+      } else if (!node.is_dir && node.name.endsWith(".md")) {
+        files.push(node.path)
       }
     }
   }
 
-  await walk(rootPath)
+  walk(tree)
   return files
+}
+
+async function listFileTree(rootPath: string): Promise<FileNode[]> {
+  let entries
+  try {
+    entries = await readdir(rootPath, { withFileTypes: true })
+  } catch {
+    return []
+  }
+
+  const nodes: FileNode[] = []
+  for (const entry of entries) {
+    const entryPath = path.join(rootPath, entry.name)
+    if (entry.isDirectory()) {
+      nodes.push({
+        name: entry.name,
+        path: entryPath,
+        is_dir: true,
+        children: await listFileTree(entryPath),
+      })
+    } else {
+      nodes.push({
+        name: entry.name,
+        path: entryPath,
+        is_dir: false,
+      })
+    }
+  }
+  return nodes
 }
 
 async function pathExists(targetPath: string): Promise<boolean> {
