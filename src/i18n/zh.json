@@ -92,7 +92,17 @@
     "save": "保存设置",
     "saved": "已保存！",
     "language": "语言",
-    "languageHint": "界面语言（Wiki 内容语言以原始资料为准）"
+    "languageHint": "界面语言（Wiki 内容语言以原始资料为准）",
+    "mcpServer": "MCP 服务",
+    "mcpDescription": "配置本地 MCP 服务设置用于工具集成。",
+    "enableMcp": "启用 MCP",
+    "autoStartMcp": "自动启动 MCP",
+    "host": "主机",
+    "port": "端口",
+    "mcpHostWarning": "警告：0.0.0.0 会将 MCP 暴露到你的网络。",
+    "mcpRuntimeStatus": "运行状态",
+    "mcpStatusPlaceholder": "未连接（占位）",
+    "mcpEndpointPreview": "端点预览"
   },
   "preview": {
     "selectFile": "选择文件以预览",

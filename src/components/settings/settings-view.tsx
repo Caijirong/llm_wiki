@@ -1,9 +1,13 @@
 import { useWikiStore } from "@/stores/wiki-store"
 import { useChatStore } from "@/stores/chat-store"
+import {
+  mcpStatus as fetchMcpStatus,
+  type McpStatus as McpRuntimeStatus,
+} from "@/commands/fs"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { useTranslation } from "react-i18next"
 import i18n from "@/i18n"
 import { saveLanguage } from "@/lib/project-store"
@@ -32,6 +36,8 @@ export function SettingsView() {
   const setSearchApiConfig = useWikiStore((s) => s.setSearchApiConfig)
   const embeddingConfig = useWikiStore((s) => s.embeddingConfig)
   const setEmbeddingConfig = useWikiStore((s) => s.setEmbeddingConfig)
+  const mcpConfig = useWikiStore((s) => s.mcpConfig)
+  const setMcpConfig = useWikiStore((s) => s.setMcpConfig)
   const maxHistoryMessages = useChatStore((s) => s.maxHistoryMessages)
   const setMaxHistoryMessages = useChatStore((s) => s.setMaxHistoryMessages)
 
@@ -47,8 +53,14 @@ export function SettingsView() {
   const [embeddingEndpoint, setEmbeddingEndpoint] = useState(embeddingConfig.endpoint)
   const [embeddingApiKey, setEmbeddingApiKey] = useState(embeddingConfig.apiKey)
   const [embeddingModel, setEmbeddingModel] = useState(embeddingConfig.model)
+  const [mcpEnabled, setMcpEnabled] = useState(mcpConfig.enabled)
+  const [mcpAutoStart, setMcpAutoStart] = useState(mcpConfig.autoStart)
+  const [mcpHost, setMcpHost] = useState(mcpConfig.host)
+  const [mcpPort, setMcpPort] = useState(String(mcpConfig.port))
+  const [mcpRuntime, setMcpRuntime] = useState<McpRuntimeStatus | null>(null)
   const [saved, setSaved] = useState(false)
   const [currentLang, setCurrentLang] = useState(i18n.language)
+  const hasTouchedMcpSettings = useRef(false)
 
   useEffect(() => {
     setProvider(llmConfig.provider)
@@ -63,19 +75,87 @@ export function SettingsView() {
     setSearchApiKey(searchApiConfig.apiKey)
   }, [searchApiConfig])
 
+  useEffect(() => {
+    let mounted = true
+    void (async () => {
+      const { loadMcpConfig } = await import("@/lib/project-store")
+      const persisted = await loadMcpConfig()
+      if (!mounted || !persisted || hasTouchedMcpSettings.current) return
+      setMcpEnabled(persisted.enabled)
+      setMcpAutoStart(persisted.autoStart)
+      setMcpHost(persisted.host)
+      setMcpPort(String(persisted.port))
+    })()
+
+    return () => {
+      mounted = false
+    }
+  }, [])
+
+  async function refreshMcpRuntime() {
+    try {
+      setMcpRuntime(await fetchMcpStatus())
+    } catch (err) {
+      setMcpRuntime({
+        status: "error",
+        lastError: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  useEffect(() => {
+    let active = true
+
+    const refresh = async () => {
+      try {
+        const runtime = await fetchMcpStatus()
+        if (active) {
+          setMcpRuntime(runtime)
+        }
+      } catch (err) {
+        if (active) {
+          setMcpRuntime({
+            status: "error",
+            lastError: err instanceof Error ? err.message : String(err),
+          })
+        }
+      }
+    }
+
+    void refresh()
+    const timer = window.setInterval(() => {
+      void refresh()
+    }, 2000)
+
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [])
+
   const currentProvider = PROVIDERS.find((p) => p.value === provider)
+  const mcpRuntimeLabel = mcpRuntime
+    ? formatMcpRuntimeStatus(mcpRuntime.status)
+    : t("settings.mcpStatusPlaceholder")
+  const mcpEndpointPreview = `http://${mcpHost.trim() || "127.0.0.1"}:${mcpPort || "18765"}/mcp`
 
   async function handleSave() {
-    const { saveLlmConfig, saveSearchApiConfig, saveEmbeddingConfig } = await import("@/lib/project-store")
+    const { saveLlmConfig, saveSearchApiConfig, saveEmbeddingConfig, saveMcpConfig } = await import("@/lib/project-store")
+    const normalizedMcpPort = parseMcpPort(mcpPort)
+    const normalizedMcpHost = mcpHost.trim() || "127.0.0.1"
     const newConfig = { provider, apiKey, model, ollamaUrl, customEndpoint, maxContextSize }
     const newSearchConfig = { provider: searchProvider, apiKey: searchApiKey }
     const newEmbeddingConfig = { enabled: embeddingEnabled, endpoint: embeddingEndpoint, apiKey: embeddingApiKey, model: embeddingModel }
+    const newMcpConfig = { enabled: mcpEnabled, autoStart: mcpAutoStart, host: normalizedMcpHost, port: normalizedMcpPort }
     setSearchApiConfig(newSearchConfig)
     await saveSearchApiConfig(newSearchConfig)
     setEmbeddingConfig(newEmbeddingConfig)
     await saveEmbeddingConfig(newEmbeddingConfig)
+    setMcpConfig(newMcpConfig)
+    await saveMcpConfig(newMcpConfig)
     setLlmConfig(newConfig)
     await saveLlmConfig(newConfig)
+    await refreshMcpRuntime()
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
   }
@@ -328,6 +408,89 @@ export function SettingsView() {
             )}
           </div>
 
+          {/* MCP Server section */}
+          <div className="space-y-4 rounded-lg border p-4">
+            <h3 className="font-semibold">{t("settings.mcpServer")}</h3>
+            <p className="text-xs text-muted-foreground">{t("settings.mcpDescription")}</p>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="flex items-center gap-2">
+                <input
+                  id="mcpEnabled"
+                  type="checkbox"
+                  checked={mcpEnabled}
+                  onChange={(e) => {
+                    hasTouchedMcpSettings.current = true
+                    setMcpEnabled(e.target.checked)
+                  }}
+                />
+                <Label htmlFor="mcpEnabled">{t("settings.enableMcp")}</Label>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input
+                  id="mcpAutoStart"
+                  type="checkbox"
+                  checked={mcpAutoStart}
+                  onChange={(e) => {
+                    hasTouchedMcpSettings.current = true
+                    setMcpAutoStart(e.target.checked)
+                  }}
+                />
+                <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="mcpHost">{t("settings.host")}</Label>
+                <Input
+                  id="mcpHost"
+                  value={mcpHost}
+                  onChange={(e) => {
+                    hasTouchedMcpSettings.current = true
+                    setMcpHost(e.target.value)
+                  }}
+                  placeholder="127.0.0.1"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="mcpPort">{t("settings.port")}</Label>
+                <Input
+                  id="mcpPort"
+                  type="number"
+                  min={1}
+                  value={mcpPort}
+                  onChange={(e) => {
+                    hasTouchedMcpSettings.current = true
+                    setMcpPort(e.target.value)
+                  }}
+                  placeholder="18765"
+                />
+              </div>
+            </div>
+
+            {mcpHost.trim() === "0.0.0.0" && (
+              <p className="text-xs text-amber-600">{t("settings.mcpHostWarning")}</p>
+            )}
+
+            <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
+              <p>
+                {t("settings.mcpRuntimeStatus")}: {mcpRuntimeLabel}
+              </p>
+              <p>
+                {t("settings.mcpEndpointPreview")}: {mcpEndpointPreview}
+              </p>
+              {mcpRuntime?.currentProject && (
+                <p>Project: {mcpRuntime.currentProject}</p>
+              )}
+              {mcpRuntime?.lastError && (
+                <p className="text-red-600">{mcpRuntime.lastError}</p>
+              )}
+            </div>
+          </div>
+
           {/* Chat History section */}
           <div className="space-y-4 rounded-lg border p-4">
             <h3 className="font-semibold">Chat History</h3>
@@ -426,4 +589,19 @@ function formatSize(chars: number): string {
   if (chars >= 1000000) return `${(chars / 1000000).toFixed(1)}M characters`
   if (chars >= 1000) return `${Math.round(chars / 1000)}K characters`
   return `${chars} characters`
+}
+
+function formatMcpRuntimeStatus(status: McpRuntimeStatus["status"]): string {
+  return status
+    .split("_")
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(" ")
+}
+
+function parseMcpPort(value: string): number {
+  const normalized = value.trim()
+  if (!/^\d+$/.test(normalized)) return 18765
+  const port = Number(normalized)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return 18765
+  return port
 }

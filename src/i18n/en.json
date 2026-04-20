@@ -92,7 +92,17 @@
     "save": "Save Settings",
     "saved": "Saved!",
     "language": "Language",
-    "languageHint": "Interface language (wiki content follows source material language)"
+    "languageHint": "Interface language (wiki content follows source material language)",
+    "mcpServer": "MCP Server",
+    "mcpDescription": "Configure local MCP settings for tool integration.",
+    "enableMcp": "Enable MCP",
+    "autoStartMcp": "Auto-start MCP",
+    "host": "Host",
+    "port": "Port",
+    "mcpHostWarning": "Warning: 0.0.0.0 exposes MCP to your network.",
+    "mcpRuntimeStatus": "Runtime status",
+    "mcpStatusPlaceholder": "Not connected (placeholder)",
+    "mcpEndpointPreview": "Endpoint preview"
   },
   "preview": {
     "selectFile": "Select a file to preview",
