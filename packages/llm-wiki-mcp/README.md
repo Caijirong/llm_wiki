@@ -7,24 +7,28 @@ Read-only MCP server for browsing and querying LLM Wiki projects.
 Run from a published npm package:
 
 ```bash
-npx -y @haowan36/llm-wiki-mcp
+npx -y @haowan36/llm-wiki-mcp --project /absolute/path/to/wiki
 ```
 
-Point the server at a workspace root or a single wiki project:
+Or expose all wiki projects under a workspace root:
 
 ```bash
-LLM_WIKI_ROOT=/absolute/path/to/workspace npx -y @haowan36/llm-wiki-mcp
+npx -y @haowan36/llm-wiki-mcp --workspace /absolute/path/to/workspace
 ```
 
 Enable semantic or hybrid retrieval with an OpenAI-compatible embeddings endpoint:
 
 ```bash
-LLM_WIKI_ROOT=/absolute/path/to/workspace \
 LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
 LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
 LLM_WIKI_EMBEDDING_API_KEY=optional-key \
-npx -y @haowan36/llm-wiki-mcp
+  npx -y @haowan36/llm-wiki-mcp \
+    --workspace /absolute/path/to/workspace \
+    --host 0.0.0.0 \
+    --port 18765
 ```
+
+The server listens on `http://<host>:<port>/mcp`.
 
 The server exposes four read-only tools:
 

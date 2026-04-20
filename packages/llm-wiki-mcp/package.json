@@ -5,7 +5,7 @@
   "type": "module",
   "private": false,
   "bin": {
-    "llm-wiki-mcp": "./dist/mcp/server.js"
+    "llm-wiki-mcp": "./dist/mcp/http-server.js"
   },
   "files": [
     "dist",
@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/mcp/server.js"
+    "start": "node dist/mcp/http-server.js"
   },
   "publishConfig": {
     "access": "public"

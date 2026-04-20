@@ -396,16 +396,16 @@ For local development in this repo, build and launch the stdio MCP server:
 
 ```bash
 npm install
-npm run mcp
+npm run mcp -- --project /absolute/path/to/wiki
 ```
 
 After publishing the MCP package, external agents can connect through:
 
 ```bash
-npx -y @haowan36/llm-wiki-mcp
+npx -y @haowan36/llm-wiki-mcp --project /absolute/path/to/wiki
 ```
 
-By default the server uses `LLM_WIKI_ROOT` if set, otherwise the current working directory. It exposes four read-only tools:
+The standalone package now requires exactly one of `--project` or `--workspace`, and it serves MCP over Streamable HTTP on `http://<host>:<port>/mcp`. It exposes four read-only tools:
 - `llm_wiki_list_projects`
 - `llm_wiki_search`
 - `llm_wiki_read_page`
@@ -414,17 +414,19 @@ By default the server uses `LLM_WIKI_ROOT` if set, otherwise the current working
 Example:
 
 ```bash
-LLM_WIKI_ROOT=/absolute/path/to/workspace npx -y @haowan36/llm-wiki-mcp
+npx -y @haowan36/llm-wiki-mcp --workspace /absolute/path/to/workspace
 ```
 
 For semantic or hybrid retrieval, also set embedding config so the server can embed the query and search the existing LanceDB index under `.llm-wiki/lancedb`:
 
 ```bash
-LLM_WIKI_ROOT=/absolute/path/to/workspace \
 LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
 LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
 LLM_WIKI_EMBEDDING_API_KEY=optional-key \
-npx -y @haowan36/llm-wiki-mcp
+  npx -y @haowan36/llm-wiki-mcp \
+    --workspace /absolute/path/to/workspace \
+    --host 0.0.0.0 \
+    --port 18765
 ```
 
 `llm_wiki_search` and `llm_wiki_get_context` support `mode: "keyword" | "semantic" | "hybrid"`. `hybrid` is the recommended default. If embedding config is missing, hybrid falls back to keyword-only retrieval.

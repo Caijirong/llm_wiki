@@ -22,12 +22,12 @@ describe("llm-wiki-mcp workspace package", () => {
     expect(packageJson.private).toBe(false)
     expect(packageJson.type).toBe("module")
     expect(packageJson.bin).toEqual({
-      "llm-wiki-mcp": "./dist/mcp/server.js",
+      "llm-wiki-mcp": "./dist/mcp/http-server.js",
     })
     expect(packageJson.files).toEqual(
       expect.arrayContaining(["dist", "README.md"]),
     )
     expect(packageJson.scripts?.build).toBe("tsc -p tsconfig.json")
-    expect(packageJson.scripts?.start).toBe("node dist/mcp/server.js")
+    expect(packageJson.scripts?.start).toBe("node dist/mcp/http-server.js")
   })
 })
