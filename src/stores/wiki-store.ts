@@ -92,8 +92,8 @@ export const useWikiStore = create<WikiState>((set) => ({
   },
 
   mcpConfig: {
-    enabled: false,
-    autoStart: false,
+    enabled: true,
+    autoStart: true,
     host: "127.0.0.1",
     port: 18765,
   },

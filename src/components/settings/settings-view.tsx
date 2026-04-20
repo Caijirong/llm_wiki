@@ -410,85 +410,96 @@ export function SettingsView() {
 
           {/* MCP Server section */}
           <div className="space-y-4 rounded-lg border p-4">
-            <h3 className="font-semibold">{t("settings.mcpServer")}</h3>
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold">{t("settings.mcpServer")}</h3>
+              <button
+                id="mcpEnabled"
+                type="button"
+                role="switch"
+                aria-checked={mcpEnabled}
+                aria-label={t("settings.enableMcp")}
+                onClick={() => {
+                  hasTouchedMcpSettings.current = true
+                  setMcpEnabled(!mcpEnabled)
+                }}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                  mcpEnabled ? "bg-primary" : "bg-muted"
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                    mcpEnabled ? "translate-x-4.5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
             <p className="text-xs text-muted-foreground">{t("settings.mcpDescription")}</p>
 
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="flex items-center gap-2">
-                <input
-                  id="mcpEnabled"
-                  type="checkbox"
-                  checked={mcpEnabled}
-                  onChange={(e) => {
-                    hasTouchedMcpSettings.current = true
-                    setMcpEnabled(e.target.checked)
-                  }}
-                />
-                <Label htmlFor="mcpEnabled">{t("settings.enableMcp")}</Label>
-              </div>
+            {mcpEnabled && (
+              <>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="mcpAutoStart"
+                    type="checkbox"
+                    checked={mcpAutoStart}
+                    onChange={(e) => {
+                      hasTouchedMcpSettings.current = true
+                      setMcpAutoStart(e.target.checked)
+                    }}
+                  />
+                  <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
+                </div>
 
-              <div className="flex items-center gap-2">
-                <input
-                  id="mcpAutoStart"
-                  type="checkbox"
-                  checked={mcpAutoStart}
-                  onChange={(e) => {
-                    hasTouchedMcpSettings.current = true
-                    setMcpAutoStart(e.target.checked)
-                  }}
-                />
-                <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
-              </div>
-            </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="mcpHost">{t("settings.host")}</Label>
+                    <Input
+                      id="mcpHost"
+                      value={mcpHost}
+                      onChange={(e) => {
+                        hasTouchedMcpSettings.current = true
+                        setMcpHost(e.target.value)
+                      }}
+                      placeholder="127.0.0.1"
+                    />
+                  </div>
 
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label htmlFor="mcpHost">{t("settings.host")}</Label>
-                <Input
-                  id="mcpHost"
-                  value={mcpHost}
-                  onChange={(e) => {
-                    hasTouchedMcpSettings.current = true
-                    setMcpHost(e.target.value)
-                  }}
-                  placeholder="127.0.0.1"
-                />
-              </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="mcpPort">{t("settings.port")}</Label>
+                    <Input
+                      id="mcpPort"
+                      type="number"
+                      min={1}
+                      value={mcpPort}
+                      onChange={(e) => {
+                        hasTouchedMcpSettings.current = true
+                        setMcpPort(e.target.value)
+                      }}
+                      placeholder="18765"
+                    />
+                  </div>
+                </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="mcpPort">{t("settings.port")}</Label>
-                <Input
-                  id="mcpPort"
-                  type="number"
-                  min={1}
-                  value={mcpPort}
-                  onChange={(e) => {
-                    hasTouchedMcpSettings.current = true
-                    setMcpPort(e.target.value)
-                  }}
-                  placeholder="18765"
-                />
-              </div>
-            </div>
+                {mcpHost.trim() === "0.0.0.0" && (
+                  <p className="text-xs text-amber-600">{t("settings.mcpHostWarning")}</p>
+                )}
 
-            {mcpHost.trim() === "0.0.0.0" && (
-              <p className="text-xs text-amber-600">{t("settings.mcpHostWarning")}</p>
+                <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
+                  <p>
+                    {t("settings.mcpRuntimeStatus")}: {mcpRuntimeLabel}
+                  </p>
+                  <p>
+                    {t("settings.mcpEndpointPreview")}: {mcpEndpointPreview}
+                  </p>
+                  {mcpRuntime?.currentProject && (
+                    <p>Project: {mcpRuntime.currentProject}</p>
+                  )}
+                  {mcpRuntime?.lastError && (
+                    <p className="text-red-600">{mcpRuntime.lastError}</p>
+                  )}
+                </div>
+              </>
             )}
-
-            <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
-              <p>
-                {t("settings.mcpRuntimeStatus")}: {mcpRuntimeLabel}
-              </p>
-              <p>
-                {t("settings.mcpEndpointPreview")}: {mcpEndpointPreview}
-              </p>
-              {mcpRuntime?.currentProject && (
-                <p>Project: {mcpRuntime.currentProject}</p>
-              )}
-              {mcpRuntime?.lastError && (
-                <p className="text-red-600">{mcpRuntime.lastError}</p>
-              )}
-            </div>
           </div>
 
           {/* Chat History section */}

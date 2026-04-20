@@ -39,6 +39,7 @@ vi.mock("@/lib/project-store", () => ({
 }))
 
 import { SettingsView } from "./settings-view"
+import { useWikiStore } from "@/stores/wiki-store"
 
 describe("SettingsView MCP settings", () => {
   afterEach(() => {
@@ -46,15 +47,35 @@ describe("SettingsView MCP settings", () => {
   })
 
   beforeEach(() => {
+    useWikiStore.setState({
+      mcpConfig: {
+        enabled: true,
+        autoStart: true,
+        host: "127.0.0.1",
+        port: 18765,
+      },
+    })
     saveMcpConfig.mockClear()
     loadMcpConfig.mockReset()
     mcpStatus.mockClear()
     loadMcpConfig.mockResolvedValue({
       enabled: true,
-      autoStart: false,
+      autoStart: true,
       host: "127.0.0.1",
       port: 18765,
     })
+  })
+
+  it("defaults mcp to enabled when no persisted config exists", async () => {
+    loadMcpConfig.mockResolvedValueOnce(null)
+
+    render(<SettingsView />)
+
+    const enabledSwitch = screen.getByRole("switch", { name: /Enable MCP/i })
+    await waitFor(() => expect(loadMcpConfig).toHaveBeenCalled())
+    expect(enabledSwitch).toHaveAttribute("aria-checked", "true")
+    expect(screen.getByLabelText(/Auto-start MCP/i)).toBeChecked()
+    expect(screen.getByLabelText(/Host/i)).toBeInTheDocument()
   })
 
   it("renders and saves mcp settings", async () => {
@@ -70,17 +91,27 @@ describe("SettingsView MCP settings", () => {
     render(<SettingsView />)
 
     expect(screen.getByText(/MCP Server/i)).toBeInTheDocument()
-    await user.click(screen.getByLabelText(/Enable MCP/i))
+    expect(screen.getByRole("switch", { name: /Enable MCP/i })).toHaveAttribute("aria-checked", "true")
+    expect(screen.getByLabelText(/Auto-start MCP/i)).toBeChecked()
+    await user.click(screen.getByRole("switch", { name: /Enable MCP/i }))
+    await waitFor(() =>
+      expect(screen.queryByLabelText(/Auto-start MCP/i)).not.toBeInTheDocument()
+    )
+    resolveLoad?.({ enabled: false, autoStart: false, host: "0.0.0.0", port: 12345 })
+    await waitFor(() => expect(loadMcpConfig).toHaveBeenCalled())
+    await user.click(screen.getByRole("switch", { name: /Enable MCP/i }))
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /Enable MCP/i })).toHaveAttribute("aria-checked", "true")
+    )
+    expect(screen.getByLabelText(/Auto-start MCP/i)).toBeChecked()
     await user.click(screen.getByLabelText(/Auto-start MCP/i))
     await user.clear(screen.getByLabelText(/Port/i))
     await user.type(screen.getByLabelText(/Port/i), "18765")
-    resolveLoad?.({ enabled: false, autoStart: false, host: "0.0.0.0", port: 12345 })
-    await waitFor(() => expect(loadMcpConfig).toHaveBeenCalled())
     await user.click(screen.getByRole("button", { name: /save settings/i }))
 
     expect(saveMcpConfig).toHaveBeenCalledWith({
       enabled: true,
-      autoStart: true,
+      autoStart: false,
       host: "127.0.0.1",
       port: 18765,
     })
@@ -90,8 +121,10 @@ describe("SettingsView MCP settings", () => {
   it("falls back to default port when port is invalid", async () => {
     const user = userEvent.setup()
     render(<SettingsView />)
-    const autoStartToggle = screen.getByLabelText(/Auto-start MCP/i) as HTMLInputElement
-    await waitFor(() => expect(autoStartToggle.checked).toBe(false))
+    const autoStartCheckbox = screen.getByLabelText(/Auto-start MCP/i) as HTMLInputElement
+    await waitFor(() =>
+      expect(autoStartCheckbox.checked).toBe(true)
+    )
 
     await user.clear(screen.getByLabelText(/Port/i))
     await user.type(screen.getByLabelText(/Port/i), "70000")
@@ -99,7 +132,7 @@ describe("SettingsView MCP settings", () => {
 
     expect(saveMcpConfig).toHaveBeenCalledWith({
       enabled: true,
-      autoStart: false,
+      autoStart: true,
       host: "127.0.0.1",
       port: 18765,
     })
