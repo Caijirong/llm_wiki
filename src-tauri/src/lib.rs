@@ -1,6 +1,9 @@
 mod clip_server;
 mod commands;
+mod mcp_server;
 mod types;
+
+use tauri::Manager;
 
 #[tauri::command]
 fn clip_server_status() -> String {
@@ -12,6 +15,7 @@ pub fn run() {
     clip_server::start_clip_server();
 
     tauri::Builder::default()
+        .manage(mcp_server::McpRuntimeManager::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -32,6 +36,12 @@ pub fn run() {
             commands::vectorstore::vector_search,
             commands::vectorstore::vector_delete,
             commands::vectorstore::vector_count,
+            mcp_server::mcp_status,
+            mcp_server::mcp_start,
+            mcp_server::mcp_stop,
+            mcp_server::mcp_update_project,
+            mcp_server::mcp_update_known_projects,
+            mcp_server::mcp_update_config,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -67,7 +77,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
                 if !has_visible_windows {
                     use tauri::Manager;
                     if let Some(window) = app.get_webview_window("main") {
@@ -75,6 +89,11 @@ pub fn run() {
                         let _ = window.set_focus();
                     }
                 }
+            }
+
+            if let tauri::RunEvent::Exit = event {
+                let manager = app.state::<mcp_server::McpRuntimeManager>();
+                let _ = manager.stop();
             }
             let _ = (app, event); // suppress unused warnings on non-macOS
         });

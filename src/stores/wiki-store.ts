@@ -22,6 +22,13 @@ interface EmbeddingConfig {
   model: string // e.g. "text-embedding-qwen3-embedding-0.6b"
 }
 
+interface McpConfig {
+  enabled: boolean
+  autoStart: boolean
+  host: string
+  port: number
+}
+
 interface WikiState {
   project: WikiProject | null
   fileTree: FileNode[]
@@ -32,6 +39,7 @@ interface WikiState {
   llmConfig: LlmConfig
   searchApiConfig: SearchApiConfig
   embeddingConfig: EmbeddingConfig
+  mcpConfig: McpConfig
   dataVersion: number
 
   setProject: (project: WikiProject | null) => void
@@ -43,6 +51,7 @@ interface WikiState {
   setLlmConfig: (config: LlmConfig) => void
   setSearchApiConfig: (config: SearchApiConfig) => void
   setEmbeddingConfig: (config: EmbeddingConfig) => void
+  setMcpConfig: (config: McpConfig) => void
   bumpDataVersion: () => void
 }
 
@@ -82,10 +91,18 @@ export const useWikiStore = create<WikiState>((set) => ({
     model: "",
   },
 
+  mcpConfig: {
+    enabled: false,
+    autoStart: false,
+    host: "127.0.0.1",
+    port: 18765,
+  },
+
   setLlmConfig: (llmConfig) => set({ llmConfig }),
   setSearchApiConfig: (searchApiConfig) => set({ searchApiConfig }),
   setEmbeddingConfig: (embeddingConfig) => set({ embeddingConfig }),
+  setMcpConfig: (mcpConfig) => set({ mcpConfig }),
   bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),
 }))
 
-export type { WikiState, LlmConfig, SearchApiConfig, EmbeddingConfig }
+export type { WikiState, LlmConfig, SearchApiConfig, EmbeddingConfig, McpConfig }

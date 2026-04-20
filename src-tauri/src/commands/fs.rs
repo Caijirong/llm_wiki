@@ -1,8 +1,8 @@
 use std::fs;
 use std::io::Read as IoRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use calamine::{Reader, open_workbook_auto, Data};
+use calamine::{open_workbook_auto, Data, Reader};
 
 use crate::types::wiki::FileNode;
 
@@ -12,8 +12,8 @@ const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif", "heic", "heif", "svg",
 ];
 const MEDIA_EXTS: &[&str] = &[
-    "mp4", "webm", "mov", "avi", "mkv", "flv", "wmv", "m4v",
-    "mp3", "wav", "ogg", "flac", "aac", "m4a", "wma",
+    "mp4", "webm", "mov", "avi", "mkv", "flv", "wmv", "m4v", "mp3", "wav", "ogg", "flac", "aac",
+    "m4a", "wma",
 ];
 const LEGACY_DOC_EXTS: &[&str] = &["doc", "xls", "ppt", "pages", "numbers", "key", "epub"];
 
@@ -36,24 +36,36 @@ pub fn read_file(path: String) -> Result<String, String> {
         e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e),
         e if IMAGE_EXTS.contains(&e) => {
             let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            Ok(format!("[Image: {} ({:.1} KB)]", p.file_name().unwrap_or_default().to_string_lossy(), size as f64 / 1024.0))
+            Ok(format!(
+                "[Image: {} ({:.1} KB)]",
+                p.file_name().unwrap_or_default().to_string_lossy(),
+                size as f64 / 1024.0
+            ))
         }
         e if MEDIA_EXTS.contains(&e) => {
             let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            Ok(format!("[Media: {} ({:.1} MB)]", p.file_name().unwrap_or_default().to_string_lossy(), size as f64 / 1048576.0))
+            Ok(format!(
+                "[Media: {} ({:.1} MB)]",
+                p.file_name().unwrap_or_default().to_string_lossy(),
+                size as f64 / 1048576.0
+            ))
         }
-        e if LEGACY_DOC_EXTS.contains(&e) => {
-            Ok(format!("[Document: {} — text extraction not supported for .{} format]",
-                p.file_name().unwrap_or_default().to_string_lossy(), e))
-        }
+        e if LEGACY_DOC_EXTS.contains(&e) => Ok(format!(
+            "[Document: {} — text extraction not supported for .{} format]",
+            p.file_name().unwrap_or_default().to_string_lossy(),
+            e
+        )),
         _ => {
             // Try reading as text; if it fails (binary), return a friendly message
             match fs::read_to_string(&path) {
                 Ok(content) => Ok(content),
                 Err(_) => {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    Ok(format!("[Binary file: {} ({:.1} KB)]",
-                        p.file_name().unwrap_or_default().to_string_lossy(), size as f64 / 1024.0))
+                    Ok(format!(
+                        "[Binary file: {} ({:.1} KB)]",
+                        p.file_name().unwrap_or_default().to_string_lossy(),
+                        size as f64 / 1024.0
+                    ))
                 }
             }
         }
@@ -83,10 +95,7 @@ pub fn preprocess_file(path: String) -> Result<String, String> {
 fn cache_path_for(original: &Path) -> std::path::PathBuf {
     let parent = original.parent().unwrap_or(Path::new("."));
     let cache_dir = parent.join(".cache");
-    let file_name = original
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let file_name = original.file_name().unwrap_or_default().to_string_lossy();
     cache_dir.join(format!("{}.txt", file_name))
 }
 
@@ -106,13 +115,11 @@ fn write_cache(original: &Path, text: &str) -> Result<(), String> {
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::write(&cache_path, text)
-        .map_err(|e| format!("Failed to write cache: {}", e))
+    fs::write(&cache_path, text).map_err(|e| format!("Failed to write cache: {}", e))
 }
 
 fn extract_pdf_text(path: &str) -> Result<String, String> {
-    let bytes =
-        fs::read(path).map_err(|e| format!("Failed to read PDF '{}': {}", path, e))?;
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read PDF '{}': {}", path, e))?;
     pdf_extract::extract_text_from_mem(&bytes)
         .map_err(|e| format!("Failed to extract text from PDF '{}': {}", path, e))
 }
@@ -130,8 +137,7 @@ fn extract_office_text(path: &str, ext: &str) -> Result<String, String> {
     }
 
     // PPTX and ODF: use ZIP-based parsing
-    let file = fs::File::open(path)
-        .map_err(|e| format!("Failed to open '{}': {}", path, e))?;
+    let file = fs::File::open(path).map_err(|e| format!("Failed to open '{}': {}", path, e))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| format!("Failed to read ZIP archive '{}': {}", path, e))?;
 
@@ -199,7 +205,9 @@ fn extract_docx_with_library(path: &str) -> Result<String, String> {
                 }
 
                 let text = para_text.trim().to_string();
-                if text.is_empty() { continue; }
+                if text.is_empty() {
+                    continue;
+                }
 
                 if is_heading {
                     let prefix = "#".repeat(heading_level as usize);
@@ -248,7 +256,9 @@ fn extract_docx_with_library(path: &str) -> Result<String, String> {
                         result.push_str(" |\n");
                         if i == 0 {
                             result.push('|');
-                            for _ in 0..max_cols { result.push_str(" --- |"); }
+                            for _ in 0..max_cols {
+                                result.push_str(" --- |");
+                            }
                             result.push('\n');
                         }
                     }
@@ -316,7 +326,9 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
             let tag_start = i;
             i += 1;
             let is_closing = i < len && chars[i] == '/';
-            if is_closing { i += 1; }
+            if is_closing {
+                i += 1;
+            }
 
             let mut tag_name = String::new();
             while i < len && chars[i] != '>' && chars[i] != ' ' && chars[i] != '/' {
@@ -330,7 +342,9 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
                 tag_content.push(chars[i]);
                 i += 1;
             }
-            if i < len { i += 1; } // skip >
+            if i < len {
+                i += 1;
+            } // skip >
 
             match tag_name.as_str() {
                 // Paragraph start
@@ -373,16 +387,26 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
                             }
                         }
                     }
-                    if tag_content.contains("ListParagraph") || tag_content.contains("listParagraph") {
+                    if tag_content.contains("ListParagraph")
+                        || tag_content.contains("listParagraph")
+                    {
                         in_list_item = true;
                     }
                 }
                 // Bold
-                "w:b" if !is_closing && !tag_content.contains("w:val=\"0\"") && !tag_content.contains("w:val=\"false\"") => {
+                "w:b"
+                    if !is_closing
+                        && !tag_content.contains("w:val=\"0\"")
+                        && !tag_content.contains("w:val=\"false\"") =>
+                {
                     is_bold = true;
                 }
                 // Italic
-                "w:i" if !is_closing && !tag_content.contains("w:val=\"0\"") && !tag_content.contains("w:val=\"false\"") => {
+                "w:i"
+                    if !is_closing
+                        && !tag_content.contains("w:val=\"0\"")
+                        && !tag_content.contains("w:val=\"false\"") =>
+                {
                     is_italic = true;
                 }
                 // Run end — apply formatting
@@ -471,8 +495,16 @@ fn extract_pptx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
 
     // Sort by slide number
     slide_names.sort_by(|a, b| {
-        let num_a = a.trim_start_matches("ppt/slides/slide").trim_end_matches(".xml").parse::<u32>().unwrap_or(0);
-        let num_b = b.trim_start_matches("ppt/slides/slide").trim_end_matches(".xml").parse::<u32>().unwrap_or(0);
+        let num_a = a
+            .trim_start_matches("ppt/slides/slide")
+            .trim_end_matches(".xml")
+            .parse::<u32>()
+            .unwrap_or(0);
+        let num_b = b
+            .trim_start_matches("ppt/slides/slide")
+            .trim_end_matches(".xml")
+            .parse::<u32>()
+            .unwrap_or(0);
         num_a.cmp(&num_b)
     });
 
@@ -541,7 +573,9 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
 
     for sheet_name in &sheet_names {
         if let Ok(range) = workbook.worksheet_range(sheet_name) {
-            if range.is_empty() { continue; }
+            if range.is_empty() {
+                continue;
+            }
 
             if sheet_names.len() > 1 {
                 result.push_str(&format!("## {}\n\n", sheet_name));
@@ -551,8 +585,9 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
             let mut max_cols = 0;
 
             for row in range.rows() {
-                let cells: Vec<String> = row.iter().map(|cell| {
-                    match cell {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|cell| match cell {
                         Data::Empty => String::new(),
                         Data::String(s) => s.clone(),
                         Data::Float(f) => {
@@ -568,14 +603,18 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
                         Data::DateTimeIso(s) => s.clone(),
                         Data::DurationIso(s) => s.clone(),
                         Data::Error(e) => format!("ERR:{:?}", e),
-                    }
-                }).collect();
-                if cells.len() > max_cols { max_cols = cells.len(); }
+                    })
+                    .collect();
+                if cells.len() > max_cols {
+                    max_cols = cells.len();
+                }
                 rows.push(cells);
             }
 
             // Skip empty sheets
-            if rows.is_empty() || max_cols == 0 { continue; }
+            if rows.is_empty() || max_cols == 0 {
+                continue;
+            }
 
             for (i, row) in rows.iter().enumerate() {
                 let mut padded = row.clone();
@@ -588,7 +627,9 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
 
                 if i == 0 {
                     result.push('|');
-                    for _ in 0..max_cols { result.push_str(" --- |"); }
+                    for _ in 0..max_cols {
+                        result.push_str(" --- |");
+                    }
                     result.push('\n');
                 }
             }
@@ -605,8 +646,8 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
 
 /// Extract OpenDocument format text (basic).
 fn extract_odf_text(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, String> {
-    let xml = read_zip_file(archive, "content.xml")
-        .ok_or_else(|| "No content.xml found".to_string())?;
+    let xml =
+        read_zip_file(archive, "content.xml").ok_or_else(|| "No content.xml found".to_string())?;
 
     let mut result = String::new();
     let mut in_tag = false;
@@ -624,7 +665,11 @@ fn extract_odf_text(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, S
     }
 
     let cleaned = decode_xml_entities(&result);
-    let lines: Vec<&str> = cleaned.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = cleaned
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
 
     if lines.is_empty() {
         Ok("[Could not extract text from this file]".to_string())
@@ -654,6 +699,35 @@ pub fn list_directory(path: String) -> Result<Vec<FileNode>, String> {
     }
     let nodes = build_tree(p, 0, 30)?;
     Ok(nodes)
+}
+
+pub(crate) fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    collect_markdown_files_inner(root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_markdown_files_inner(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(root)
+        .map_err(|e| format!("Failed to read directory '{}': {}", root.display(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if name.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_markdown_files_inner(&path, files)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            files.push(path);
+        }
+    }
+
+    Ok(())
 }
 
 fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Result<Vec<FileNode>, String> {
@@ -688,11 +762,7 @@ fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Result<Vec<FileNode
     let mut nodes = Vec::new();
     for entry in entries {
         let entry_path = entry.path();
-        let name = entry
-            .file_name()
-            .to_str()
-            .unwrap_or("")
-            .to_string();
+        let name = entry.file_name().to_str().unwrap_or("").to_string();
         let path_str = entry_path.to_string_lossy().to_string();
         let is_dir = entry_path.is_dir();
 
@@ -722,8 +792,7 @@ fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Result<Vec<FileNode
 pub fn copy_file(source: String, destination: String) -> Result<(), String> {
     let dest = Path::new(&destination);
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent dirs: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create parent dirs: {}", e))?;
     }
     fs::copy(&source, &destination)
         .map_err(|e| format!("Failed to copy '{}' to '{}': {}", source, destination, e))?;
@@ -743,11 +812,7 @@ pub fn copy_directory(source: String, destination: String) -> Result<Vec<String>
 
     let mut copied_files = Vec::new();
 
-    fn copy_recursive(
-        src: &Path,
-        dest: &Path,
-        files: &mut Vec<String>,
-    ) -> Result<(), String> {
+    fn copy_recursive(src: &Path, dest: &Path, files: &mut Vec<String>) -> Result<(), String> {
         fs::create_dir_all(dest)
             .map_err(|e| format!("Failed to create dir '{}': {}", dest.display(), e))?;
 
@@ -768,9 +833,8 @@ pub fn copy_directory(source: String, destination: String) -> Result<Vec<String>
             if path.is_dir() {
                 copy_recursive(&path, &dest_path, files)?;
             } else {
-                fs::copy(&path, &dest_path).map_err(|e| {
-                    format!("Failed to copy '{}': {}", path.display(), e)
-                })?;
+                fs::copy(&path, &dest_path)
+                    .map_err(|e| format!("Failed to copy '{}': {}", path.display(), e))?;
                 files.push(dest_path.to_string_lossy().to_string());
             }
         }
@@ -788,15 +852,17 @@ pub fn delete_file(path: String) -> Result<(), String> {
         fs::remove_dir_all(&path)
             .map_err(|e| format!("Failed to delete directory '{}': {}", path, e))
     } else {
-        fs::remove_file(&path)
-            .map_err(|e| format!("Failed to delete file '{}': {}", path, e))
+        fs::remove_file(&path).map_err(|e| format!("Failed to delete file '{}': {}", path, e))
     }
 }
 
 /// Find wiki pages that reference a given source file name.
 /// Scans all .md files under wiki/ for the source filename in frontmatter or content.
 #[tauri::command]
-pub fn find_related_wiki_pages(project_path: String, source_name: String) -> Result<Vec<String>, String> {
+pub fn find_related_wiki_pages(
+    project_path: String,
+    source_name: String,
+) -> Result<Vec<String>, String> {
     let wiki_dir = Path::new(&project_path).join("wiki");
     if !wiki_dir.is_dir() {
         return Ok(vec![]);
@@ -807,7 +873,11 @@ pub fn find_related_wiki_pages(project_path: String, source_name: String) -> Res
     Ok(related)
 }
 
-fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String>) -> Result<(), String> {
+fn collect_related_pages(
+    dir: &Path,
+    source_name: &str,
+    results: &mut Vec<String>,
+) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
 
     // Get just the filename without path — use Path for cross-platform separator handling
@@ -827,7 +897,11 @@ fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String
         .rev()
         .collect::<Vec<_>>()
         .join(".");
-    let file_stem_lower = if file_stem.is_empty() { file_name_lower.clone() } else { file_stem.to_lowercase() };
+    let file_stem_lower = if file_stem.is_empty() {
+        file_name_lower.clone()
+    } else {
+        file_stem.to_lowercase()
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -850,18 +924,15 @@ fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String
 
                 // Match 2: source summary page (wiki/sources/{stem}.md)
                 // Use Path component iteration to avoid hardcoded separator assumptions
-                let is_in_sources_dir = path
-                    .components()
-                    .any(|c| c.as_os_str() == "sources");
-                let is_source_summary = is_in_sources_dir
-                    && fname.to_lowercase().starts_with(&file_stem_lower);
+                let is_in_sources_dir = path.components().any(|c| c.as_os_str() == "sources");
+                let is_source_summary =
+                    is_in_sources_dir && fname.to_lowercase().starts_with(&file_stem_lower);
 
                 // Match 3: page was generated from this source (check frontmatter sources field)
                 let frontmatter_match = if let Some(fm_start) = content.find("---\n") {
                     if let Some(fm_end) = content[fm_start + 4..].find("\n---") {
                         let frontmatter = &content[fm_start..fm_start + 4 + fm_end].to_lowercase();
-                        frontmatter.contains("sources:")
-                            && frontmatter.contains(&file_name_lower)
+                        frontmatter.contains("sources:") && frontmatter.contains(&file_name_lower)
                     } else {
                         false
                     }
@@ -880,6 +951,5 @@ fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String
 
 #[tauri::command]
 pub fn create_directory(path: String) -> Result<(), String> {
-    fs::create_dir_all(&path)
-        .map_err(|e| format!("Failed to create directory '{}': {}", path, e))
+    fs::create_dir_all(&path).map_err(|e| format!("Failed to create directory '{}': {}", path, e))
 }
