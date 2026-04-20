@@ -1,0 +1,26 @@
+{
+  "name": "@haowan36/llm-wiki-mcp",
+  "version": "0.3.2",
+  "description": "Read-only MCP server for browsing and querying LLM Wiki projects",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "llm-wiki-mcp": "./dist/mcp/http-server.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/mcp/http-server.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.27.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
+  }
+}

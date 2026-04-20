@@ -5,6 +5,10 @@ use chrono::Local;
 
 use crate::types::wiki::WikiProject;
 
+pub fn is_valid_wiki_project_path(root: &Path) -> bool {
+    root.join("schema.md").is_file() && root.join("wiki/index.md").is_file()
+}
+
 #[tauri::command]
 pub fn create_project(name: String, path: String) -> Result<WikiProject, String> {
     let root = Path::new(&path).join(&name);
@@ -222,7 +226,10 @@ related: []
   "outgoing-link": true,
   "starred": true
 }"#;
-    write_file_inner(root.join(".obsidian/core-plugins.json"), obsidian_core_plugins)?;
+    write_file_inner(
+        root.join(".obsidian/core-plugins.json"),
+        obsidian_core_plugins,
+    )?;
 
     Ok(WikiProject {
         name,
@@ -242,15 +249,9 @@ pub fn open_project(path: String) -> Result<WikiProject, String> {
     }
 
     // Validate that this looks like a wiki project
-    if !root.join("schema.md").exists() {
+    if !is_valid_wiki_project_path(root) {
         return Err(format!(
-            "Not a valid wiki project (missing schema.md): '{}'",
-            path
-        ));
-    }
-    if !root.join("wiki").is_dir() {
-        return Err(format!(
-            "Not a valid wiki project (missing wiki/ directory): '{}'",
+            "Not a valid wiki project (missing schema.md or wiki/index.md): '{}'",
             path
         ));
     }
@@ -267,8 +268,13 @@ pub fn open_project(path: String) -> Result<WikiProject, String> {
 
 fn write_file_inner(path: std::path::PathBuf, contents: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path.display(), e))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create parent dirs for '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
     }
     fs::write(&path, contents)
         .map_err(|e| format!("Failed to write file '{}': {}", path.display(), e))

@@ -1,7 +1,7 @@
+use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
 use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use arrow_array::{Float32Array, RecordBatch, StringArray, FixedSizeListArray, ArrayRef};
-use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -24,8 +24,14 @@ fn validate_page_id(page_id: &str) -> Result<(), String> {
         return Err("Invalid page_id: empty or too long".to_string());
     }
     // Only allow alphanumeric, hyphens, underscores, dots
-    if !page_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
-        return Err(format!("Invalid page_id: contains disallowed characters: {}", page_id));
+    if !page_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "Invalid page_id: contains disallowed characters: {}",
+            page_id
+        ));
     }
     Ok(())
 }
@@ -35,28 +41,27 @@ fn make_schema(dim: i32) -> Arc<Schema> {
         Field::new("page_id", DataType::Utf8, false),
         Field::new(
             "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dim,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
             false,
         ),
     ]))
 }
 
-fn make_batch(schema: Arc<Schema>, page_id: &str, embedding: Vec<f32>, dim: i32) -> Result<RecordBatch, String> {
+fn make_batch(
+    schema: Arc<Schema>,
+    page_id: &str,
+    embedding: Vec<f32>,
+    dim: i32,
+) -> Result<RecordBatch, String> {
     let ids: ArrayRef = Arc::new(StringArray::from(vec![page_id]));
     let values = Float32Array::from(embedding);
-    let vector: ArrayRef = Arc::new(
-        FixedSizeListArray::new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            dim,
-            Arc::new(values),
-            None,
-        )
-    );
-    RecordBatch::try_new(schema, vec![ids, vector])
-        .map_err(|e| format!("Batch error: {e}"))
+    let vector: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim,
+        Arc::new(values),
+        None,
+    ));
+    RecordBatch::try_new(schema, vec![ids, vector]).map_err(|e| format!("Batch error: {e}"))
 }
 
 /// Upsert a page embedding into LanceDB
@@ -78,23 +83,29 @@ pub async fn vector_upsert(
     let batch = make_batch(schema.clone(), &page_id, embedding, dim)?;
     let data = vec![batch];
 
-    let tables = db.table_names()
+    let tables = db
+        .table_names()
         .execute()
         .await
         .map_err(|e| format!("List tables error: {e}"))?;
 
     if tables.contains(&TABLE_NAME.to_string()) {
-        let table = db.open_table(TABLE_NAME)
+        let table = db
+            .open_table(TABLE_NAME)
             .execute()
             .await
             .map_err(|e| format!("Open table error: {e}"))?;
 
         // Delete existing entry then add new one
         if let Err(e) = table.delete(&format!("page_id = '{}'", page_id)).await {
-            eprintln!("[vectorstore] Warning: delete before upsert failed for '{}': {}", page_id, e);
+            eprintln!(
+                "[vectorstore] Warning: delete before upsert failed for '{}': {}",
+                page_id, e
+            );
         }
 
-        table.add(data)
+        table
+            .add(data)
             .execute()
             .await
             .map_err(|e| format!("Add error: {e}"))?;
@@ -120,7 +131,8 @@ pub async fn vector_search(
         .await
         .map_err(|e| format!("DB connect error: {e}"))?;
 
-    let tables = db.table_names()
+    let tables = db
+        .table_names()
         .execute()
         .await
         .map_err(|e| format!("List tables error: {e}"))?;
@@ -129,7 +141,8 @@ pub async fn vector_search(
         return Ok(vec![]);
     }
 
-    let table = db.open_table(TABLE_NAME)
+    let table = db
+        .open_table(TABLE_NAME)
         .execute()
         .await
         .map_err(|e| format!("Open table error: {e}"))?;
@@ -174,10 +187,7 @@ pub async fn vector_search(
 
 /// Delete a page from the vector index
 #[tauri::command]
-pub async fn vector_delete(
-    project_path: String,
-    page_id: String,
-) -> Result<(), String> {
+pub async fn vector_delete(project_path: String, page_id: String) -> Result<(), String> {
     validate_page_id(&page_id)?;
 
     let db = connect(&db_path(&project_path))
@@ -185,7 +195,8 @@ pub async fn vector_delete(
         .await
         .map_err(|e| format!("DB connect error: {e}"))?;
 
-    let tables = db.table_names()
+    let tables = db
+        .table_names()
         .execute()
         .await
         .map_err(|e| format!("List tables error: {e}"))?;
@@ -194,12 +205,14 @@ pub async fn vector_delete(
         return Ok(());
     }
 
-    let table = db.open_table(TABLE_NAME)
+    let table = db
+        .open_table(TABLE_NAME)
         .execute()
         .await
         .map_err(|e| format!("Open table error: {e}"))?;
 
-    table.delete(&format!("page_id = '{}'", page_id))
+    table
+        .delete(&format!("page_id = '{}'", page_id))
         .await
         .map_err(|e| format!("Delete error: {e}"))?;
 
@@ -208,15 +221,14 @@ pub async fn vector_delete(
 
 /// Get count of indexed vectors
 #[tauri::command]
-pub async fn vector_count(
-    project_path: String,
-) -> Result<usize, String> {
+pub async fn vector_count(project_path: String) -> Result<usize, String> {
     let db = connect(&db_path(&project_path))
         .execute()
         .await
         .map_err(|e| format!("DB connect error: {e}"))?;
 
-    let tables = db.table_names()
+    let tables = db
+        .table_names()
         .execute()
         .await
         .map_err(|e| format!("List tables error: {e}"))?;
@@ -225,12 +237,14 @@ pub async fn vector_count(
         return Ok(0);
     }
 
-    let table = db.open_table(TABLE_NAME)
+    let table = db
+        .open_table(TABLE_NAME)
         .execute()
         .await
         .map_err(|e| format!("Open table error: {e}"))?;
 
-    let count = table.count_rows(None)
+    let count = table
+        .count_rows(None)
         .await
         .map_err(|e| format!("Count error: {e}"))?;
 

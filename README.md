@@ -40,6 +40,7 @@
 - **Deep Research** — LLM-optimized search topics, multi-query web search, auto-ingest results into wiki
 - **Async Review System** — LLM flags items for human judgment, predefined actions, pre-generated search queries
 - **Chrome Web Clipper** — one-click web page capture with auto-ingest into knowledge base
+- **Read-Only MCP Server** — expose project discovery, wiki search, page read, and context bundle tools to external agents like Codex or Claude
 
 ## What is this?
 
@@ -388,6 +389,49 @@ npm run tauri build    # Production build
 2. Enable "Developer mode"
 3. Click "Load unpacked"
 4. Select the `extension/` directory
+
+### MCP Server for External Agents
+
+For local development in this repo, build and launch the stdio MCP server:
+
+```bash
+npm install
+npm run mcp -- --project /absolute/path/to/wiki
+```
+
+After publishing the MCP package, external agents can connect through:
+
+```bash
+npx -y @haowan36/llm-wiki-mcp --project /absolute/path/to/wiki
+```
+
+The standalone package now requires exactly one of `--project` or `--workspace`, and it serves MCP over Streamable HTTP on `http://<host>:<port>/mcp`. It exposes four read-only tools:
+- `llm_wiki_list_projects`
+- `llm_wiki_search`
+- `llm_wiki_read_page`
+- `llm_wiki_get_context`
+
+Example:
+
+```bash
+npx -y @haowan36/llm-wiki-mcp --workspace /absolute/path/to/workspace
+```
+
+For semantic or hybrid retrieval, also set embedding config so the server can embed the query and search the existing LanceDB index under `.llm-wiki/lancedb`:
+
+```bash
+LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
+LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
+LLM_WIKI_EMBEDDING_API_KEY=optional-key \
+  npx -y @haowan36/llm-wiki-mcp \
+    --workspace /absolute/path/to/workspace \
+    --host 0.0.0.0 \
+    --port 18765
+```
+
+`llm_wiki_search` and `llm_wiki_get_context` support `mode: "keyword" | "semantic" | "hybrid"`. `hybrid` is the recommended default. If embedding config is missing, hybrid falls back to keyword-only retrieval.
+
+This first version is read-only. It does not ingest or modify wiki content.
 
 ## Quick Start
 

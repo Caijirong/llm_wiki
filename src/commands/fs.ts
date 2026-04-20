@@ -1,5 +1,23 @@
 import { invoke } from "@tauri-apps/api/core"
 import type { FileNode, WikiProject } from "@/types/wiki"
+import type { McpConfig } from "@/stores/wiki-store"
+
+export type McpRuntimeStatus =
+  | "stopped"
+  | "starting"
+  | "running"
+  | "port_conflict"
+  | "no_project"
+  | "error"
+
+export interface McpStatus {
+  status: McpRuntimeStatus
+  host?: string
+  port?: number
+  currentProject?: string | null
+  knownProjects?: string[]
+  lastError?: string | null
+}
 
 export async function readFile(path: string): Promise<string> {
   return invoke<string>("read_file", { path })
@@ -52,4 +70,28 @@ export async function openProject(path: string): Promise<WikiProject> {
 
 export async function clipServerStatus(): Promise<string> {
   return invoke<string>("clip_server_status")
+}
+
+export async function mcpStatus(): Promise<McpStatus> {
+  return invoke<McpStatus>("mcp_status")
+}
+
+export async function mcpStart(): Promise<void> {
+  return invoke("mcp_start")
+}
+
+export async function mcpStop(): Promise<void> {
+  return invoke("mcp_stop")
+}
+
+export async function mcpUpdateProject(projectPath: string | null): Promise<void> {
+  return invoke("mcp_update_project", { projectPath })
+}
+
+export async function mcpUpdateKnownProjects(projectPaths: string[]): Promise<void> {
+  return invoke("mcp_update_known_projects", { projectPaths })
+}
+
+export async function mcpUpdateConfig(config: McpConfig): Promise<void> {
+  return invoke("mcp_update_config", { config })
 }

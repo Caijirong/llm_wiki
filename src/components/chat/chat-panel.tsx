@@ -10,9 +10,10 @@ import { executeIngestWrites } from "@/lib/ingest"
 import { listDirectory, readFile, writeFile, deleteFile } from "@/commands/fs"
 import { searchWiki } from "@/lib/search"
 import { buildRetrievalGraph, getRelatedNodes } from "@/lib/graph-relevance"
+import { buildRetrievalContextBundle } from "@/lib/retrieval-core"
 import { useReviewStore } from "@/stores/review-store"
 import type { FileNode } from "@/types/wiki"
-import { normalizePath, getFileName, getRelativePath } from "@/lib/path-utils"
+import { normalizePath, getFileName } from "@/lib/path-utils"
 import { detectLanguage } from "@/lib/detect-language"
 
 // Store the page mapping from the last query so SourceFilesBar can show which pages were cited
@@ -173,11 +174,6 @@ export function ChatPanel() {
         const dataVersion = useWikiStore.getState().dataVersion
         const maxCtx = llmConfig.maxContextSize || 204800
 
-        // ── Budget allocation ──────────────────────────────────
-        const INDEX_BUDGET = Math.floor(maxCtx * 0.05)
-        const PAGE_BUDGET = Math.floor(maxCtx * 0.6)
-        const MAX_PAGE_SIZE = Math.min(Math.floor(PAGE_BUDGET * 0.3), 30_000)
-
         const [rawIndex, purpose] = await Promise.all([
           readFile(`${pp}/wiki/index.md`).catch(() => ""),
           readFile(`${pp}/purpose.md`).catch(() => ""),
@@ -186,33 +182,6 @@ export function ChatPanel() {
         // ── Phase 1: Tokenized search → top 10 ────────────────
         const searchResults = await searchWiki(pp, text)
         const topSearchResults = searchResults.slice(0, 10)
-
-        // ── Trim index by relevance if over budget ─────────────
-        let index = rawIndex
-        if (rawIndex.length > INDEX_BUDGET) {
-          const { tokenizeQuery } = await import("@/lib/search")
-          const tokens = tokenizeQuery(text)
-          const lines = rawIndex.split("\n")
-          const keptLines: string[] = []
-          let keptSize = 0
-
-          for (const line of lines) {
-            const isHeader = line.startsWith("##")
-            const lower = line.toLowerCase()
-            const isRelevant = tokens.some((t) => lower.includes(t))
-
-            if (isHeader || isRelevant) {
-              if (keptSize + line.length + 1 <= INDEX_BUDGET) {
-                keptLines.push(line)
-                keptSize += line.length + 1
-              }
-            }
-          }
-          index = keptLines.join("\n")
-          if (index.length < rawIndex.length) {
-            index += "\n\n[...index trimmed to relevant entries...]"
-          }
-        }
 
         // ── Phase 2: Graph 1-level expansion ───────────────────
         // Note: Vector search (if enabled) is already merged into searchResults
@@ -236,52 +205,23 @@ export function ChatPanel() {
         }
         graphExpansions.sort((a, b) => b.relevance - a.relevance)
 
-        // ── Phase 3 & 4: Page budget control ───────────────────
-        let usedChars = 0
-        type PageEntry = { title: string; path: string; content: string; priority: number }
-        const relevantPages: PageEntry[] = []
+        const retrievalBundle = await buildRetrievalContextBundle({
+          projectPath: pp,
+          query: text,
+          maxContextSize: maxCtx,
+          index: rawIndex,
+          purpose,
+          searchResults: topSearchResults,
+          graphExpansions,
+          overviewPath: `${pp}/wiki/overview.md`,
+          readText: async (filePath) => readFile(filePath),
+        })
 
-        const tryAddPage = async (title: string, filePath: string, priority: number): Promise<boolean> => {
-          if (usedChars >= PAGE_BUDGET) return false
-          try {
-            const raw = await readFile(filePath)
-            const relativePath = getRelativePath(filePath, pp)
-            const truncated = raw.length > MAX_PAGE_SIZE
-              ? raw.slice(0, MAX_PAGE_SIZE) + "\n\n[...truncated...]"
-              : raw
-            if (usedChars + truncated.length > PAGE_BUDGET) return false
-            usedChars += truncated.length
-            relevantPages.push({ title, path: relativePath, content: truncated, priority })
-            return true
-          } catch { return false }
-        }
-
-        // P0: Title matches
-        for (const r of topSearchResults.filter((r) => r.titleMatch)) {
-          await tryAddPage(r.title, r.path, 0)
-        }
-        // P1: Content matches
-        for (const r of topSearchResults.filter((r) => !r.titleMatch)) {
-          await tryAddPage(r.title, r.path, 1)
-        }
-        // P2: Graph expansions
-        for (const exp of graphExpansions) {
-          await tryAddPage(exp.title, exp.path, 2)
-        }
-        // P3: Overview fallback
-        if (relevantPages.length === 0) {
-          await tryAddPage("Overview", `${pp}/wiki/overview.md`, 3)
-        }
-
-        const pagesContext = relevantPages.length > 0
-          ? relevantPages.map((p, i) =>
+        const pagesContext = retrievalBundle.pages.length > 0
+          ? retrievalBundle.pages.map((p, i) =>
               `### [${i + 1}] ${p.title}\nPath: ${p.path}\n\n${p.content}`
             ).join("\n\n---\n\n")
           : "(No wiki pages found)"
-
-        const pageList = relevantPages.map((p, i) =>
-          `[${i + 1}] ${p.title} (${p.path})`
-        ).join("\n")
 
         systemMessages.push({
           role: "system",
@@ -301,14 +241,14 @@ export function ChatPanel() {
             "",
             "Use markdown formatting for clarity.",
             "",
-            purpose ? `## Wiki Purpose\n${purpose}` : "",
-            index ? `## Wiki Index\n${index}` : "",
-            relevantPages.length > 0 ? `## Page List\n${pageList}` : "",
+            retrievalBundle.purpose ? `## Wiki Purpose\n${retrievalBundle.purpose}` : "",
+            retrievalBundle.index ? `## Wiki Index\n${retrievalBundle.index}` : "",
+            retrievalBundle.pages.length > 0 ? `## Page List\n${retrievalBundle.pageList}` : "",
             `## Wiki Pages\n\n${pagesContext}`,
           ].filter(Boolean).join("\n"),
         })
 
-        lastQueryPages = relevantPages.map((p) => ({ title: p.title, path: p.path }))
+        lastQueryPages = retrievalBundle.references
         queryRefs = [...lastQueryPages]
       }
 

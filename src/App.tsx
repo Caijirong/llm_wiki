@@ -4,8 +4,23 @@ import i18n from "@/i18n"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useChatStore } from "@/stores/chat-store"
-import { listDirectory, openProject } from "@/commands/fs"
-import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig } from "@/lib/project-store"
+import {
+  listDirectory,
+  mcpUpdateConfig,
+  mcpUpdateKnownProjects,
+  mcpUpdateProject,
+  openProject,
+} from "@/commands/fs"
+import {
+  getLastProject,
+  getRecentProjects,
+  saveLastProject,
+  loadLlmConfig,
+  loadLanguage,
+  loadSearchApiConfig,
+  loadEmbeddingConfig,
+  loadMcpConfig,
+} from "@/lib/project-store"
 import { loadReviewItems, loadChatHistory } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
@@ -16,18 +31,42 @@ import type { WikiProject } from "@/types/wiki"
 
 function App() {
   const project = useWikiStore((s) => s.project)
+  const mcpConfig = useWikiStore((s) => s.mcpConfig)
   const setProject = useWikiStore((s) => s.setProject)
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
   const setActiveView = useWikiStore((s) => s.setActiveView)
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [mcpConfigLoaded, setMcpConfigLoaded] = useState(false)
+
+  async function syncMcpConfigOnInit() {
+    const savedMcpConfig = await loadMcpConfig()
+    if (savedMcpConfig) {
+      useWikiStore.getState().setMcpConfig(savedMcpConfig)
+    }
+    setMcpConfigLoaded(true)
+  }
 
   // Set up auto-save and clip watcher once on mount
   useEffect(() => {
     setupAutoSave()
     startClipWatcher()
   }, [])
+
+  useEffect(() => {
+    if (!mcpConfigLoaded) return
+
+    mcpUpdateConfig(mcpConfig).catch((err) => {
+      console.error("Failed to sync MCP config to Tauri:", err)
+    })
+  }, [
+    mcpConfigLoaded,
+    mcpConfig.autoStart,
+    mcpConfig.enabled,
+    mcpConfig.host,
+    mcpConfig.port,
+  ])
 
   // Auto-open last project on startup
   useEffect(() => {
@@ -45,6 +84,7 @@ function App() {
         if (savedEmbeddingConfig) {
           useWikiStore.getState().setEmbeddingConfig(savedEmbeddingConfig)
         }
+        await syncMcpConfigOnInit()
         const savedLang = await loadLanguage()
         if (savedLang) {
           await i18n.changeLanguage(savedLang)
@@ -54,12 +94,15 @@ function App() {
           try {
             const proj = await openProject(lastProject.path)
             await handleProjectOpened(proj)
-          } catch {
-            // Last project no longer valid
+          } catch (err) {
+            console.error(
+              `Failed to auto-open last project (${lastProject.path}); continuing without active project:`,
+              err
+            )
           }
         }
-      } catch {
-        // ignore init errors
+      } catch (err) {
+        console.error("App initialization failed (including MCP startup sync):", err)
       } finally {
         setLoading(false)
       }
@@ -80,6 +123,9 @@ function App() {
       )
     })
     // Notify local clip server of the current project + all recent projects
+    mcpUpdateProject(proj.path).catch((err) => {
+      console.error(`Failed to sync MCP current project (${proj.path}) to Tauri:`, err)
+    })
     fetch("http://127.0.0.1:19827/project", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -89,12 +135,18 @@ function App() {
     // Send all recent projects to clip server for extension project picker
     getRecentProjects().then((recents) => {
       const projects = recents.map((p) => ({ name: p.name, path: p.path }))
+      const paths = recents.map((p) => p.path)
+      mcpUpdateKnownProjects(paths).catch((err) => {
+        console.error("Failed to sync MCP known projects to Tauri:", err)
+      })
       fetch("http://127.0.0.1:19827/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ projects }),
       }).catch(() => {})
-    }).catch(() => {})
+    }).catch((err) => {
+      console.error("Failed to load recent projects for MCP/clip sync:", err)
+    })
     try {
       const tree = await listDirectory(proj.path)
       setFileTree(tree)
@@ -152,6 +204,9 @@ function App() {
   }
 
   function handleSwitchProject() {
+    mcpUpdateProject(null).catch((err) => {
+      console.error("Failed to clear MCP current project in Tauri:", err)
+    })
     setProject(null)
     setFileTree([])
     setSelectedFile(null)
