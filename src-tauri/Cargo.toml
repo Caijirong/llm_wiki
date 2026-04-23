@@ -41,6 +41,9 @@ axum = "0.7"
 tokio-util = "0.7"
 rmcp = { version = "1.5.0", default-features = false, features = ["client", "macros", "server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

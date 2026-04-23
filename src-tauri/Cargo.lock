@@ -4489,6 +4489,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tokio-util",
+ "windows-sys 0.61.2",
  "zip 2.4.2",
 ]
 
