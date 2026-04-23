@@ -1,5 +1,6 @@
 mod clip_server;
 mod commands;
+mod file_receiver_server;
 mod mcp_server;
 mod types;
 
@@ -16,6 +17,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(mcp_server::McpRuntimeManager::default())
+        .manage(file_receiver_server::FileReceiverRuntimeManager::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -42,6 +44,11 @@ pub fn run() {
             mcp_server::mcp_update_project,
             mcp_server::mcp_update_known_projects,
             mcp_server::mcp_update_config,
+            file_receiver_server::file_receiver_status,
+            file_receiver_server::file_receiver_update_config,
+            file_receiver_server::file_receiver_update_known_projects,
+            file_receiver_server::list_uploads,
+            file_receiver_server::get_upload,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -92,8 +99,10 @@ pub fn run() {
             }
 
             if let tauri::RunEvent::Exit = event {
-                let manager = app.state::<mcp_server::McpRuntimeManager>();
-                let _ = manager.stop();
+                let mcp = app.state::<mcp_server::McpRuntimeManager>();
+                let uploads = app.state::<file_receiver_server::FileReceiverRuntimeManager>();
+                let _ = mcp.stop();
+                let _ = uploads.stop();
             }
             let _ = (app, event); // suppress unused warnings on non-macOS
         });
