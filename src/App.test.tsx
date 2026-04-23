@@ -4,7 +4,11 @@ import { describe, expect, it, vi } from "vitest"
 
 const {
   persistedMcpConfig,
+  persistedFileReceiverConfig,
   loadMcpConfig,
+  loadFileReceiverConfig,
+  fileReceiverUpdateConfig,
+  fileReceiverUpdateKnownProjects,
   mcpUpdateConfig,
   mcpUpdateKnownProjects,
   mcpUpdateProject,
@@ -16,12 +20,32 @@ const {
     host: "127.0.0.1",
     port: 18765,
   },
+  persistedFileReceiverConfig: {
+    enabled: true,
+    autoStart: true,
+    host: "127.0.0.1",
+    port: 18766,
+    staticToken: "secret",
+    maxFileSizeBytes: 1024 * 1024 * 1024,
+    uploadTtlHours: 168,
+  },
   loadMcpConfig: vi.fn(async () => ({
     enabled: true,
     autoStart: false,
     host: "127.0.0.1",
     port: 18765,
   })),
+  loadFileReceiverConfig: vi.fn(async () => ({
+    enabled: true,
+    autoStart: true,
+    host: "127.0.0.1",
+    port: 18766,
+    staticToken: "secret",
+    maxFileSizeBytes: 1024 * 1024 * 1024,
+    uploadTtlHours: 168,
+  })),
+  fileReceiverUpdateConfig: vi.fn(async () => {}),
+  fileReceiverUpdateKnownProjects: vi.fn(async () => {}),
   mcpUpdateConfig: vi.fn(async () => {}),
   mcpUpdateKnownProjects: vi.fn(async () => {}),
   mcpUpdateProject: vi.fn(async () => {}),
@@ -40,6 +64,8 @@ vi.mock("@/i18n", () => ({
 vi.mock("@/commands/fs", () => ({
   listDirectory: vi.fn(async () => []),
   openProject,
+  fileReceiverUpdateConfig,
+  fileReceiverUpdateKnownProjects,
   mcpUpdateProject,
   mcpUpdateKnownProjects,
   mcpUpdateConfig,
@@ -54,6 +80,7 @@ vi.mock("@/lib/project-store", () => ({
   loadEmbeddingConfig: vi.fn(async () => null),
   loadLanguage: vi.fn(async () => null),
   loadMcpConfig,
+  loadFileReceiverConfig,
 }))
 
 vi.mock("@/lib/persist", () => ({
@@ -83,12 +110,16 @@ vi.mock("@/components/project/create-project-dialog", () => ({
 
 import App from "./App"
 
-describe("App MCP startup sync", () => {
-  it("loads mcp config on startup and syncs the opened project to tauri", async () => {
+describe("App runtime startup sync", () => {
+  it("loads runtime configs on startup and syncs the opened project to tauri", async () => {
     render(<App />)
     await waitFor(() => expect(loadMcpConfig).toHaveBeenCalled())
+    await waitFor(() => expect(loadFileReceiverConfig).toHaveBeenCalled())
     await waitFor(() =>
       expect(mcpUpdateConfig).toHaveBeenCalledWith(persistedMcpConfig)
+    )
+    await waitFor(() =>
+      expect(fileReceiverUpdateConfig).toHaveBeenCalledWith(persistedFileReceiverConfig)
     )
     await waitFor(() =>
       expect(mcpUpdateProject).toHaveBeenCalledWith("/tmp/wiki")
@@ -96,8 +127,14 @@ describe("App MCP startup sync", () => {
     await waitFor(() =>
       expect(mcpUpdateKnownProjects).toHaveBeenCalledWith(["/tmp/wiki"])
     )
+    await waitFor(() =>
+      expect(fileReceiverUpdateKnownProjects).toHaveBeenCalledWith(["/tmp/wiki"])
+    )
     expect(loadMcpConfig.mock.invocationCallOrder[0]).toBeLessThan(
       mcpUpdateConfig.mock.invocationCallOrder[0]
+    )
+    expect(loadFileReceiverConfig.mock.invocationCallOrder[0]).toBeLessThan(
+      fileReceiverUpdateConfig.mock.invocationCallOrder[0]
     )
   })
 })

@@ -5,6 +5,7 @@ import type {
   SearchApiConfig,
   EmbeddingConfig,
   McpConfig,
+  FileReceiverConfig,
 } from "@/stores/wiki-store"
 
 const STORE_NAME = "app-state.json"
@@ -80,6 +81,7 @@ export async function loadEmbeddingConfig(): Promise<EmbeddingConfig | null> {
 }
 
 const MCP_CONFIG_KEY = "mcpConfig"
+const FILE_RECEIVER_CONFIG_KEY = "fileReceiverConfig"
 
 export async function saveMcpConfig(config: McpConfig): Promise<void> {
   const store = await getStore()
@@ -89,6 +91,16 @@ export async function saveMcpConfig(config: McpConfig): Promise<void> {
 export async function loadMcpConfig(): Promise<McpConfig | null> {
   const store = await getStore()
   return (await store.get<McpConfig>(MCP_CONFIG_KEY)) ?? null
+}
+
+export async function saveFileReceiverConfig(config: FileReceiverConfig): Promise<void> {
+  const store = await getStore()
+  await store.set(FILE_RECEIVER_CONFIG_KEY, config)
+}
+
+export async function loadFileReceiverConfig(): Promise<FileReceiverConfig | null> {
+  const store = await getStore()
+  return (await store.get<FileReceiverConfig>(FILE_RECEIVER_CONFIG_KEY)) ?? null
 }
 
 export async function removeFromRecentProjects(
