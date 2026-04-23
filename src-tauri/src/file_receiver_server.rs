@@ -47,6 +47,7 @@ const UPLOAD_HISTORY_RELATIVE_PATH: &str = ".llm-wiki/upload-history.json";
 const UPLOAD_METADATA_FILE_NAME: &str = "metadata.json";
 const UPLOAD_PAYLOAD_FILE_NAME: &str = "payload.bin";
 const INGEST_QUEUE_RELATIVE_PATH: &str = ".llm-wiki/ingest-queue.json";
+const MAX_METADATA_FIELD_BYTES: usize = 16 * 1024;
 const UPLOAD_PROGRESS_PERSIST_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
 static UPLOAD_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -193,7 +194,18 @@ impl FileReceiverSharedState {
     }
 
     fn set_known_projects(&self, project_paths: Vec<String>) {
-        *lock_or_recover(&self.known_projects) = project_paths;
+        let normalized = project_paths
+            .into_iter()
+            .filter_map(|path| {
+                let trimmed = path.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(normalize_project_path(trimmed).unwrap_or_else(|_| trimmed.to_string()))
+                }
+            })
+            .collect();
+        *lock_or_recover(&self.known_projects) = normalized;
     }
 
     fn known_projects(&self) -> Vec<String> {
@@ -563,6 +575,14 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
     }
 }
 
+fn normalize_project_path(project_path: &str) -> Result<String, String> {
+    let trimmed = non_empty_trimmed(project_path)
+        .ok_or_else(|| "projectPath must not be empty".to_string())?;
+    let canonical = fs::canonicalize(trimmed)
+        .map_err(|err| format!("Failed to resolve projectPath '{}': {}", trimmed, err))?;
+    Ok(canonical.to_string_lossy().replace('\\', "/"))
+}
+
 fn generate_upload_id() -> String {
     format!(
         "upload-{}-{}",
@@ -621,9 +641,7 @@ async fn cleanup_failed_upload(
 }
 
 fn validate_project_path(project_path: &str, known_projects: &[String]) -> Result<String, String> {
-    let project = non_empty_trimmed(project_path)
-        .ok_or_else(|| "projectPath must not be empty".to_string())?
-        .to_string();
+    let project = normalize_project_path(project_path)?;
     if !known_projects.iter().any(|item| item == &project) {
         return Err(format!("Unknown projectPath '{}'", project));
     }
@@ -641,13 +659,27 @@ fn resolve_requested_project_paths(
     known_projects: &[String],
 ) -> Result<(Vec<String>, bool), String> {
     if let Some(project_path) = requested_project_path.and_then(non_empty_trimmed) {
-        if !known_projects.iter().any(|known| known == project_path) {
-            return Err(format!("Unknown projectPath '{}'", project_path));
+        let normalized = normalize_project_path(project_path)?;
+        if !known_projects.iter().any(|known| known == &normalized) {
+            return Err(format!("Unknown projectPath '{}'", normalized));
         }
-        return Ok((vec![project_path.to_string()], true));
+        return Ok((vec![normalized], true));
     }
 
     Ok((known_projects.to_vec(), false))
+}
+
+async fn read_limited_text_field(
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<String, StatusCode> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+        if bytes.len() + chunk.len() > MAX_METADATA_FIELD_BYTES {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 fn validate_safe_path_component(value: &str, field_name: &str) -> Result<(), String> {
@@ -999,35 +1031,29 @@ async fn post_upload(
         }
 
         if name == "projectPath" {
-            let validated = validate_project_path(
-                &field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?,
-                &known_projects,
-            )
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            let field_text = read_limited_text_field(field).await?;
+            let validated = validate_project_path(&field_text, &known_projects)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
             project_lock = Some(shared_state.project_lock(&validated));
             project_path = Some(validated);
             continue;
         }
 
         if name == "fileName" {
-            file_name = Some(
-                sanitize_file_name(&field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?)
-                    .map_err(|_| StatusCode::BAD_REQUEST)?,
-            );
+            let field_text = read_limited_text_field(field).await?;
+            file_name = Some(sanitize_file_name(&field_text).map_err(|_| StatusCode::BAD_REQUEST)?);
             continue;
         }
 
         if name == "mimeType" {
-            mime_type =
-                non_empty_trimmed(&field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?)
-                    .map(str::to_string);
+            let field_text = read_limited_text_field(field).await?;
+            mime_type = non_empty_trimmed(&field_text).map(str::to_string);
             continue;
         }
 
         if name == "folderContext" {
-            folder_context =
-                non_empty_trimmed(&field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?)
-                    .map(str::to_string);
+            let field_text = read_limited_text_field(field).await?;
+            folder_context = non_empty_trimmed(&field_text).map(str::to_string);
             continue;
         }
 
@@ -1289,20 +1315,28 @@ async fn post_upload(
         completed.stored_source_path = Some(stored_relative_path.clone());
         completed.updated_at = now_millis();
         if let Err(err) = upsert_upload_record(&normalized_project_path, &completed) {
-            queue.pop();
-            if let Err(queue_rollback_err) =
-                write_ingest_queue_values(&normalized_project_path, &queue)
-            {
-                break 'commit Err(format!(
-                    "{}; queue rollback failed: {}",
-                    err, queue_rollback_err
-                ));
-            }
             if let Err(file_rollback_err) = tokio::fs::rename(&stored_abs_path, &payload_path).await
             {
                 break 'commit Err(format!(
                     "{}; source rollback failed: {}",
                     err, file_rollback_err
+                ));
+            }
+            queue.pop();
+            if let Err(queue_rollback_err) =
+                write_ingest_queue_values(&normalized_project_path, &queue)
+            {
+                if let Err(source_restore_err) =
+                    tokio::fs::rename(&payload_path, &stored_abs_path).await
+                {
+                    break 'commit Err(format!(
+                        "{}; queue rollback failed: {}; source restore failed: {}",
+                        err, queue_rollback_err, source_restore_err
+                    ));
+                }
+                break 'commit Err(format!(
+                    "{}; queue rollback failed: {}",
+                    err, queue_rollback_err
                 ));
             }
             break 'commit Err(err);
@@ -1526,7 +1560,9 @@ impl FileReceiverRuntimeCore {
         for path in project_paths {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
-                paths.insert(trimmed.to_string());
+                let normalized =
+                    normalize_project_path(trimmed).unwrap_or_else(|_| trimmed.to_string());
+                paths.insert(normalized);
             }
         }
         self.known_projects = paths.into_iter().collect();
@@ -1961,6 +1997,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_upload_when_project_path_uses_trailing_slash_variant() {
+        let project = TempWikiProject::new("upload-normalized-project-path");
+        let response = post_test_upload(
+            test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
+            valid_upload_body(
+                &format!("{}/", project.path_string()),
+                "normalized.txt",
+                b"ok",
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(Path::new(&project.path_string())
+            .join("raw/sources/normalized.txt")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_metadata_field_before_file_streaming() {
+        let project = TempWikiProject::new("upload-oversized-metadata");
+        let response = post_test_upload(
+            test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
+            multipart_with_large_folder_context(
+                &project.path_string(),
+                MAX_METADATA_FIELD_BYTES + 1,
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(load_upload_history(&project.path_string())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn rejects_second_file_part_and_marks_first_upload_failed() {
         let project = TempWikiProject::new("upload-two-files");
         let response = post_test_upload(
@@ -2198,6 +2271,17 @@ mod tests {
             text_part("projectPath", project_path),
             file_part("file", "first.txt", "text/plain", b"first"),
             file_part("file", "second.txt", "text/plain", b"second"),
+        ])
+    }
+
+    fn multipart_with_large_folder_context(
+        project_path: &str,
+        folder_context_len: usize,
+    ) -> TestMultipartRequest {
+        build_multipart_request(vec![
+            text_part("projectPath", project_path),
+            text_part("folderContext", &"a".repeat(folder_context_len)),
+            file_part("file", "meta.txt", "text/plain", b"hello"),
         ])
     }
 
