@@ -420,8 +420,8 @@ fn replace_file(path: &Path, temp_path: &Path) -> Result<(), String> {
                 temp_wide.as_ptr(),
                 std::ptr::null(),
                 REPLACEFILE_IGNORE_MERGE_ERRORS,
-                0,
-                0,
+                std::ptr::null(),
+                std::ptr::null(),
             )
         };
         if result == 0 {
