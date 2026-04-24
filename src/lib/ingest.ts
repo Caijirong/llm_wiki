@@ -12,6 +12,18 @@ const FILE_BLOCK_REGEX = /---FILE:\s*([^\n-]+?)\s*---\n([\s\S]*?)---END FILE---/
 
 export const LANGUAGE_RULE = "## Language Rule\n- ALWAYS match the language of the source document. If the source is in Chinese, write in Chinese. If in English, write in English. Wiki page titles, content, and descriptions should all be in the same language as the source material."
 
+export interface IngestQueueMetadataPatch {
+  cacheHit?: boolean
+  filesWritten?: string[]
+  reviewItemCount?: number
+  finishedAt?: number
+}
+
+export interface AutoIngestOptions {
+  queueTaskId?: string
+  onQueueMetadata?: (taskId: string, patch: IngestQueueMetadataPatch) => void | Promise<void>
+}
+
 /**
  * Auto-ingest: reads source → LLM analyzes → LLM writes wiki pages, all in one go.
  * Used when importing new files.
@@ -22,9 +34,14 @@ export async function autoIngest(
   llmConfig: LlmConfig,
   signal?: AbortSignal,
   folderContext?: string,
+  options?: AutoIngestOptions,
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
+  const updateQueueMetadata = async (patch: IngestQueueMetadataPatch): Promise<void> => {
+    if (!options?.queueTaskId || !options.onQueueMetadata) return
+    await options.onQueueMetadata(options.queueTaskId, patch)
+  }
   const activity = useActivityStore.getState()
   const fileName = getFileName(sp)
   const activityId = activity.addItem({
@@ -46,6 +63,10 @@ export async function autoIngest(
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   const cachedFiles = await checkIngestCache(pp, fileName, sourceContent)
   if (cachedFiles !== null) {
+    await updateQueueMetadata({
+      cacheHit: true,
+      filesWritten: cachedFiles,
+    })
     activity.updateItem(activityId, {
       status: "done",
       detail: `Skipped (unchanged) — ${cachedFiles.length} files from previous ingest`,
@@ -53,6 +74,7 @@ export async function autoIngest(
     })
     return cachedFiles
   }
+  await updateQueueMetadata({ cacheHit: false })
 
   const truncatedContent = sourceContent.length > 50000
     ? sourceContent.slice(0, 50000) + "\n\n[...truncated...]"
@@ -175,6 +197,10 @@ export async function autoIngest(
   if (reviewItems.length > 0) {
     useReviewStore.getState().addItems(reviewItems)
   }
+  await updateQueueMetadata({
+    filesWritten: writtenPaths,
+    reviewItemCount: reviewItems.length,
+  })
 
   // ── Step 5: Save to cache ───────────────────────────────────
   if (writtenPaths.length > 0) {
