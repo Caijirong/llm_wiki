@@ -40,12 +40,15 @@ const DEFAULT_MCP_PORT: u16 = 18765;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_CONTEXT_PAGE_LIMIT: usize = 5;
 const DEFAULT_PAGE_CHAR_LIMIT: usize = 4000;
+const DEFAULT_INGEST_POLL_INTERVAL_SECONDS: u64 = 60;
 const MCP_ENDPOINT_PATH: &str = "/mcp";
 const UPLOADS_ENDPOINT_PATH: &str = "/uploads";
 const UPLOADS_ITEM_PATH_TEMPLATE: &str = "/uploads/{upload_id}";
 const NO_PROJECT_MESSAGE: &str =
     "No active project configured. Open a project in LLM Wiki or pass a known project_id.";
 const INGEST_QUEUE_RELATIVE_PATH: &str = ".llm-wiki/ingest-queue.json";
+const INGEST_STATUS_HINT: &str =
+    "Ingest runs asynchronously inside the desktop app and can take a while for large or complex sources. A task in processing is usually still working, not stuck. Ask the user to check again later instead of polling aggressively.";
 static INGEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -313,6 +316,8 @@ pub struct McpGetIngestTaskResponse {
     pub task_id: String,
     pub found: bool,
     pub task: Option<McpIngestTask>,
+    pub status_hint: String,
+    pub recommended_poll_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -324,6 +329,8 @@ pub struct McpGetIngestQueueResponse {
     pub current_task: Option<McpIngestTask>,
     pub limit: usize,
     pub queue: Vec<McpIngestTask>,
+    pub status_hint: String,
+    pub recommended_poll_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -543,7 +550,7 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_get_ingest_task",
-        description = "Query a single ingest task by task id from the shared ingest queue file."
+        description = "Query a single ingest task by task id from the shared ingest queue file. Ingest is asynchronous and may take a while; avoid aggressive polling and ask the user to check again later when a task is still processing."
     )]
     async fn get_ingest_task(
         &self,
@@ -561,7 +568,7 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_get_ingest_queue",
-        description = "Return the persisted ingest queue and summary from the shared queue file."
+        description = "Return the persisted ingest queue and summary from the shared queue file. Ingest is asynchronous and may take a while; avoid aggressive polling and ask the user to check again later when tasks are still processing."
     )]
     async fn get_ingest_queue(
         &self,
@@ -1413,6 +1420,8 @@ impl EmbeddedMcpTools {
             task_id: trimmed_task_id.to_string(),
             found: task.is_some(),
             task,
+            status_hint: INGEST_STATUS_HINT.to_string(),
+            recommended_poll_interval_seconds: DEFAULT_INGEST_POLL_INTERVAL_SECONDS,
         })
     }
 
@@ -1440,6 +1449,8 @@ impl EmbeddedMcpTools {
             current_task,
             limit,
             queue: recent_tasks,
+            status_hint: INGEST_STATUS_HINT.to_string(),
+            recommended_poll_interval_seconds: DEFAULT_INGEST_POLL_INTERVAL_SECONDS,
         })
     }
 }
@@ -2475,6 +2486,10 @@ OpenAI builds GPT models and AI systems.
         assert_eq!(queue_response.limit, 2);
         assert_eq!(queue_response.recent_tasks.len(), 2);
         assert_eq!(queue_response.queue.len(), 2);
+        assert_eq!(queue_response.recommended_poll_interval_seconds, 60);
+        assert!(queue_response
+            .status_hint
+            .contains("check again later"));
         assert_eq!(queue_response.recent_tasks[0].id, "task-processing-1");
         assert_eq!(queue_response.recent_tasks[1].id, "task-done-1");
         assert_eq!(
@@ -2511,12 +2526,16 @@ OpenAI builds GPT models and AI systems.
                 .status,
             "pending"
         );
+        assert_eq!(task_response.recommended_poll_interval_seconds, 60);
+        assert!(task_response.status_hint.contains("processing"));
 
         let missing_task = EmbeddedMcpTools
             .llm_wiki_get_ingest_task(&state, "missing-task-id", None)
             .expect("missing task query should still succeed");
         assert!(!missing_task.found);
         assert!(missing_task.task.is_none());
+        assert_eq!(missing_task.recommended_poll_interval_seconds, 60);
+        assert!(missing_task.status_hint.contains("check again later"));
     }
 
     #[test]
