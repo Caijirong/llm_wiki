@@ -15,9 +15,12 @@ fn clip_server_status() -> String {
 pub fn run() {
     clip_server::start_clip_server();
 
+    let uploads = file_receiver_server::FileReceiverRuntimeManager::default();
+    let mcp = mcp_server::McpRuntimeManager::with_file_receiver(uploads.clone());
+
     tauri::Builder::default()
-        .manage(mcp_server::McpRuntimeManager::default())
-        .manage(file_receiver_server::FileReceiverRuntimeManager::default())
+        .manage(mcp)
+        .manage(uploads)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())

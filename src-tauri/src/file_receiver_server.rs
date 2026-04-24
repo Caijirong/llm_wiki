@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fs, io,
-    net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, MutexGuard},
@@ -18,10 +17,8 @@ use axum::{
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::async_runtime::JoinHandle;
 use tauri::State;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use axum::{body::Body, http::Request};
@@ -36,10 +33,12 @@ use windows_sys::Win32::{
     Storage::FileSystem::{ReplaceFileW, REPLACEFILE_IGNORE_MERGE_ERRORS},
 };
 
-use crate::commands::project::is_valid_wiki_project_path;
+use crate::{commands::project::is_valid_wiki_project_path, mcp_server::McpRuntimeManager};
 
 pub const DEFAULT_FILE_RECEIVER_HOST: &str = "127.0.0.1";
-pub const DEFAULT_FILE_RECEIVER_PORT: u16 = 18766;
+pub const DEFAULT_FILE_RECEIVER_PORT: u16 = 18765;
+pub const UPLOAD_TOKEN_HEADER_NAME: &str = "x-llm-wiki-upload-token";
+pub const UPLOAD_TOKEN_HEADER_DISPLAY_NAME: &str = "X-LLM-Wiki-Upload-Token";
 const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_UPLOAD_TTL_HOURS: u64 = 24 * 7;
 const UPLOADS_RELATIVE_DIR: &str = ".llm-wiki/uploads";
@@ -67,8 +66,6 @@ pub enum FileReceiverStatus {
 pub struct FileReceiverConfig {
     pub enabled: bool,
     pub auto_start: bool,
-    pub host: String,
-    pub port: u16,
     pub static_token: String,
     pub max_file_size_bytes: u64,
     pub upload_ttl_hours: u64,
@@ -130,10 +127,35 @@ pub struct UploadListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PublicUploadRecord {
+    pub upload_id: String,
+    pub project_id: String,
+    pub file_name: String,
+    pub mime_type: Option<String>,
+    pub folder_context: String,
+    pub status: UploadStatus,
+    pub received_bytes: u64,
+    pub total_size: Option<u64>,
+    pub stored_source_path: Option<String>,
+    pub task_id: Option<String>,
+    pub error: Option<String>,
+    pub started_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicUploadListResponse {
+    pub uploads: Vec<PublicUploadRecord>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadResponse {
     pub upload_id: String,
     pub status: String,
-    pub project_path: String,
+    pub project_id: String,
     pub stored_source_path: String,
     pub task_id: String,
     pub received_bytes: u64,
@@ -142,11 +164,12 @@ pub struct UploadResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadListQuery {
-    project_path: Option<String>,
+    project_id: Option<String>,
     status: Option<UploadStatus>,
     limit: Option<usize>,
 }
 
+#[derive(Clone)]
 pub struct FileReceiverRuntimeManager {
     inner: Arc<Mutex<FileReceiverRuntimeCore>>,
 }
@@ -154,17 +177,13 @@ pub struct FileReceiverRuntimeManager {
 struct FileReceiverRuntimeCore {
     config: FileReceiverConfig,
     status: FileReceiverStatus,
+    runtime_host: String,
+    runtime_port: u16,
     known_projects: Vec<String>,
     last_error: Option<String>,
+    shared_listener_status: FileReceiverStatus,
+    shared_listener_error: Option<String>,
     server_state: FileReceiverSharedState,
-    server: Option<FileReceiverServerHandle>,
-}
-
-struct FileReceiverServerHandle {
-    host: String,
-    port: u16,
-    cancellation_token: CancellationToken,
-    task: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -246,8 +265,6 @@ impl Default for FileReceiverConfig {
         Self {
             enabled: false,
             auto_start: false,
-            host: DEFAULT_FILE_RECEIVER_HOST.to_string(),
-            port: DEFAULT_FILE_RECEIVER_PORT,
             static_token: String::new(),
             max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
             upload_ttl_hours: DEFAULT_UPLOAD_TTL_HOURS,
@@ -282,10 +299,13 @@ impl Default for FileReceiverRuntimeCore {
         Self {
             config: FileReceiverConfig::default(),
             status: FileReceiverStatus::Stopped,
+            runtime_host: DEFAULT_FILE_RECEIVER_HOST.to_string(),
+            runtime_port: DEFAULT_FILE_RECEIVER_PORT,
             known_projects: Vec::new(),
             last_error: None,
+            shared_listener_status: FileReceiverStatus::Stopped,
+            shared_listener_error: None,
             server_state: FileReceiverSharedState::default(),
-            server: None,
         }
     }
 }
@@ -298,14 +318,6 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub fn validate_file_receiver_config(config: &FileReceiverConfig) -> Result<(), String> {
-    if config.host.trim().is_empty() {
-        return Err("File receiver host cannot be empty".to_string());
-    }
-
-    if config.port == 0 {
-        return Err("File receiver port cannot be 0".to_string());
-    }
-
     if config.enabled && config.static_token.trim().is_empty() {
         return Err("File receiver token cannot be empty when service is enabled".to_string());
     }
@@ -640,18 +652,48 @@ async fn cleanup_failed_upload(
     }
 }
 
-fn validate_project_path(project_path: &str, known_projects: &[String]) -> Result<String, String> {
-    let project = normalize_project_path(project_path)?;
-    if !known_projects.iter().any(|item| item == &project) {
-        return Err(format!("Unknown projectPath '{}'", project));
+fn project_public_id(path: &str) -> String {
+    format!(
+        "wiki-{:016x}",
+        stable_hash_hex(&normalize_project_path(path).unwrap_or_else(|_| path.to_string()))
+    )
+}
+
+fn stable_hash_hex(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
     }
-    if !is_valid_wiki_project_path(Path::new(&project)) {
-        return Err(format!(
-            "Invalid wiki project '{}': missing schema.md or wiki/index.md",
-            project
-        ));
+    hash
+}
+
+fn validate_project_id(project_id: &str, known_projects: &[String]) -> Result<String, String> {
+    let trimmed =
+        non_empty_trimmed(project_id).ok_or_else(|| "projectId must not be empty".to_string())?;
+    for path in known_projects {
+        if project_public_id(path) == trimmed {
+            if !is_valid_wiki_project_path(Path::new(path)) {
+                return Err(format!(
+                    "Invalid wiki project '{}': missing schema.md or wiki/index.md",
+                    trimmed
+                ));
+            }
+            return Ok(path.clone());
+        }
     }
-    Ok(project)
+    Err(format!("Unknown projectId '{}'", trimmed))
+}
+
+fn resolve_public_project_scope(
+    requested_project_id: Option<&str>,
+    known_projects: &[String],
+) -> Result<(Vec<String>, bool), String> {
+    if let Some(project_id) = requested_project_id.and_then(non_empty_trimmed) {
+        return Ok((vec![validate_project_id(project_id, known_projects)?], true));
+    }
+
+    Ok((known_projects.to_vec(), false))
 }
 
 fn resolve_requested_project_paths(
@@ -667,6 +709,41 @@ fn resolve_requested_project_paths(
     }
 
     Ok((known_projects.to_vec(), false))
+}
+
+fn to_public_upload_record(record: UploadRecord) -> PublicUploadRecord {
+    PublicUploadRecord {
+        upload_id: record.upload_id,
+        project_id: project_public_id(&record.project_path),
+        file_name: record.file_name,
+        mime_type: record.mime_type,
+        folder_context: record.folder_context,
+        status: record.status,
+        received_bytes: record.received_bytes,
+        total_size: record.total_size,
+        stored_source_path: record.stored_source_path,
+        task_id: record.task_id,
+        error: sanitize_public_error(record.error, &record.project_path),
+        started_at: record.started_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn sanitize_public_error(error: Option<String>, project_path: &str) -> Option<String> {
+    error.map(|message| redact_project_path(&message, project_path))
+}
+
+fn redact_project_path(message: &str, project_path: &str) -> String {
+    let raw_project = project_path.trim().replace('\\', "/");
+    let normalized_project =
+        normalize_project_path(project_path).unwrap_or_else(|_| raw_project.clone());
+    let mut normalized_message = message.replace('\\', "/");
+    for candidate in [&normalized_project, &raw_project] {
+        if !candidate.is_empty() {
+            normalized_message = normalized_message.replace(candidate, "<project>");
+        }
+    }
+    normalized_message
 }
 
 async fn read_limited_text_field(
@@ -903,72 +980,26 @@ fn build_file_receiver_router(state: FileReceiverSharedState) -> Router {
         .with_state(state)
 }
 
-async fn run_file_receiver_http_server(
-    shared: Arc<Mutex<FileReceiverRuntimeCore>>,
-    listener: StdTcpListener,
-    host: String,
-    port: u16,
-    cancellation_token: CancellationToken,
-    state: FileReceiverSharedState,
-) {
-    let listener = match tokio::net::TcpListener::from_std(listener) {
-        Ok(listener) => listener,
-        Err(err) => {
-            record_background_failure(
-                &shared,
-                &host,
-                port,
-                format!("Failed to adopt file receiver listener: {}", err),
-            );
-            return;
-        }
-    };
-
-    let router = build_file_receiver_router(state);
-    let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move { cancellation_token.cancelled_owned().await })
-        .await;
-
-    if let Err(err) = serve_result {
-        record_background_failure(
-            &shared,
-            &host,
-            port,
-            format!("File receiver server stopped unexpectedly: {}", err),
-        );
-    }
-}
-
-fn record_background_failure(
-    shared: &Arc<Mutex<FileReceiverRuntimeCore>>,
-    host: &str,
-    port: u16,
-    message: String,
-) {
-    let mut core = lock_or_recover(shared);
-    let matches_current_server = core
-        .server
-        .as_ref()
-        .map(|server| server.host == host && server.port == port)
-        .unwrap_or(false);
-    if matches_current_server {
-        core.server = None;
-        core.status = FileReceiverStatus::Error;
-        core.last_error = Some(message);
-    }
-}
-
 fn authorize(
     headers: &HeaderMap,
     shared_state: &FileReceiverSharedState,
 ) -> Result<(), StatusCode> {
     let config = shared_state.config();
-    let expected = format!("Bearer {}", config.static_token);
-    let provided = headers
+    if !config.enabled || !config.auto_start {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let expected_bearer = format!("Bearer {}", config.static_token);
+    let provided_bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if provided == expected {
+
+    let provided_custom = headers
+        .get(UPLOAD_TOKEN_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+
+    if provided_bearer == expected_bearer || provided_custom == config.static_token {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -1030,9 +1061,9 @@ async fn post_upload(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        if name == "projectPath" {
+        if name == "projectId" {
             let field_text = read_limited_text_field(field).await?;
-            let validated = validate_project_path(&field_text, &known_projects)
+            let validated = validate_project_id(&field_text, &known_projects)
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
             project_lock = Some(shared_state.project_lock(&validated));
             project_path = Some(validated);
@@ -1367,7 +1398,7 @@ async fn post_upload(
         Json(UploadResponse {
             upload_id: record.upload_id.clone(),
             status: "pending".to_string(),
-            project_path: normalized_project_path,
+            project_id: project_public_id(&normalized_project_path),
             stored_source_path: stored_relative_path,
             task_id,
             received_bytes,
@@ -1379,27 +1410,36 @@ async fn http_list_uploads(
     AxumState(shared_state): AxumState<FileReceiverSharedState>,
     headers: HeaderMap,
     Query(query): Query<UploadListQuery>,
-) -> Result<Json<UploadListResponse>, StatusCode> {
+) -> Result<Json<PublicUploadListResponse>, StatusCode> {
     authorize(&headers, &shared_state)?;
     let known_projects = shared_state.known_projects();
-    let (project_paths, scoped_project) =
-        resolve_requested_project_paths(query.project_path.as_deref(), &known_projects)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (project_paths, scoped_project) = resolve_public_project_scope(
+        query.project_id.as_deref(),
+        &known_projects,
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
     let response =
         collect_uploads_for_projects(project_paths, query.status, query.limit, scoped_project)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(response))
+    Ok(Json(PublicUploadListResponse {
+        uploads: response
+            .uploads
+            .into_iter()
+            .map(to_public_upload_record)
+            .collect(),
+        total: response.total,
+    }))
 }
 
 async fn http_get_upload(
     AxumState(shared_state): AxumState<FileReceiverSharedState>,
     headers: HeaderMap,
     AxumPath(upload_id): AxumPath<String>,
-) -> Result<Json<Option<UploadRecord>>, StatusCode> {
+) -> Result<Json<Option<PublicUploadRecord>>, StatusCode> {
     authorize(&headers, &shared_state)?;
     let response = find_upload_for_projects(shared_state.known_projects(), &upload_id, false)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(response))
+    Ok(Json(response.map(to_public_upload_record)))
 }
 
 fn collect_uploads_for_projects(
@@ -1456,8 +1496,8 @@ impl FileReceiverRuntimeCore {
     fn snapshot(&self) -> FileReceiverRuntimeState {
         FileReceiverRuntimeState {
             status: self.status.clone(),
-            host: self.config.host.clone(),
-            port: self.config.port,
+            host: self.runtime_host.clone(),
+            port: self.runtime_port,
             known_projects: self.known_projects.clone(),
             last_error: self.last_error.clone(),
             max_file_size_bytes: self.config.max_file_size_bytes,
@@ -1466,92 +1506,36 @@ impl FileReceiverRuntimeCore {
     }
 
     fn stop(&mut self) {
-        self.stop_server();
+        self.shared_listener_status = FileReceiverStatus::Stopped;
+        self.shared_listener_error = None;
         self.status = FileReceiverStatus::Stopped;
         self.last_error = None;
     }
 
-    fn stop_server(&mut self) {
-        if let Some(server) = self.server.take() {
-            server.cancellation_token.cancel();
-        }
-    }
-
-    fn start_server(&mut self, shared: Arc<Mutex<FileReceiverRuntimeCore>>) -> Result<(), String> {
-        validate_file_receiver_config(&self.config)?;
-
+    fn reconcile_runtime_state(&mut self) {
         self.server_state.set_config(self.config.clone());
         self.server_state
             .set_known_projects(self.known_projects.clone());
 
         if !self.config.enabled || !self.config.auto_start {
-            self.stop_server();
             self.status = FileReceiverStatus::Stopped;
             self.last_error = None;
-            return Ok(());
+            return;
         }
 
-        let desired_host = self.config.host.clone();
-        let desired_port = self.config.port;
-        if let Some(server) = &self.server {
-            if server.host == desired_host && server.port == desired_port {
-                self.status = FileReceiverStatus::Running;
-                self.last_error = None;
-                return Ok(());
+        self.status = self.shared_listener_status.clone();
+        self.last_error = match self.shared_listener_status {
+            FileReceiverStatus::PortConflict | FileReceiverStatus::Error => {
+                self.shared_listener_error.clone()
             }
-        }
-
-        self.stop_server();
-        self.status = FileReceiverStatus::Starting;
-        self.last_error = None;
-
-        let bind_address = format!("{}:{}", desired_host, desired_port);
-        let listener = StdTcpListener::bind(&bind_address).map_err(|err| {
-            self.status = if err.kind() == io::ErrorKind::AddrInUse {
-                FileReceiverStatus::PortConflict
-            } else {
-                FileReceiverStatus::Error
-            };
-            let message = format!("Failed to bind file receiver on {}: {}", bind_address, err);
-            self.last_error = Some(message.clone());
-            message
-        })?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|err| format!("Failed to configure file receiver listener: {}", err))?;
-
-        let cancellation_token = CancellationToken::new();
-        let task_token = cancellation_token.child_token();
-        let task_host = desired_host.clone();
-        let task_shared = shared.clone();
-        let task_state = self.server_state.clone();
-        let task = tauri::async_runtime::spawn(async move {
-            run_file_receiver_http_server(
-                task_shared,
-                listener,
-                task_host,
-                desired_port,
-                task_token,
-                task_state,
-            )
-            .await;
-        });
-
-        self.server = Some(FileReceiverServerHandle {
-            host: desired_host,
-            port: desired_port,
-            cancellation_token,
-            task: Some(task),
-        });
-        self.status = FileReceiverStatus::Running;
-        self.last_error = None;
-        Ok(())
+            _ => None,
+        };
     }
 
     fn update_config(&mut self, config: FileReceiverConfig) -> Result<(), String> {
         validate_file_receiver_config(&config)?;
         self.config = config;
-        self.server_state.set_config(self.config.clone());
+        self.reconcile_runtime_state();
         Ok(())
     }
 
@@ -1566,16 +1550,25 @@ impl FileReceiverRuntimeCore {
             }
         }
         self.known_projects = paths.into_iter().collect();
-        self.server_state
-            .set_known_projects(self.known_projects.clone());
+        self.reconcile_runtime_state();
+    }
+
+    fn sync_shared_listener(
+        &mut self,
+        host: String,
+        port: u16,
+        status: FileReceiverStatus,
+        last_error: Option<String>,
+    ) {
+        self.runtime_host = host;
+        self.runtime_port = port;
+        self.shared_listener_status = status;
+        self.shared_listener_error = last_error;
+        self.reconcile_runtime_state();
     }
 }
 
 impl FileReceiverRuntimeManager {
-    fn shared(&self) -> Arc<Mutex<FileReceiverRuntimeCore>> {
-        self.inner.clone()
-    }
-
     pub(crate) fn snapshot(&self) -> FileReceiverRuntimeState {
         lock_or_recover(&self.inner).snapshot()
     }
@@ -1585,15 +1578,29 @@ impl FileReceiverRuntimeManager {
     }
 
     pub(crate) fn update_config(&self, config: FileReceiverConfig) -> Result<(), String> {
-        let shared = self.shared();
-        {
-            lock_or_recover(&self.inner).update_config(config)?;
-        }
-        lock_or_recover(&self.inner).start_server(shared)
+        lock_or_recover(&self.inner).update_config(config)
     }
 
     pub(crate) fn update_known_projects(&self, project_paths: Vec<String>) {
         lock_or_recover(&self.inner).update_known_projects(project_paths);
+    }
+
+    pub(crate) fn config(&self) -> FileReceiverConfig {
+        lock_or_recover(&self.inner).config.clone()
+    }
+
+    pub(crate) fn sync_shared_listener(
+        &self,
+        host: String,
+        port: u16,
+        status: FileReceiverStatus,
+        last_error: Option<String>,
+    ) {
+        lock_or_recover(&self.inner).sync_shared_listener(host, port, status, last_error);
+    }
+
+    pub(crate) fn router(&self) -> Router {
+        build_file_receiver_router(lock_or_recover(&self.inner).server_state.clone())
     }
 
     fn known_project_paths(&self) -> Vec<String> {
@@ -1612,8 +1619,10 @@ pub fn file_receiver_status(
 pub fn file_receiver_update_config(
     config: FileReceiverConfig,
     manager: State<'_, FileReceiverRuntimeManager>,
+    mcp_manager: State<'_, McpRuntimeManager>,
 ) -> Result<(), String> {
-    manager.update_config(config)
+    manager.update_config(config)?;
+    mcp_manager.refresh_external_service()
 }
 
 #[tauri::command]
@@ -1664,12 +1673,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_file_receiver_config_rejects_empty_token_and_zero_port() {
+    fn validate_file_receiver_config_rejects_empty_token() {
         let bad = FileReceiverConfig {
             enabled: true,
             auto_start: true,
-            host: "127.0.0.1".into(),
-            port: 0,
             static_token: "".into(),
             max_file_size_bytes: 2 * 1024 * 1024 * 1024,
             upload_ttl_hours: 24,
@@ -1684,8 +1691,6 @@ mod tests {
         let bad = FileReceiverConfig {
             enabled: true,
             auto_start: true,
-            host: "127.0.0.1".into(),
-            port: DEFAULT_FILE_RECEIVER_PORT,
             static_token: "".into(),
             max_file_size_bytes: 2 * 1024 * 1024,
             upload_ttl_hours: 24,
@@ -1699,19 +1704,24 @@ mod tests {
     }
 
     #[test]
-    fn file_receiver_config_deserializes_missing_fields_from_defaults() {
+    fn file_receiver_config_ignores_legacy_host_and_port_fields() {
         let config: FileReceiverConfig = serde_json::from_value(serde_json::json!({
             "enabled": false,
-            "host": "0.0.0.0"
+            "host": "0.0.0.0",
+            "port": 19090
         }))
         .unwrap();
 
-        assert!(!config.enabled);
-        assert!(!config.auto_start);
-        assert_eq!(config.host, "0.0.0.0");
-        assert_eq!(config.port, DEFAULT_FILE_RECEIVER_PORT);
-        assert_eq!(config.max_file_size_bytes, DEFAULT_MAX_FILE_SIZE_BYTES);
-        assert_eq!(config.upload_ttl_hours, DEFAULT_UPLOAD_TTL_HOURS);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({
+                "enabled": false,
+                "autoStart": false,
+                "staticToken": "",
+                "maxFileSizeBytes": DEFAULT_MAX_FILE_SIZE_BYTES,
+                "uploadTtlHours": DEFAULT_UPLOAD_TTL_HOURS,
+            })
+        );
     }
 
     #[test]
@@ -1754,15 +1764,12 @@ mod tests {
     #[test]
     fn runtime_refreshes_known_projects_while_running() {
         let manager = FileReceiverRuntimeManager::default();
-        {
-            let mut core = lock_or_recover(&manager.inner);
-            core.server = Some(FileReceiverServerHandle {
-                host: DEFAULT_FILE_RECEIVER_HOST.to_string(),
-                port: DEFAULT_FILE_RECEIVER_PORT,
-                cancellation_token: CancellationToken::new(),
-                task: None,
-            });
-        }
+        manager.sync_shared_listener(
+            DEFAULT_FILE_RECEIVER_HOST.to_string(),
+            DEFAULT_FILE_RECEIVER_PORT,
+            FileReceiverStatus::Running,
+            None,
+        );
         manager.update_known_projects(vec![
             " /tmp/wiki-b ".into(),
             "/tmp/wiki-a".into(),
@@ -1905,9 +1912,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_multipart_when_file_part_precedes_required_metadata() {
+        let project = TempWikiProject::new("upload-file-first");
         let response = post_test_upload(
-            test_app_with_config(test_file_receiver_config(), Vec::new()),
-            raw_multipart_with_file_first(),
+            test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
+            raw_multipart_with_file_first(&project.path_string()),
         )
         .await;
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
@@ -1944,6 +1952,11 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response_body_json::<serde_json::Value>(response).await;
+        assert_eq!(body["projectId"], project_public_id(&project.path_string()));
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["storedSourcePath"], "raw/sources/report.pdf");
+        assert!(body.get("projectPath").is_none());
         assert!(Path::new(&project.path_string())
             .join("raw/sources/report.pdf")
             .exists());
@@ -1953,6 +1966,22 @@ mod tests {
         assert_eq!(queue[0]["status"], "pending");
         assert_eq!(queue[0]["origin"], "upload_service");
         assert_eq!(queue[0]["sourcePath"], "raw/sources/report.pdf");
+    }
+
+    #[tokio::test]
+    async fn accepts_custom_upload_token_header() {
+        let project = TempWikiProject::new("upload-custom-header");
+        let response = post_test_upload_with_headers(
+            test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
+            valid_upload_body(&project.path_string(), "custom.pdf", b"hello"),
+            &[(UPLOAD_TOKEN_HEADER_DISPLAY_NAME, "secret")],
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(Path::new(&project.path_string())
+            .join("raw/sources/custom.pdf")
+            .exists());
     }
 
     #[tokio::test]
@@ -1997,15 +2026,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_upload_when_project_path_uses_trailing_slash_variant() {
-        let project = TempWikiProject::new("upload-normalized-project-path");
+    async fn accepts_upload_when_project_id_matches_known_project() {
+        let project = TempWikiProject::new("upload-project-id");
         let response = post_test_upload(
             test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
-            valid_upload_body(
-                &format!("{}/", project.path_string()),
-                "normalized.txt",
-                b"ok",
-            ),
+            valid_upload_body(&project.path_string(), "normalized.txt", b"ok"),
         )
         .await;
 
@@ -2069,14 +2094,14 @@ mod tests {
                 test_file_receiver_config(),
                 vec![project_a.path_string(), project_b.path_string()],
             ),
-            &format!("/uploads?projectPath={}", &project_a.path_string()),
+            &format!("/uploads?projectId={}", project_public_id(&project_a.path_string())),
         )
         .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let body = response_body_json::<UploadListResponse>(response).await;
+        let body = response_body_json::<PublicUploadListResponse>(response).await;
         assert_eq!(body.total, 1);
-        assert_eq!(body.uploads, vec![record_a]);
+        assert_eq!(body.uploads, vec![to_public_upload_record(record_a)]);
     }
 
     #[tokio::test]
@@ -2084,7 +2109,7 @@ mod tests {
         let project = TempWikiProject::new("upload-list-unknown-project");
         let response = get_test_request(
             test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
-            "/uploads?projectPath=/tmp/not-allowed",
+            "/uploads?projectId=wiki-missing",
         )
         .await;
 
@@ -2108,8 +2133,67 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let body = response_body_json::<Option<UploadRecord>>(response).await;
-        assert_eq!(body, Some(record));
+        let body = response_body_json::<Option<PublicUploadRecord>>(response).await;
+        assert_eq!(body, Some(to_public_upload_record(record)));
+    }
+
+    #[tokio::test]
+    async fn http_upload_queries_do_not_expose_project_path() {
+        let project = TempWikiProject::new("upload-public-record");
+        let record = sample_upload_record(
+            &project.path_string(),
+            "public.pdf",
+            UploadStatus::Completed,
+        );
+        persist_upload_history(&project.path_string(), std::slice::from_ref(&record)).unwrap();
+
+        let list_response = get_test_request(
+            test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
+            "/uploads",
+        )
+        .await;
+        let list_body = response_body_json::<serde_json::Value>(list_response).await;
+        let list_upload = &list_body["uploads"][0];
+        assert_eq!(list_upload["projectId"], project_public_id(&project.path_string()));
+        assert!(list_upload.get("projectPath").is_none());
+
+        let get_response = get_test_request(
+            test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
+            &format!("/uploads/{}", record.upload_id),
+        )
+        .await;
+        let get_body = response_body_json::<serde_json::Value>(get_response).await;
+        assert_eq!(get_body["projectId"], project_public_id(&project.path_string()));
+        assert!(get_body.get("projectPath").is_none());
+    }
+
+    #[tokio::test]
+    async fn http_upload_queries_redact_project_path_from_error_messages() {
+        let project = TempWikiProject::new("upload-public-error");
+        let mut record = sample_upload_record(
+            &project.path_string(),
+            "error.pdf",
+            UploadStatus::Failed,
+        );
+        record.error = Some(format!(
+            "Failed to read '{}': permission denied",
+            Path::new(&project.path_string())
+                .join(".llm-wiki/upload-history.json")
+                .display()
+        ));
+        persist_upload_history(&project.path_string(), std::slice::from_ref(&record)).unwrap();
+
+        let response = get_test_request(
+            test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
+            &format!("/uploads/{}", record.upload_id),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response_body_json::<serde_json::Value>(response).await;
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains("<project>"));
+        assert!(!error.contains(&project.path_string()));
     }
 
     fn sample_upload_record(
@@ -2169,8 +2253,6 @@ mod tests {
         FileReceiverConfig {
             enabled: true,
             auto_start: true,
-            host: DEFAULT_FILE_RECEIVER_HOST.to_string(),
-            port: DEFAULT_FILE_RECEIVER_PORT,
             static_token: "secret".to_string(),
             max_file_size_bytes: 1024 * 1024,
             upload_ttl_hours: 24,
@@ -2188,20 +2270,24 @@ mod tests {
         app: Router,
         multipart: TestMultipartRequest,
     ) -> axum::response::Response {
-        app.oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/uploads")
-                .header("authorization", "Bearer secret")
-                .header(
-                    "content-type",
-                    format!("multipart/form-data; boundary={}", multipart.boundary),
-                )
-                .body(Body::from(multipart.body))
-                .unwrap(),
-        )
-        .await
-        .unwrap()
+        post_test_upload_with_headers(app, multipart, &[("authorization", "Bearer secret")]).await
+    }
+
+    async fn post_test_upload_with_headers(
+        app: Router,
+        multipart: TestMultipartRequest,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method("POST").uri("/uploads").header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", multipart.boundary),
+        );
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        app.oneshot(builder.body(Body::from(multipart.body)).unwrap())
+            .await
+            .unwrap()
     }
 
     async fn get_test_request(app: Router, uri: &str) -> axum::response::Response {
@@ -2233,7 +2319,7 @@ mod tests {
         bytes: &[u8],
     ) -> TestMultipartRequest {
         build_multipart_request(vec![
-            text_part("projectPath", project_path),
+            text_part("projectId", &project_public_id(project_path)),
             file_part("file", file_name, "application/octet-stream", bytes),
         ])
     }
@@ -2244,7 +2330,7 @@ mod tests {
         bytes_len: usize,
     ) -> TestMultipartRequest {
         build_multipart_request(vec![
-            text_part("projectPath", project_path),
+            text_part("projectId", &project_public_id(project_path)),
             file_part(
                 "file",
                 file_name,
@@ -2260,7 +2346,7 @@ mod tests {
         bytes: &[u8],
     ) -> TestMultipartRequest {
         build_multipart_request(vec![
-            text_part("projectPath", project_path),
+            text_part("projectId", &project_public_id(project_path)),
             file_part("file", file_name, "application/octet-stream", bytes),
             text_part("folderContext", "Late > Metadata"),
         ])
@@ -2268,7 +2354,7 @@ mod tests {
 
     fn multipart_with_two_files(project_path: &str) -> TestMultipartRequest {
         build_multipart_request(vec![
-            text_part("projectPath", project_path),
+            text_part("projectId", &project_public_id(project_path)),
             file_part("file", "first.txt", "text/plain", b"first"),
             file_part("file", "second.txt", "text/plain", b"second"),
         ])
@@ -2279,16 +2365,16 @@ mod tests {
         folder_context_len: usize,
     ) -> TestMultipartRequest {
         build_multipart_request(vec![
-            text_part("projectPath", project_path),
+            text_part("projectId", &project_public_id(project_path)),
             text_part("folderContext", &"a".repeat(folder_context_len)),
             file_part("file", "meta.txt", "text/plain", b"hello"),
         ])
     }
 
-    fn raw_multipart_with_file_first() -> TestMultipartRequest {
+    fn raw_multipart_with_file_first(project_path: &str) -> TestMultipartRequest {
         build_multipart_request(vec![
             file_part("file", "first.txt", "text/plain", b"hello"),
-            text_part("projectPath", "/tmp/wiki-a"),
+            text_part("projectId", &project_public_id(project_path)),
         ])
     }
 

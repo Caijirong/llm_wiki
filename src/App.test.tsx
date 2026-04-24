@@ -23,8 +23,6 @@ const {
   persistedFileReceiverConfig: {
     enabled: true,
     autoStart: true,
-    host: "127.0.0.1",
-    port: 18766,
     staticToken: "secret",
     maxFileSizeBytes: 1024 * 1024 * 1024,
     uploadTtlHours: 168,
@@ -38,8 +36,6 @@ const {
   loadFileReceiverConfig: vi.fn(async () => ({
     enabled: true,
     autoStart: true,
-    host: "127.0.0.1",
-    port: 18766,
     staticToken: "secret",
     maxFileSizeBytes: 1024 * 1024 * 1024,
     uploadTtlHours: 168,

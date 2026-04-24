@@ -1,29 +1,39 @@
 use std::{
     collections::BTreeSet,
-    fs,
-    io,
+    fs, io,
     net::TcpListener as StdTcpListener,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::Router;
+use axum::{
+    http::{header::HOST, request::Parts, HeaderMap},
+    Router,
+};
 use rmcp::{
-    Json, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
     model::{CallToolResult, ServerCapabilities, ServerInfo},
     schemars::{self, JsonSchema},
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
+    Json, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tauri::{State, async_runtime::JoinHandle};
+use serde_json::{json, Value};
+use tauri::{async_runtime::JoinHandle, State};
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::{fs::collect_markdown_files, project::is_valid_wiki_project_path};
+use crate::file_receiver_server::{
+    FileReceiverRuntimeManager, FileReceiverRuntimeState, FileReceiverStatus,
+    UPLOAD_TOKEN_HEADER_DISPLAY_NAME, UPLOAD_TOKEN_HEADER_NAME,
+};
 
 const DEFAULT_MCP_HOST: &str = "127.0.0.1";
 const DEFAULT_MCP_PORT: u16 = 18765;
@@ -31,8 +41,12 @@ const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_CONTEXT_PAGE_LIMIT: usize = 5;
 const DEFAULT_PAGE_CHAR_LIMIT: usize = 4000;
 const MCP_ENDPOINT_PATH: &str = "/mcp";
+const UPLOADS_ENDPOINT_PATH: &str = "/uploads";
+const UPLOADS_ITEM_PATH_TEMPLATE: &str = "/uploads/{upload_id}";
 const NO_PROJECT_MESSAGE: &str =
-    "No active project configured. Open a project in LLM Wiki or pass a known project_path.";
+    "No active project configured. Open a project in LLM Wiki or pass a known project_id.";
+const INGEST_QUEUE_RELATIVE_PATH: &str = ".llm-wiki/ingest-queue.json";
+static INGEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +81,7 @@ pub struct McpRuntimeState {
 
 pub struct McpRuntimeManager {
     inner: Arc<Mutex<McpRuntimeCore>>,
+    file_receiver: FileReceiverRuntimeManager,
 }
 
 struct McpRuntimeCore {
@@ -81,6 +96,7 @@ struct McpRuntimeCore {
 struct EmbeddedMcpServerHandle {
     host: String,
     port: u16,
+    mcp_route_enabled: bool,
     cancellation_token: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -108,6 +124,9 @@ impl SearchMode {
 pub enum McpToolErrorCode {
     NoProject,
     InvalidProject,
+    InvalidInput,
+    QueueFormat,
+    Internal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -126,7 +145,7 @@ impl McpToolError {
     }
 
     fn invalid_project(project_path: &str, known_projects: &[String]) -> Self {
-        let mut message = format!("Invalid project_path: {}", project_path);
+        let mut message = format!("Invalid project_id: {}", project_path);
         if !known_projects.is_empty() {
             message.push_str(". Available projects:\n");
             for project in known_projects {
@@ -139,13 +158,34 @@ impl McpToolError {
             message,
         }
     }
+
+    fn invalid_input(message: impl Into<String>) -> Self {
+        Self {
+            code: McpToolErrorCode::InvalidInput,
+            message: message.into(),
+        }
+    }
+
+    fn queue_format(message: impl Into<String>) -> Self {
+        Self {
+            code: McpToolErrorCode::QueueFormat,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: McpToolErrorCode::Internal,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpProjectInfo {
     pub name: String,
-    pub path: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -168,7 +208,7 @@ pub struct McpSearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpSearchResponse {
-    pub project_path: String,
+    pub project_id: String,
     pub query: String,
     pub mode: SearchMode,
     pub warning: Option<String>,
@@ -187,14 +227,14 @@ pub struct McpPage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpReadPageResponse {
-    pub project_path: String,
+    pub project_id: String,
     pub page: McpPage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpContextResponse {
-    pub project_path: String,
+    pub project_id: String,
     pub mode: SearchMode,
     pub warning: Option<String>,
     pub purpose: String,
@@ -203,19 +243,112 @@ pub struct McpContextResponse {
     pub pages: Vec<McpPage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpIngestTask {
+    pub id: String,
+    pub source_path: String,
+    pub folder_context: String,
+    pub status: String,
+    pub added_at: u64,
+    pub error: Option<String>,
+    pub retry_count: u64,
+    pub origin: Option<String>,
+    pub mime_type: Option<String>,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    pub files_written: Option<Vec<String>>,
+    pub review_item_count: Option<u64>,
+    pub cache_hit: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpIngestQueueSummary {
+    pub pending: usize,
+    pub processing: usize,
+    pub failed: usize,
+    pub done: usize,
+    pub active: usize,
+    pub history: usize,
+    pub records_total: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpUploadGuideResponse {
+    pub upload_mode: String,
+    pub summary: String,
+    pub current_project_id: Option<String>,
+    pub service_status: String,
+    pub endpoint_path: String,
+    pub default_endpoint: String,
+    pub resolved_endpoint: String,
+    pub upload_host: String,
+    pub upload_port: u16,
+    pub scheme: String,
+    pub authorization_scheme: String,
+    pub header_auth_name: String,
+    pub forward_headers: Vec<McpHttpHeader>,
+    pub required_fields: Vec<String>,
+    pub optional_fields: Vec<String>,
+    pub list_uploads_path: String,
+    pub get_upload_path_template: String,
+    pub curl_example: String,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpHttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpGetIngestTaskResponse {
+    pub project_id: String,
+    pub task_id: String,
+    pub found: bool,
+    pub task: Option<McpIngestTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpGetIngestQueueResponse {
+    pub project_id: String,
+    pub summary: McpIngestQueueSummary,
+    pub recent_tasks: Vec<McpIngestTask>,
+    pub current_task: Option<McpIngestTask>,
+    pub limit: usize,
+    pub queue: Vec<McpIngestTask>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EmbeddedMcpTools;
 
 #[derive(Clone)]
 struct EmbeddedMcpServer {
     runtime: Arc<Mutex<McpRuntimeCore>>,
+    file_receiver: FileReceiverRuntimeManager,
     tool_router: ToolRouter<Self>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedUploadEndpoint {
+    scheme: String,
+    host: String,
+    port: u16,
+    url: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchRequest {
     query: String,
-    project_path: Option<String>,
+    #[serde(alias = "project_path")]
+    project_id: Option<String>,
     limit: Option<usize>,
     mode: Option<SearchMode>,
 }
@@ -223,17 +356,33 @@ struct SearchRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadPageRequest {
     path_or_id: String,
-    project_path: Option<String>,
+    #[serde(alias = "project_path")]
+    project_id: Option<String>,
     max_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetContextRequest {
     query: String,
-    project_path: Option<String>,
+    #[serde(alias = "project_path")]
+    project_id: Option<String>,
     max_pages: Option<usize>,
     page_char_limit: Option<usize>,
     mode: Option<SearchMode>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetIngestTaskRequest {
+    task_id: String,
+    #[serde(alias = "project_path")]
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetIngestQueueRequest {
+    #[serde(alias = "project_path")]
+    project_id: Option<String>,
+    limit: Option<usize>,
 }
 
 impl Default for McpConfig {
@@ -262,8 +411,10 @@ impl Default for McpRuntimeState {
 
 impl Default for McpRuntimeManager {
     fn default() -> Self {
+        let file_receiver = FileReceiverRuntimeManager::default();
         Self {
             inner: Arc::new(Mutex::new(McpRuntimeCore::default())),
+            file_receiver,
         }
     }
 }
@@ -282,15 +433,20 @@ impl Default for McpRuntimeCore {
 }
 
 impl EmbeddedMcpServer {
-    fn new(runtime: Arc<Mutex<McpRuntimeCore>>) -> Self {
+    fn new(runtime: Arc<Mutex<McpRuntimeCore>>, file_receiver: FileReceiverRuntimeManager) -> Self {
         Self {
             runtime,
+            file_receiver,
             tool_router: Self::tool_router(),
         }
     }
 
     fn runtime_snapshot(&self) -> McpRuntimeState {
         lock_or_recover(&self.runtime).snapshot()
+    }
+
+    fn file_receiver_snapshot(&self) -> FileReceiverRuntimeState {
+        self.file_receiver.snapshot()
     }
 }
 
@@ -313,14 +469,14 @@ impl EmbeddedMcpServer {
         &self,
         Parameters(SearchRequest {
             query,
-            project_path,
+            project_id,
             limit,
             mode,
         }): Parameters<SearchRequest>,
     ) -> Result<Json<McpSearchResponse>, CallToolResult> {
         let state = self.runtime_snapshot();
         EmbeddedMcpTools
-            .llm_wiki_search(&state, &query, project_path.as_deref(), limit, mode)
+            .llm_wiki_search(&state, &query, project_id.as_deref(), limit, mode)
             .map(Json)
             .map_err(tool_error_result)
     }
@@ -333,13 +489,13 @@ impl EmbeddedMcpServer {
         &self,
         Parameters(ReadPageRequest {
             path_or_id,
-            project_path,
+            project_id,
             max_chars,
         }): Parameters<ReadPageRequest>,
     ) -> Result<Json<McpReadPageResponse>, CallToolResult> {
         let state = self.runtime_snapshot();
         EmbeddedMcpTools
-            .llm_wiki_read_page(&state, &path_or_id, project_path.as_deref(), max_chars)
+            .llm_wiki_read_page(&state, &path_or_id, project_id.as_deref(), max_chars)
             .map(Json)
             .map_err(tool_error_result)
     }
@@ -352,7 +508,7 @@ impl EmbeddedMcpServer {
         &self,
         Parameters(GetContextRequest {
             query,
-            project_path,
+            project_id,
             max_pages,
             page_char_limit,
             mode,
@@ -363,11 +519,57 @@ impl EmbeddedMcpServer {
             .llm_wiki_get_context(
                 &state,
                 &query,
-                project_path.as_deref(),
+                project_id.as_deref(),
                 max_pages,
                 page_char_limit,
                 mode,
             )
+            .map(Json)
+            .map_err(tool_error_result)
+    }
+
+    #[tool(
+        name = "llm_wiki_get_upload_guide",
+        description = "Return the file upload contract for importing sources. MCP does not accept file content; upload through /uploads instead."
+    )]
+    async fn get_upload_guide(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Json<McpUploadGuideResponse> {
+        let state = self.runtime_snapshot();
+        let upload_state = self.file_receiver_snapshot();
+        Json(EmbeddedMcpTools.llm_wiki_get_upload_guide(&state, &upload_state, Some(&parts)))
+    }
+
+    #[tool(
+        name = "llm_wiki_get_ingest_task",
+        description = "Query a single ingest task by task id from the shared ingest queue file."
+    )]
+    async fn get_ingest_task(
+        &self,
+        Parameters(GetIngestTaskRequest {
+            task_id,
+            project_id,
+        }): Parameters<GetIngestTaskRequest>,
+    ) -> Result<Json<McpGetIngestTaskResponse>, CallToolResult> {
+        let state = self.runtime_snapshot();
+        EmbeddedMcpTools
+            .llm_wiki_get_ingest_task(&state, &task_id, project_id.as_deref())
+            .map(Json)
+            .map_err(tool_error_result)
+    }
+
+    #[tool(
+        name = "llm_wiki_get_ingest_queue",
+        description = "Return the persisted ingest queue and summary from the shared queue file."
+    )]
+    async fn get_ingest_queue(
+        &self,
+        Parameters(GetIngestQueueRequest { project_id, limit }): Parameters<GetIngestQueueRequest>,
+    ) -> Result<Json<McpGetIngestQueueResponse>, CallToolResult> {
+        let state = self.runtime_snapshot();
+        EmbeddedMcpTools
+            .llm_wiki_get_ingest_queue(&state, project_id.as_deref(), limit)
             .map(Json)
             .map_err(tool_error_result)
     }
@@ -377,7 +579,7 @@ impl EmbeddedMcpServer {
 impl ServerHandler for EmbeddedMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Read-only LLM Wiki MCP server embedded in the desktop app. It only exposes projects known to the app.",
+            "LLM Wiki MCP server embedded in the desktop app. MCP does not accept file uploads. Import sources through the desktop app's /uploads endpoint and use llm_wiki_get_upload_guide for the upload contract. If the client already sends X-LLM-Wiki-Upload-Token on MCP requests, llm_wiki_get_upload_guide returns forwardHeaders that can be reused directly for /uploads.",
         )
     }
 }
@@ -390,6 +592,38 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl McpRuntimeCore {
+    fn sync_file_receiver_runtime(&self, file_receiver: &FileReceiverRuntimeManager) {
+        let status = if file_receiver
+            .config()
+            .enabled
+            && file_receiver.config().auto_start
+        {
+            if self.server.is_some() {
+                FileReceiverStatus::Running
+            } else {
+                match self.status {
+                    McpStatus::PortConflict => FileReceiverStatus::PortConflict,
+                    McpStatus::Error => FileReceiverStatus::Error,
+                    _ => FileReceiverStatus::Stopped,
+                }
+            }
+        } else {
+            FileReceiverStatus::Stopped
+        };
+
+        let last_error = match status {
+            FileReceiverStatus::PortConflict | FileReceiverStatus::Error => self.last_error.clone(),
+            _ => None,
+        };
+
+        file_receiver.sync_shared_listener(
+            self.config.host.clone(),
+            self.config.port,
+            status,
+            last_error,
+        );
+    }
+
     fn snapshot(&self) -> McpRuntimeState {
         McpRuntimeState {
             status: self.status.clone(),
@@ -410,59 +644,87 @@ impl McpRuntimeCore {
     fn start_server(
         &mut self,
         shared: Arc<Mutex<McpRuntimeCore>>,
+        file_receiver: FileReceiverRuntimeManager,
         respect_auto_start: bool,
     ) -> Result<(), String> {
+        let upload_config = file_receiver.config();
+        let uploads_enabled = upload_config.enabled && (!respect_auto_start || upload_config.auto_start);
+        let mcp_requested = self.config.enabled && (!respect_auto_start || self.config.auto_start);
+
+        if !mcp_requested && !uploads_enabled {
+            self.stop_server();
+            self.status = McpStatus::Stopped;
+            self.last_error = None;
+            self.sync_file_receiver_runtime(&file_receiver);
+            return Ok(());
+        }
+
         validate_config(&self.config).map_err(|err| {
             self.set_error(err.clone());
+            self.sync_file_receiver_runtime(&file_receiver);
             err
         })?;
 
-        if !self.config.enabled {
-            self.stop_server();
+        let mut mcp_route_enabled = false;
+        let mut startup_error: Option<String> = None;
+
+        if mcp_requested {
+            match self.current_project.as_deref().and_then(non_empty_trimmed) {
+                Some(current_project) => {
+                    let normalized_project = normalize_project_path(current_project);
+                    if is_valid_wiki_project_path(Path::new(&normalized_project)) {
+                        mcp_route_enabled = true;
+                        self.status = McpStatus::Running;
+                        self.last_error = None;
+                    } else {
+                        let message = format!(
+                            "Invalid current project '{}': missing schema.md or wiki/index.md",
+                            normalized_project
+                        );
+                        self.status = McpStatus::Error;
+                        self.last_error = Some(message.clone());
+                        startup_error = Some(message);
+                    }
+                }
+                None => {
+                    let message = NO_PROJECT_MESSAGE.to_string();
+                    self.status = McpStatus::NoProject;
+                    self.last_error = Some(message.clone());
+                    startup_error = Some(message);
+                }
+            }
+        } else {
             self.status = McpStatus::Stopped;
             self.last_error = None;
-            return Ok(());
         }
 
-        if respect_auto_start && !self.config.auto_start {
+        if !mcp_route_enabled && !uploads_enabled {
             self.stop_server();
-            self.status = McpStatus::Stopped;
-            self.last_error = None;
-            return Ok(());
-        }
-
-        let Some(current_project) = self.current_project.as_deref().and_then(non_empty_trimmed) else {
-            self.stop_server();
-            let message = NO_PROJECT_MESSAGE.to_string();
-            self.status = McpStatus::NoProject;
-            self.last_error = Some(message.clone());
-            return Err(message);
-        };
-
-        let normalized_project = normalize_project_path(current_project);
-        if !is_valid_wiki_project_path(Path::new(&normalized_project)) {
-            let message = format!(
-                "Invalid current project '{}': missing schema.md or wiki/index.md",
-                normalized_project
-            );
-            self.set_error(message.clone());
-            return Err(message);
+            self.sync_file_receiver_runtime(&file_receiver);
+            return Err(startup_error.unwrap_or_else(|| NO_PROJECT_MESSAGE.to_string()));
         }
 
         let desired_host = self.config.host.clone();
         let desired_port = self.config.port;
 
         if let Some(server) = &self.server {
-            if server.host == desired_host && server.port == desired_port {
-                self.status = McpStatus::Running;
-                self.last_error = None;
-                return Ok(());
+            if server.host == desired_host
+                && server.port == desired_port
+                && server.mcp_route_enabled == mcp_route_enabled
+            {
+                self.sync_file_receiver_runtime(&file_receiver);
+                return startup_error.map_or(Ok(()), Err);
             }
         }
 
         self.stop_server();
-        self.status = McpStatus::Starting;
-        self.last_error = None;
+        if uploads_enabled || mcp_route_enabled {
+            self.status = if mcp_route_enabled {
+                McpStatus::Starting
+            } else {
+                self.status.clone()
+            };
+        }
 
         let bind_address = format!("{}:{}", desired_host, desired_port);
         let listener = match StdTcpListener::bind(&bind_address) {
@@ -475,13 +737,18 @@ impl McpRuntimeCore {
                     McpStatus::Error
                 };
                 self.last_error = Some(message.clone());
+                self.sync_file_receiver_runtime(&file_receiver);
                 return Err(message);
             }
         };
 
         if let Err(err) = listener.set_nonblocking(true) {
-            let message = format!("Failed to configure MCP listener on {}: {}", bind_address, err);
+            let message = format!(
+                "Failed to configure MCP listener on {}: {}",
+                bind_address, err
+            );
             self.set_error(message.clone());
+            self.sync_file_receiver_runtime(&file_receiver);
             return Err(message);
         }
 
@@ -489,19 +756,33 @@ impl McpRuntimeCore {
         let task_token = cancellation_token.child_token();
         let task_host = desired_host.clone();
         let task_shared = shared.clone();
+        let task_file_receiver = file_receiver.clone();
         let task = tauri::async_runtime::spawn(async move {
-            run_mcp_http_server(task_shared, listener, task_host, desired_port, task_token).await;
+            run_mcp_http_server(
+                task_shared,
+                task_file_receiver,
+                listener,
+                task_host,
+                desired_port,
+                mcp_route_enabled,
+                task_token,
+            )
+            .await;
         });
 
         self.server = Some(EmbeddedMcpServerHandle {
             host: desired_host,
             port: desired_port,
+            mcp_route_enabled,
             cancellation_token,
             task,
         });
-        self.status = McpStatus::Running;
-        self.last_error = None;
-        Ok(())
+        if mcp_route_enabled {
+            self.status = McpStatus::Running;
+            self.last_error = None;
+        }
+        self.sync_file_receiver_runtime(&file_receiver);
+        startup_error.map_or(Ok(()), Err)
     }
 
     fn stop_server(&mut self) {
@@ -520,6 +801,7 @@ impl McpRuntimeCore {
     fn update_project(
         &mut self,
         shared: Arc<Mutex<McpRuntimeCore>>,
+        file_receiver: FileReceiverRuntimeManager,
         project_path: Option<String>,
     ) -> Result<(), String> {
         let had_server = self.server.is_some();
@@ -529,7 +811,6 @@ impl McpRuntimeCore {
             .map(normalize_project_path);
 
         if self.current_project.is_none() {
-            self.stop_server();
             if had_server || (self.config.enabled && self.config.auto_start) {
                 self.status = McpStatus::NoProject;
                 self.last_error = Some(NO_PROJECT_MESSAGE.to_string());
@@ -537,18 +818,15 @@ impl McpRuntimeCore {
                 self.status = McpStatus::Stopped;
                 self.last_error = None;
             }
-            return Ok(());
+            let upload_config = file_receiver.config();
+            if !(upload_config.enabled && upload_config.auto_start) {
+                self.stop_server();
+                self.sync_file_receiver_runtime(&file_receiver);
+                return Ok(());
+            }
         }
 
-        if self.config.enabled && self.config.auto_start {
-            self.start_server(shared, true)
-        } else if matches!(self.status, McpStatus::NoProject) {
-            self.status = McpStatus::Stopped;
-            self.last_error = None;
-            Ok(())
-        } else {
-            Ok(())
-        }
+        self.start_server(shared, file_receiver, true)
     }
 
     fn update_known_projects(&mut self, project_paths: Vec<String>) {
@@ -564,6 +842,7 @@ impl McpRuntimeCore {
     fn update_config(
         &mut self,
         shared: Arc<Mutex<McpRuntimeCore>>,
+        file_receiver: FileReceiverRuntimeManager,
         config: McpConfig,
     ) -> Result<(), String> {
         validate_config(&config).map_err(|err| {
@@ -571,51 +850,31 @@ impl McpRuntimeCore {
             err
         })?;
 
-        let host_changed = self.config.host != config.host;
-        let port_changed = self.config.port != config.port;
-        let enabled_changed = self.config.enabled != config.enabled;
-        let auto_start_changed = self.config.auto_start != config.auto_start;
         self.config = config;
-
-        if !self.config.enabled {
-            self.stop_server();
-            self.status = McpStatus::Stopped;
-            self.last_error = None;
-            return Ok(());
-        }
-
-        if !self.config.auto_start {
-            self.stop_server();
-            self.status = McpStatus::Stopped;
-            self.last_error = None;
-            return Ok(());
-        }
-
-        if self.current_project.is_none() {
+        let upload_config = file_receiver.config();
+        if self.current_project.is_none()
+            && self.config.enabled
+            && self.config.auto_start
+            && !(upload_config.enabled && upload_config.auto_start)
+        {
             self.stop_server();
             self.status = McpStatus::NoProject;
             self.last_error = Some(NO_PROJECT_MESSAGE.to_string());
+            self.sync_file_receiver_runtime(&file_receiver);
             return Ok(());
         }
-
-        if host_changed
-            || port_changed
-            || enabled_changed
-            || auto_start_changed
-            || self.server.is_none()
-            || matches!(
-                self.status,
-                McpStatus::Stopped | McpStatus::NoProject | McpStatus::PortConflict | McpStatus::Error
-            )
-        {
-            return self.start_server(shared, true);
-        }
-
-        Ok(())
+        self.start_server(shared, file_receiver, true)
     }
 }
 
 impl McpRuntimeManager {
+    pub(crate) fn with_file_receiver(file_receiver: FileReceiverRuntimeManager) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(McpRuntimeCore::default())),
+            file_receiver,
+        }
+    }
+
     fn shared(&self) -> Arc<Mutex<McpRuntimeCore>> {
         self.inner.clone()
     }
@@ -626,16 +885,29 @@ impl McpRuntimeManager {
 
     fn start(&self) -> Result<(), String> {
         let shared = self.shared();
-        lock_or_recover(&self.inner).start_server(shared, false)
+        lock_or_recover(&self.inner).start_server(shared, self.file_receiver.clone(), false)
     }
 
     pub(crate) fn stop(&self) {
-        lock_or_recover(&self.inner).stop();
+        {
+            lock_or_recover(&self.inner).stop();
+        }
+        let snapshot = self.snapshot();
+        self.file_receiver.sync_shared_listener(
+            snapshot.host,
+            snapshot.port,
+            FileReceiverStatus::Stopped,
+            None,
+        );
     }
 
     fn update_project(&self, project_path: Option<String>) -> Result<(), String> {
         let shared = self.shared();
-        lock_or_recover(&self.inner).update_project(shared, project_path)
+        lock_or_recover(&self.inner).update_project(
+            shared,
+            self.file_receiver.clone(),
+            project_path,
+        )
     }
 
     fn update_known_projects(&self, project_paths: Vec<String>) {
@@ -644,15 +916,22 @@ impl McpRuntimeManager {
 
     fn update_config(&self, config: McpConfig) -> Result<(), String> {
         let shared = self.shared();
-        lock_or_recover(&self.inner).update_config(shared, config)
+        lock_or_recover(&self.inner).update_config(shared, self.file_receiver.clone(), config)
+    }
+
+    pub(crate) fn refresh_external_service(&self) -> Result<(), String> {
+        let shared = self.shared();
+        lock_or_recover(&self.inner).start_server(shared, self.file_receiver.clone(), true)
     }
 }
 
 async fn run_mcp_http_server(
     shared: Arc<Mutex<McpRuntimeCore>>,
+    file_receiver: FileReceiverRuntimeManager,
     listener: StdTcpListener,
     host: String,
     port: u16,
+    mcp_route_enabled: bool,
     cancellation_token: CancellationToken,
 ) {
     let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -660,6 +939,7 @@ async fn run_mcp_http_server(
         Err(err) => {
             record_background_failure(
                 &shared,
+                &file_receiver,
                 &host,
                 port,
                 format!("Failed to adopt MCP listener into Tokio runtime: {}", err),
@@ -668,17 +948,25 @@ async fn run_mcp_http_server(
         }
     };
 
-    let service: StreamableHttpService<EmbeddedMcpServer, LocalSessionManager> =
-        StreamableHttpService::new(
-            {
-                let shared = shared.clone();
-                move || Ok(EmbeddedMcpServer::new(shared.clone()))
-            },
-            Default::default(),
-            streamable_http_config(&host, cancellation_token.clone()),
-        );
-
-    let router = Router::new().nest_service(MCP_ENDPOINT_PATH, service);
+    let mut router = Router::new().merge(file_receiver.router());
+    if mcp_route_enabled {
+        let service: StreamableHttpService<EmbeddedMcpServer, LocalSessionManager> =
+            StreamableHttpService::new(
+                {
+                    let shared = shared.clone();
+                    let file_receiver = file_receiver.clone();
+                    move || {
+                        Ok(EmbeddedMcpServer::new(
+                            shared.clone(),
+                            file_receiver.clone(),
+                        ))
+                    }
+                },
+                Default::default(),
+                streamable_http_config(&host, cancellation_token.clone()),
+            );
+        router = router.nest_service(MCP_ENDPOINT_PATH, service);
+    }
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move { cancellation_token.cancelled_owned().await })
         .await;
@@ -686,6 +974,7 @@ async fn run_mcp_http_server(
     if let Err(err) = serve_result {
         record_background_failure(
             &shared,
+            &file_receiver,
             &host,
             port,
             format!("Embedded MCP HTTP server stopped unexpectedly: {}", err),
@@ -693,9 +982,11 @@ async fn run_mcp_http_server(
     }
 }
 
-fn streamable_http_config(host: &str, cancellation_token: CancellationToken) -> StreamableHttpServerConfig {
-    let config = StreamableHttpServerConfig::default()
-        .with_cancellation_token(cancellation_token);
+fn streamable_http_config(
+    host: &str,
+    cancellation_token: CancellationToken,
+) -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default().with_cancellation_token(cancellation_token);
 
     if host == DEFAULT_MCP_HOST {
         config.with_allowed_hosts(["127.0.0.1", "localhost", "::1"])
@@ -707,6 +998,7 @@ fn streamable_http_config(host: &str, cancellation_token: CancellationToken) -> 
 
 fn record_background_failure(
     shared: &Arc<Mutex<McpRuntimeCore>>,
+    file_receiver: &FileReceiverRuntimeManager,
     host: &str,
     port: u16,
     message: String,
@@ -722,20 +1014,201 @@ fn record_background_failure(
         core.server = None;
         core.status = McpStatus::Error;
         core.last_error = Some(message);
+        core.sync_file_receiver_runtime(file_receiver);
+    }
+}
+
+fn first_header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn trim_forwarded_value(value: &str) -> &str {
+    value.trim().trim_matches('"')
+}
+
+fn parse_forwarded_header(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let Some(value) = first_header_value(headers, "forwarded") else {
+        return (None, None);
+    };
+
+    let mut proto = None;
+    let mut host = None;
+
+    for segment in value.split(';') {
+        let Some((key, raw_value)) = segment.split_once('=') else {
+            continue;
+        };
+        let value = trim_forwarded_value(raw_value);
+        if value.is_empty() {
+            continue;
+        }
+
+        if key.trim().eq_ignore_ascii_case("proto") {
+            proto = Some(value.to_ascii_lowercase());
+        } else if key.trim().eq_ignore_ascii_case("host") {
+            host = Some(value.to_string());
+        }
+    }
+
+    (proto, host)
+}
+
+fn normalize_scheme(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_ascii_lowercase())
+    }
+}
+
+fn parse_host_and_port(candidate: &str) -> Option<(String, Option<u16>)> {
+    let trimmed = trim_forwarded_value(candidate);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(authority) = axum::http::uri::Authority::try_from(trimmed) {
+        return Some((authority.host().to_string(), authority.port_u16()));
+    }
+
+    Some((trimmed.trim_matches(['[', ']']).to_string(), None))
+}
+
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+fn format_url_authority(host: &str, port: u16, scheme: &str) -> String {
+    let formatted_host = format_url_host(host);
+    if default_port_for_scheme(scheme) == Some(port) {
+        formatted_host
+    } else {
+        format!("{}:{}", formatted_host, port)
+    }
+}
+
+fn format_url_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{}]", host.trim_matches(['[', ']']))
+    } else {
+        host.to_string()
+    }
+}
+
+fn resolve_upload_endpoint(
+    upload_state: &FileReceiverRuntimeState,
+    request_parts: Option<&Parts>,
+) -> ResolvedUploadEndpoint {
+    let mut scheme = None;
+    let mut authority = None;
+
+    if let Some(parts) = request_parts {
+        let (forwarded_proto, forwarded_host) = parse_forwarded_header(&parts.headers);
+        scheme = forwarded_proto
+            .or_else(|| first_header_value(&parts.headers, "x-forwarded-proto"))
+            .or_else(|| parts.uri.scheme_str().map(ToOwned::to_owned))
+            .and_then(|value| normalize_scheme(&value));
+        authority = forwarded_host
+            .or_else(|| first_header_value(&parts.headers, "x-forwarded-host"))
+            .or_else(|| first_header_value(&parts.headers, HOST.as_str()))
+            .or_else(|| {
+                parts
+                    .uri
+                    .authority()
+                    .map(|authority| authority.as_str().to_string())
+            })
+            .and_then(|value| parse_host_and_port(&value));
+    }
+
+    let scheme = scheme.unwrap_or_else(|| "http".to_string());
+    let (host, port) = authority
+        .map(|(host, port)| {
+            (
+                host,
+                port.or_else(|| default_port_for_scheme(&scheme))
+                    .unwrap_or(upload_state.port),
+            )
+        })
+        .unwrap_or_else(|| (upload_state.host.clone(), upload_state.port));
+    let url = format!(
+        "{}://{}{}",
+        scheme,
+        format_url_authority(&host, port, &scheme),
+        UPLOADS_ENDPOINT_PATH
+    );
+
+    ResolvedUploadEndpoint {
+        scheme,
+        host,
+        port,
+        url,
+    }
+}
+
+fn upload_forward_headers(request_parts: Option<&Parts>) -> Vec<McpHttpHeader> {
+    request_parts
+        .and_then(|parts| {
+            parts
+                .headers
+                .get(UPLOAD_TOKEN_HEADER_NAME)
+                .and_then(|value| value.to_str().ok())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            vec![McpHttpHeader {
+                name: UPLOAD_TOKEN_HEADER_DISPLAY_NAME.to_string(),
+                value: value.to_string(),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn upload_auth_header_line(forward_headers: &[McpHttpHeader]) -> String {
+    if let Some(header) = forward_headers.first() {
+        format!("-H '{}: {}'", header.name, header.value)
+    } else {
+        "-H 'Authorization: Bearer <token>'".to_string()
+    }
+}
+
+fn file_receiver_status_label(status: &FileReceiverStatus) -> &'static str {
+    match status {
+        FileReceiverStatus::Stopped => "stopped",
+        FileReceiverStatus::Starting => "starting",
+        FileReceiverStatus::Running => "running",
+        FileReceiverStatus::PortConflict => "port_conflict",
+        FileReceiverStatus::Error => "error",
     }
 }
 
 pub fn resolve_project(
     state: &McpRuntimeState,
-    project_path: Option<&str>,
+    project_id: Option<&str>,
 ) -> Result<String, McpToolError> {
-    if let Some(override_path) = project_path.and_then(non_empty_trimmed) {
-        let normalized = normalize_project_path(override_path);
-        let known = known_project_paths(state);
-        if known.iter().any(|path| path == &normalized) {
-            return Ok(normalized);
+    let known_projects = known_project_paths(state);
+    let known_ids = known_projects
+        .iter()
+        .map(|path| project_public_id(path))
+        .collect::<Vec<_>>();
+
+    if let Some(override_id) = project_id.and_then(non_empty_trimmed) {
+        for path in &known_projects {
+            if project_public_id(path) == override_id {
+                return Ok(path.clone());
+            }
         }
-        return Err(McpToolError::invalid_project(&normalized, &known));
+        return Err(McpToolError::invalid_project(override_id, &known_ids));
     }
 
     if let Some(current) = state.current_project.as_deref().and_then(non_empty_trimmed) {
@@ -769,12 +1242,13 @@ impl EmbeddedMcpTools {
         &self,
         state: &McpRuntimeState,
         query: &str,
-        project_path: Option<&str>,
+        project_id: Option<&str>,
         limit: Option<usize>,
         mode: Option<SearchMode>,
     ) -> Result<McpSearchResponse, McpToolError> {
-        let project_path = resolve_project(state, project_path)?;
+        let project_path = resolve_project(state, project_id)?;
         ensure_valid_wiki_project(&project_path)?;
+        let project_id = project_public_id(&project_path);
 
         let requested_mode = mode.unwrap_or(SearchMode::Hybrid);
         let (effective_mode, warning) = effective_mode_with_warning(requested_mode);
@@ -782,7 +1256,7 @@ impl EmbeddedMcpTools {
         let results = keyword_search(&project_path, query, search_limit)?;
 
         Ok(McpSearchResponse {
-            project_path,
+            project_id,
             query: query.to_string(),
             mode: effective_mode,
             warning,
@@ -794,29 +1268,31 @@ impl EmbeddedMcpTools {
         &self,
         state: &McpRuntimeState,
         path_or_id: &str,
-        project_path: Option<&str>,
+        project_id: Option<&str>,
         max_chars: Option<usize>,
     ) -> Result<McpReadPageResponse, McpToolError> {
-        let project_path = resolve_project(state, project_path)?;
+        let project_path = resolve_project(state, project_id)?;
         ensure_valid_wiki_project(&project_path)?;
+        let project_id = project_public_id(&project_path);
 
         let mut page = read_wiki_page(&project_path, path_or_id)?;
         page.content = truncate_chars(&page.content, max_chars.unwrap_or(12_000));
 
-        Ok(McpReadPageResponse { project_path, page })
+        Ok(McpReadPageResponse { project_id, page })
     }
 
     pub fn llm_wiki_get_context(
         &self,
         state: &McpRuntimeState,
         query: &str,
-        project_path: Option<&str>,
+        project_id: Option<&str>,
         max_pages: Option<usize>,
         page_char_limit: Option<usize>,
         mode: Option<SearchMode>,
     ) -> Result<McpContextResponse, McpToolError> {
-        let project_path = resolve_project(state, project_path)?;
+        let project_path = resolve_project(state, project_id)?;
         ensure_valid_wiki_project(&project_path)?;
+        let project_id = project_public_id(&project_path);
 
         let requested_mode = mode.unwrap_or(SearchMode::Hybrid);
         let (effective_mode, warning) = effective_mode_with_warning(requested_mode);
@@ -841,13 +1317,129 @@ impl EmbeddedMcpTools {
         }
 
         Ok(McpContextResponse {
-            project_path,
+            project_id,
             mode: effective_mode,
             warning,
             purpose,
             schema,
             index,
             pages,
+        })
+    }
+
+    pub fn llm_wiki_get_upload_guide(
+        &self,
+        state: &McpRuntimeState,
+        upload_state: &FileReceiverRuntimeState,
+        request_parts: Option<&Parts>,
+    ) -> McpUploadGuideResponse {
+        let resolved_endpoint = resolve_upload_endpoint(upload_state, request_parts);
+        let forward_headers = upload_forward_headers(request_parts);
+        let current_project_id = state
+            .current_project
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            .map(normalize_project_path)
+            .map(|path| project_public_id(&path));
+        let default_endpoint = format!(
+            "http://{}:{}{}",
+            format_url_host(&upload_state.host),
+            upload_state.port,
+            UPLOADS_ENDPOINT_PATH
+        );
+        let curl_example = format!(
+            "curl -X POST {} \\\n  {} \\\n  -F 'projectId={}' \\\n  -F 'fileName=source.pdf' \\\n  -F 'mimeType=application/pdf' \\\n  -F 'folderContext=docs/reference' \\\n  -F 'file=@/absolute/path/to/source.pdf'",
+            resolved_endpoint.url,
+            upload_auth_header_line(&forward_headers),
+            current_project_id.as_deref().unwrap_or("<project-id>")
+        );
+
+        McpUploadGuideResponse {
+            upload_mode: "uploads_only".to_string(),
+            summary: "MCP does not accept file uploads. Import sources by sending multipart/form-data to the desktop app's file receiver service, then use ingest queue tools to monitor processing.".to_string(),
+            current_project_id,
+            service_status: file_receiver_status_label(&upload_state.status).to_string(),
+            endpoint_path: UPLOADS_ENDPOINT_PATH.to_string(),
+            default_endpoint,
+            resolved_endpoint: resolved_endpoint.url,
+            upload_host: resolved_endpoint.host,
+            upload_port: resolved_endpoint.port,
+            scheme: resolved_endpoint.scheme,
+            authorization_scheme: "Bearer".to_string(),
+            header_auth_name: UPLOAD_TOKEN_HEADER_DISPLAY_NAME.to_string(),
+            forward_headers,
+            required_fields: vec!["projectId".to_string(), "file".to_string()],
+            optional_fields: vec![
+                "fileName".to_string(),
+                "mimeType".to_string(),
+                "folderContext".to_string(),
+            ],
+            list_uploads_path: UPLOADS_ENDPOINT_PATH.to_string(),
+            get_upload_path_template: UPLOADS_ITEM_PATH_TEMPLATE.to_string(),
+            curl_example,
+            notes: vec![
+                "Reuse the same scheme, host/domain, and port that reached this MCP server; uploads live on the same external listener.".to_string(),
+                "defaultEndpoint is the upload service bind address; resolvedEndpoint is the externally reachable URL inferred from the current MCP request.".to_string(),
+                "Use projectId from llm_wiki_list_projects or currentProjectId from this guide. MCP does not expose local filesystem paths.".to_string(),
+                "The upload service also accepts the custom header X-LLM-Wiki-Upload-Token. If the current MCP request already included that header, forwardHeaders returns it so external agents can reuse the same header set for /uploads.".to_string(),
+                "Metadata fields must be sent before the file part in the multipart payload."
+                    .to_string(),
+                "fileName is optional when the multipart file part already includes a filename."
+                    .to_string(),
+                "Use GET /uploads to inspect recent upload records and GET /uploads/{upload_id} to inspect one upload.".to_string(),
+                "Use llm_wiki_get_ingest_queue and llm_wiki_get_ingest_task to monitor the downstream ingest queue after upload.".to_string(),
+            ],
+        }
+    }
+
+    pub fn llm_wiki_get_ingest_task(
+        &self,
+        state: &McpRuntimeState,
+        task_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<McpGetIngestTaskResponse, McpToolError> {
+        let project_path = resolve_project(state, project_id)?;
+        ensure_valid_wiki_project(&project_path)?;
+        let project_id = project_public_id(&project_path);
+
+        let trimmed_task_id = non_empty_trimmed(task_id)
+            .ok_or_else(|| McpToolError::invalid_input("task_id must not be empty"))?;
+        let queue_values = read_ingest_queue_values(&project_path)?;
+        let queue = normalized_ingest_tasks_from_values(&project_path, &queue_values);
+        let task = queue.into_iter().find(|entry| entry.id == trimmed_task_id);
+
+        Ok(McpGetIngestTaskResponse {
+            project_id,
+            task_id: trimmed_task_id.to_string(),
+            found: task.is_some(),
+            task,
+        })
+    }
+
+    pub fn llm_wiki_get_ingest_queue(
+        &self,
+        state: &McpRuntimeState,
+        project_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<McpGetIngestQueueResponse, McpToolError> {
+        let project_path = resolve_project(state, project_id)?;
+        ensure_valid_wiki_project(&project_path)?;
+        let project_id = project_public_id(&project_path);
+
+        let queue_values = read_ingest_queue_values(&project_path)?;
+        let queue = normalized_ingest_tasks_from_values(&project_path, &queue_values);
+        let summary = summarize_ingest_queue(&queue);
+        let limit = limit.unwrap_or(50).clamp(1, 500);
+        let recent_tasks = recent_ingest_tasks(&queue, limit);
+        let current_task = current_ingest_task(&queue);
+
+        Ok(McpGetIngestQueueResponse {
+            project_id,
+            summary,
+            recent_tasks: recent_tasks.clone(),
+            current_task,
+            limit,
+            queue: recent_tasks,
         })
     }
 }
@@ -875,8 +1467,205 @@ fn ensure_valid_wiki_project(project_path: &str) -> Result<(), McpToolError> {
     if is_valid_wiki_project_path(Path::new(&normalized)) {
         Ok(())
     } else {
-        Err(McpToolError::invalid_project(&normalized, &[]))
+        Err(McpToolError::invalid_input(
+            "Current project is not a valid LLM Wiki project.",
+        ))
     }
+}
+
+fn ingest_queue_path(project_path: &str) -> PathBuf {
+    Path::new(project_path).join(INGEST_QUEUE_RELATIVE_PATH)
+}
+
+fn read_ingest_queue_values(project_path: &str) -> Result<Vec<Value>, McpToolError> {
+    let queue_path = ingest_queue_path(project_path);
+    if !queue_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw = fs::read_to_string(&queue_path).map_err(|err| {
+        McpToolError::internal(format!(
+            "Failed to read ingest queue '{}': {}",
+            INGEST_QUEUE_RELATIVE_PATH, err
+        ))
+    })?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parsed: Value = serde_json::from_str(&raw).map_err(|err| {
+        McpToolError::queue_format(format!(
+            "Invalid ingest queue JSON '{}': {}",
+            INGEST_QUEUE_RELATIVE_PATH, err
+        ))
+    })?;
+    let values = parsed.as_array().ok_or_else(|| {
+        McpToolError::queue_format(format!(
+            "Invalid ingest queue JSON '{}': expected an array",
+            INGEST_QUEUE_RELATIVE_PATH
+        ))
+    })?;
+
+    Ok(values.clone())
+}
+
+fn normalized_ingest_tasks_from_values(project_path: &str, values: &[Value]) -> Vec<McpIngestTask> {
+    values
+        .iter()
+        .filter_map(|value| normalize_ingest_task(project_path, value))
+        .collect()
+}
+
+fn normalize_ingest_task(project_path: &str, raw: &Value) -> Option<McpIngestTask> {
+    let source_path = raw.get("sourcePath")?.as_str()?.trim().to_string();
+    if source_path.is_empty() {
+        return None;
+    }
+
+    let status = raw
+        .get("status")
+        .and_then(Value::as_str)
+        .map(normalize_ingest_status)
+        .unwrap_or_else(|| "pending".to_string());
+
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(generate_ingest_task_id);
+
+    let folder_context = raw
+        .get("folderContext")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let error = match raw.get("error") {
+        Some(Value::String(message)) => Some(redact_project_path_text(message, project_path)),
+        _ => None,
+    };
+
+    let files_written = raw.get("filesWritten").and_then(|value| {
+        let items = value
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?;
+        Some(items.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>())
+    });
+
+    Some(McpIngestTask {
+        id,
+        source_path,
+        folder_context,
+        status,
+        added_at: raw
+            .get("addedAt")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(now_millis),
+        error,
+        retry_count: raw.get("retryCount").and_then(Value::as_u64).unwrap_or(0),
+        origin: raw
+            .get("origin")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed)
+            .map(ToOwned::to_owned),
+        mime_type: raw
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed)
+            .map(ToOwned::to_owned),
+        started_at: raw.get("startedAt").and_then(Value::as_u64),
+        finished_at: raw.get("finishedAt").and_then(Value::as_u64),
+        files_written,
+        review_item_count: raw.get("reviewItemCount").and_then(Value::as_u64),
+        cache_hit: raw.get("cacheHit").and_then(Value::as_bool),
+    })
+}
+
+fn normalize_ingest_status(status: &str) -> String {
+    match status {
+        "pending" | "processing" | "done" | "failed" => status.to_string(),
+        _ => "pending".to_string(),
+    }
+}
+
+fn summarize_ingest_queue(queue: &[McpIngestTask]) -> McpIngestQueueSummary {
+    let visible = queue
+        .iter()
+        .filter(|task| task.status != "done")
+        .collect::<Vec<_>>();
+
+    let pending = visible
+        .iter()
+        .filter(|task| task.status == "pending")
+        .count();
+    let processing = visible
+        .iter()
+        .filter(|task| task.status == "processing")
+        .count();
+    let failed = visible
+        .iter()
+        .filter(|task| task.status == "failed")
+        .count();
+    let done = queue.iter().filter(|task| task.status == "done").count();
+    let active = pending + processing;
+    let records_total = queue.len();
+    let total = visible.len();
+
+    McpIngestQueueSummary {
+        pending,
+        processing,
+        failed,
+        done,
+        active,
+        history: done + failed,
+        records_total,
+        total,
+    }
+}
+
+fn recent_ingest_tasks(queue: &[McpIngestTask], limit: usize) -> Vec<McpIngestTask> {
+    let mut indexed = queue
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect::<Vec<(usize, McpIngestTask)>>();
+    indexed.sort_by(|(left_idx, left), (right_idx, right)| {
+        right
+            .added_at
+            .cmp(&left.added_at)
+            .then_with(|| right_idx.cmp(left_idx))
+    });
+    indexed
+        .into_iter()
+        .take(limit)
+        .map(|(_, task)| task)
+        .collect()
+}
+
+fn current_ingest_task(queue: &[McpIngestTask]) -> Option<McpIngestTask> {
+    queue
+        .iter()
+        .find(|task| task.status == "processing")
+        .cloned()
+        .or_else(|| queue.iter().find(|task| task.status == "pending").cloned())
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn generate_ingest_task_id() -> String {
+    format!(
+        "ingest-{}-{:x}",
+        now_millis(),
+        INGEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn keyword_search(
@@ -892,7 +1681,7 @@ fn keyword_search(
     let wiki_root = Path::new(project_path).join("wiki");
     let files = collect_markdown_files(&wiki_root).map_err(|err| McpToolError {
         code: McpToolErrorCode::InvalidProject,
-        message: err,
+        message: redact_project_path_text(&err, project_path),
     })?;
     let query_tokens = tokenize_query(query);
     let query_lower = query.to_lowercase();
@@ -956,9 +1745,14 @@ fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpTo
 
     for candidate in candidates {
         if candidate.is_file() {
+            let relative_path = candidate
+                .strip_prefix(&wiki_root)
+                .unwrap_or(&candidate)
+                .to_string_lossy()
+                .replace('\\', "/");
             let content = fs::read_to_string(&candidate).map_err(|err| McpToolError {
                 code: McpToolErrorCode::InvalidProject,
-                message: format!("Failed reading page '{}': {}", candidate.display(), err),
+                message: format!("Failed reading page '{}': {}", relative_path, err),
             })?;
             let title = extract_title(
                 &content,
@@ -967,11 +1761,6 @@ fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpTo
                     .and_then(|name| name.to_str())
                     .unwrap_or(path_or_id),
             );
-            let relative_path = candidate
-                .strip_prefix(&wiki_root)
-                .unwrap_or(&candidate)
-                .to_string_lossy()
-                .replace('\\', "/");
             return Ok(McpPage {
                 exists: true,
                 title,
@@ -987,7 +1776,7 @@ fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpTo
         .unwrap_or(&normalized);
     let files = collect_markdown_files(&wiki_root).map_err(|err| McpToolError {
         code: McpToolErrorCode::InvalidProject,
-        message: err,
+        message: redact_project_path_text(&err, project_path),
     })?;
     for file_path in files {
         let file_id = file_path
@@ -997,9 +1786,14 @@ fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpTo
         if file_id != bare_id {
             continue;
         }
+        let relative_path = file_path
+            .strip_prefix(&wiki_root)
+            .unwrap_or(&file_path)
+            .to_string_lossy()
+            .replace('\\', "/");
         let content = fs::read_to_string(&file_path).map_err(|err| McpToolError {
             code: McpToolErrorCode::InvalidProject,
-            message: format!("Failed reading page '{}': {}", file_path.display(), err),
+            message: format!("Failed reading page '{}': {}", relative_path, err),
         })?;
         let title = extract_title(
             &content,
@@ -1008,11 +1802,6 @@ fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpTo
                 .and_then(|name| name.to_str())
                 .unwrap_or(path_or_id),
         );
-        let relative_path = file_path
-            .strip_prefix(&wiki_root)
-            .unwrap_or(&file_path)
-            .to_string_lossy()
-            .replace('\\', "/");
         return Ok(McpPage {
             exists: true,
             title,
@@ -1181,8 +1970,39 @@ fn project_info(path: &str) -> McpProjectInfo {
         .to_string();
     McpProjectInfo {
         name,
-        path: path.to_string(),
+        id: project_public_id(path),
     }
+}
+
+fn project_public_id(path: &str) -> String {
+    let normalized = fs::canonicalize(path)
+        .map(|resolved| resolved.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| normalize_project_path(path));
+    format!(
+        "wiki-{:016x}",
+        stable_hash_hex(&normalized)
+    )
+}
+
+fn redact_project_path_text(message: &str, project_path: &str) -> String {
+    let raw_project = project_path.trim().replace('\\', "/");
+    let normalized_project = normalize_project_path(project_path);
+    let mut normalized_message = message.replace('\\', "/");
+    for candidate in [&normalized_project, &raw_project] {
+        if !candidate.is_empty() {
+            normalized_message = normalized_message.replace(candidate, "<project>");
+        }
+    }
+    normalized_message
+}
+
+fn stable_hash_hex(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn normalize_project_path(path: &str) -> String {
@@ -1269,10 +2089,9 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::file_receiver_server::FileReceiverConfig;
     use rmcp::{
-        ServiceExt,
-        model::CallToolRequestParams,
-        transport::StreamableHttpClientTransport,
+        model::CallToolRequestParams, transport::StreamableHttpClientTransport, ServiceExt,
     };
     use serde_json::Value;
 
@@ -1288,10 +2107,14 @@ mod tests {
                 .as_nanos();
             let path = std::env::temp_dir().join(format!("llm-wiki-mcp-{}-{}", name, unique));
 
-            fs::create_dir_all(path.join("wiki/entities")).expect("test wiki dir should be created");
+            fs::create_dir_all(path.join("wiki/entities"))
+                .expect("test wiki dir should be created");
             fs::write(path.join("schema.md"), "# Schema\n").expect("schema should be written");
-            fs::write(path.join("purpose.md"), "# Purpose\nAnswer questions about OpenAI.\n")
-                .expect("purpose should be written");
+            fs::write(
+                path.join("purpose.md"),
+                "# Purpose\nAnswer questions about OpenAI.\n",
+            )
+            .expect("purpose should be written");
             fs::write(path.join("wiki/index.md"), "# Index\n- [[openai]]\n")
                 .expect("index should be written");
             fs::write(
@@ -1358,7 +2181,7 @@ OpenAI builds GPT models and AI systems.
     #[test]
     fn resolve_project_rejects_unknown_project_override() {
         let state = state_with_known_projects(vec!["/tmp/wiki-a"]);
-        assert!(resolve_project(&state, Some("/tmp/wiki-b")).is_err());
+        assert!(resolve_project(&state, Some("wiki-missing")).is_err());
     }
 
     #[test]
@@ -1371,16 +2194,22 @@ OpenAI builds GPT models and AI systems.
         fn assert_server_handler<T: ServerHandler>(_: &T) {}
 
         let manager = McpRuntimeManager::default();
-        let server = EmbeddedMcpServer::new(manager.shared());
+        let server = EmbeddedMcpServer::new(manager.shared(), manager.file_receiver.clone());
         assert_server_handler(&server);
 
         let tools = server.tool_router.list_all();
-        let mut names = tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>();
+        let mut names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
         names.sort_unstable();
         assert_eq!(
             names,
             vec![
                 "llm_wiki_get_context",
+                "llm_wiki_get_ingest_queue",
+                "llm_wiki_get_ingest_task",
+                "llm_wiki_get_upload_guide",
                 "llm_wiki_list_projects",
                 "llm_wiki_read_page",
                 "llm_wiki_search",
@@ -1456,7 +2285,9 @@ OpenAI builds GPT models and AI systems.
         manager
             .update_project(Some(project.path_string()))
             .expect("project should update");
-        manager.start().expect("start should succeed with a valid project");
+        manager
+            .start()
+            .expect("start should succeed with a valid project");
 
         manager
             .update_project(None)
@@ -1482,10 +2313,316 @@ OpenAI builds GPT models and AI systems.
         assert_eq!(state.status, McpStatus::NoProject);
     }
 
+    #[test]
+    fn upload_guide_explains_uploads_as_the_only_import_path() {
+        let upload_state = FileReceiverRuntimeState {
+            status: FileReceiverStatus::Running,
+            host: "127.0.0.1".to_string(),
+            port: 28766,
+            ..FileReceiverRuntimeState::default()
+        };
+        let state = state_with_current_project("/tmp/wiki-a");
+        let guide = EmbeddedMcpTools.llm_wiki_get_upload_guide(&state, &upload_state, None);
+
+        assert_eq!(guide.upload_mode, "uploads_only");
+        assert_eq!(guide.endpoint_path, "/uploads");
+        assert_eq!(
+            guide.current_project_id,
+            Some(project_public_id("/tmp/wiki-a"))
+        );
+        assert_eq!(guide.service_status, "running");
+        assert_eq!(guide.upload_port, 28766);
+        assert_eq!(guide.upload_host, "127.0.0.1");
+        assert_eq!(guide.scheme, "http");
+        assert_eq!(guide.default_endpoint, "http://127.0.0.1:28766/uploads");
+        assert_eq!(guide.resolved_endpoint, "http://127.0.0.1:28766/uploads");
+        assert_eq!(guide.authorization_scheme, "Bearer");
+        assert_eq!(guide.header_auth_name, "X-LLM-Wiki-Upload-Token");
+        assert!(guide.forward_headers.is_empty());
+        assert!(guide.summary.contains("MCP does not accept file uploads"));
+        assert!(guide
+            .notes
+            .iter()
+            .any(|note| note.contains("same scheme, host/domain, and port")));
+        assert!(guide.curl_example.contains("Authorization: Bearer <token>"));
+        assert!(guide.curl_example.contains("-F 'projectId=wiki-"));
+        assert!(guide
+            .curl_example
+            .contains("-F 'file=@/absolute/path/to/source.pdf'"));
+        assert_eq!(guide.required_fields, vec!["projectId", "file"]);
+        assert!(guide.optional_fields.contains(&"fileName".to_string()));
+    }
+
+    #[test]
+    fn upload_guide_reuses_forwarded_host_and_proto() {
+        let upload_state = FileReceiverRuntimeState {
+            status: FileReceiverStatus::Running,
+            host: "127.0.0.1".to_string(),
+            port: 39001,
+            ..FileReceiverRuntimeState::default()
+        };
+
+        let (mut parts, _) = axum::http::Request::new(()).into_parts();
+        parts.headers.insert(
+            "forwarded",
+            "proto=https;host=wiki.example.com:18443"
+                .parse()
+                .expect("forwarded header should parse"),
+        );
+        parts.headers.insert(
+            HOST,
+            "127.0.0.1:18765".parse().expect("host header should parse"),
+        );
+        parts.headers.insert(
+            UPLOAD_TOKEN_HEADER_NAME,
+            "secret-token"
+                .parse()
+                .expect("custom token header should parse"),
+        );
+
+        let state = state_with_current_project("/tmp/wiki-a");
+        let guide = EmbeddedMcpTools.llm_wiki_get_upload_guide(&state, &upload_state, Some(&parts));
+
+        assert_eq!(guide.scheme, "https");
+        assert_eq!(guide.upload_host, "wiki.example.com");
+        assert_eq!(guide.upload_port, 18443);
+        assert_eq!(guide.default_endpoint, "http://127.0.0.1:39001/uploads");
+        assert_eq!(
+            guide.forward_headers,
+            vec![McpHttpHeader {
+                name: "X-LLM-Wiki-Upload-Token".to_string(),
+                value: "secret-token".to_string(),
+            }]
+        );
+        assert_eq!(
+            guide.resolved_endpoint,
+            "https://wiki.example.com:18443/uploads"
+        );
+        assert!(guide
+            .curl_example
+            .contains("https://wiki.example.com:18443/uploads"));
+        assert!(guide
+            .curl_example
+            .contains("X-LLM-Wiki-Upload-Token: secret-token"));
+    }
+
+    #[test]
+    fn ingest_queue_and_task_queries_return_structured_shapes() {
+        let project = TempWikiProject::new("ingest-queries");
+        let project_path = project.path_string();
+        let state = state_with_current_project(&project_path);
+
+        let queue_path = Path::new(&project_path).join(INGEST_QUEUE_RELATIVE_PATH);
+        fs::create_dir_all(
+            queue_path
+                .parent()
+                .expect("queue path should have parent directory"),
+        )
+        .expect("queue dir should be created");
+        let mut queue_values: Vec<Value> = vec![json!({
+            "id": "task-pending-1",
+            "sourcePath": "raw/sources/Inbox/notes.txt",
+            "folderContext": "Inbox",
+            "status": "pending",
+            "addedAt": 1000_u64,
+            "error": null,
+            "retryCount": 0,
+            "origin": "upload_service",
+            "mimeType": "text/plain"
+        })];
+        queue_values.push(json!({
+            "id": "task-done-1",
+            "sourcePath": "raw/sources/done.md",
+            "folderContext": "",
+            "status": "done",
+            "addedAt": 2000_u64,
+            "error": null,
+            "retryCount": 0,
+            "origin": "desktop",
+            "mimeType": "text/markdown",
+            "startedAt": 2010_u64,
+            "finishedAt": 2020_u64,
+            "filesWritten": ["wiki/entities/done.md"],
+            "reviewItemCount": 2,
+            "cacheHit": true
+        }));
+        queue_values.push(json!({
+            "id": "task-processing-1",
+            "sourcePath": "raw/sources/processing.md",
+            "folderContext": "Ops",
+            "status": "processing",
+            "addedAt": 3000_u64,
+            "error": null,
+            "retryCount": 0,
+            "origin": "mcp"
+        }));
+        fs::write(
+            &queue_path,
+            serde_json::to_string_pretty(&queue_values).expect("queue json should serialize"),
+        )
+        .expect("queue file should be written");
+
+        let queue_response = EmbeddedMcpTools
+            .llm_wiki_get_ingest_queue(&state, None, Some(2))
+            .expect("queue query should succeed");
+        assert_eq!(queue_response.project_id, project_public_id(&project_path));
+        assert_eq!(queue_response.summary.records_total, 3);
+        assert_eq!(queue_response.summary.pending, 1);
+        assert_eq!(queue_response.summary.processing, 1);
+        assert_eq!(queue_response.summary.done, 1);
+        assert_eq!(queue_response.summary.total, 2);
+        assert_eq!(queue_response.summary.history, 1);
+        assert_eq!(queue_response.limit, 2);
+        assert_eq!(queue_response.recent_tasks.len(), 2);
+        assert_eq!(queue_response.queue.len(), 2);
+        assert_eq!(queue_response.recent_tasks[0].id, "task-processing-1");
+        assert_eq!(queue_response.recent_tasks[1].id, "task-done-1");
+        assert_eq!(
+            queue_response
+                .current_task
+                .as_ref()
+                .map(|task| task.id.as_str()),
+            Some("task-processing-1")
+        );
+
+        let done_task = queue_response
+            .recent_tasks
+            .iter()
+            .find(|task| task.id == "task-done-1")
+            .expect("done task should be present");
+        assert_eq!(done_task.status, "done");
+        assert_eq!(
+            done_task.files_written,
+            Some(vec!["wiki/entities/done.md".to_string()])
+        );
+        assert_eq!(done_task.review_item_count, Some(2));
+        assert_eq!(done_task.cache_hit, Some(true));
+
+        let task_response = EmbeddedMcpTools
+            .llm_wiki_get_ingest_task(&state, "task-pending-1", None)
+            .expect("task query should succeed");
+        assert!(task_response.found);
+        assert!(task_response.task.is_some());
+        assert_eq!(
+            task_response
+                .task
+                .as_ref()
+                .expect("task should exist")
+                .status,
+            "pending"
+        );
+
+        let missing_task = EmbeddedMcpTools
+            .llm_wiki_get_ingest_task(&state, "missing-task-id", None)
+            .expect("missing task query should still succeed");
+        assert!(!missing_task.found);
+        assert!(missing_task.task.is_none());
+    }
+
+    #[test]
+    fn ingest_queue_errors_do_not_expose_project_path() {
+        let project = TempWikiProject::new("ingest-queue-error");
+        let project_path = project.path_string();
+        let state = state_with_current_project(&project_path);
+        let queue_path = Path::new(&project_path).join(INGEST_QUEUE_RELATIVE_PATH);
+
+        fs::create_dir_all(
+            queue_path
+                .parent()
+                .expect("queue path should have parent directory"),
+        )
+        .expect("queue dir should be created");
+        fs::write(&queue_path, "{not-json").expect("broken queue should be written");
+
+        let err = EmbeddedMcpTools
+            .llm_wiki_get_ingest_queue(&state, None, None)
+            .expect_err("broken queue should surface an error");
+
+        assert_eq!(err.code, McpToolErrorCode::QueueFormat);
+        assert!(err.message.contains(INGEST_QUEUE_RELATIVE_PATH));
+        assert!(!err.message.contains(&project_path));
+    }
+
+    #[test]
+    fn invalid_current_project_errors_do_not_expose_project_path() {
+        let path = "/tmp/not-a-valid-wiki-project";
+        let state = state_with_current_project(path);
+
+        let err = EmbeddedMcpTools
+            .llm_wiki_search(&state, "OpenAI", None, None, None)
+            .expect_err("invalid current project should fail");
+
+        assert_eq!(err.code, McpToolErrorCode::InvalidInput);
+        assert!(err.message.contains("Current project is not a valid LLM Wiki project."));
+        assert!(!err.message.contains(path));
+    }
+
+    #[test]
+    fn project_public_id_canonicalizes_dot_segments() {
+        let project = TempWikiProject::new("project-id-canonical");
+        let dotted_path = format!("{}/.", project.path_string());
+
+        assert_eq!(
+            project_public_id(&dotted_path),
+            project_public_id(&project.path_string())
+        );
+    }
+
+    #[test]
+    fn background_failure_marks_file_receiver_error_when_shared_listener_dies() {
+        let uploads = FileReceiverRuntimeManager::default();
+        uploads
+            .update_config(FileReceiverConfig {
+                enabled: true,
+                auto_start: true,
+                static_token: "secret".to_string(),
+                max_file_size_bytes: 1024 * 1024,
+                upload_ttl_hours: 24,
+            })
+            .expect("upload config should apply");
+
+        let shared = Arc::new(Mutex::new(McpRuntimeCore::default()));
+        {
+            let mut core = lock_or_recover(&shared);
+            core.config = McpConfig {
+                enabled: false,
+                auto_start: false,
+                host: "127.0.0.1".to_string(),
+                port: 18765,
+            };
+            core.server = Some(EmbeddedMcpServerHandle {
+                host: "127.0.0.1".to_string(),
+                port: 18765,
+                mcp_route_enabled: false,
+                cancellation_token: CancellationToken::new(),
+                task: tauri::async_runtime::spawn(async {}),
+            });
+            core.sync_file_receiver_runtime(&uploads);
+        }
+
+        assert_eq!(uploads.snapshot().status, FileReceiverStatus::Running);
+
+        record_background_failure(
+            &shared,
+            &uploads,
+            "127.0.0.1",
+            18765,
+            "listener crashed".to_string(),
+        );
+
+        let state = uploads.snapshot();
+        assert_eq!(state.status, FileReceiverStatus::Error);
+        assert_eq!(state.last_error.as_deref(), Some("listener crashed"));
+    }
+
     #[tokio::test]
     async fn streamable_http_service_calls_embedded_tools() {
         let project = TempWikiProject::new("streamable-http");
-        let manager = McpRuntimeManager::default();
+        let uploads = FileReceiverRuntimeManager::default();
+        uploads
+            .update_config(FileReceiverConfig::default())
+            .expect("upload config should apply");
+        let manager = McpRuntimeManager::with_file_receiver(uploads.clone());
         let project_path = project.path_string();
 
         manager.update_known_projects(vec![project_path.clone()]);
@@ -1496,14 +2633,17 @@ OpenAI builds GPT models and AI systems.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test listener should bind");
-        let addr = listener.local_addr().expect("listener should have local addr");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
         let token = CancellationToken::new();
 
         let service: StreamableHttpService<EmbeddedMcpServer, LocalSessionManager> =
             StreamableHttpService::new(
                 {
                     let shared = manager.shared();
-                    move || Ok(EmbeddedMcpServer::new(shared.clone()))
+                    let uploads = uploads.clone();
+                    move || Ok(EmbeddedMcpServer::new(shared.clone(), uploads.clone()))
                 },
                 Default::default(),
                 StreamableHttpServerConfig::default()
@@ -1525,16 +2665,45 @@ OpenAI builds GPT models and AI systems.
             "http://{}{}",
             addr, MCP_ENDPOINT_PATH
         ));
-        let client = ()
-            .serve(transport)
-            .await
-            .expect("client should connect");
+        let client = ().serve(transport).await.expect("client should connect");
 
         let tools = client
             .list_all_tools()
             .await
             .expect("tool listing should succeed");
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 7);
+        let tool_names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"llm_wiki_get_upload_guide"));
+        assert!(!tool_names.contains(&"llm_wiki_ingest_source"));
+
+        let guide_result = client
+            .call_tool(CallToolRequestParams::new("llm_wiki_get_upload_guide"))
+            .await
+            .expect("upload guide tool call should succeed");
+
+        assert_eq!(guide_result.is_error, Some(false));
+        let guide_structured = guide_result
+            .structured_content
+            .expect("upload guide should include structured content");
+        assert_eq!(guide_structured["uploadMode"], "uploads_only");
+        assert_eq!(guide_structured["endpointPath"], "/uploads");
+        assert_eq!(
+            guide_structured["currentProjectId"],
+            project_public_id(&project_path)
+        );
+        assert_eq!(guide_structured["authorizationScheme"], "Bearer");
+        assert_eq!(
+            guide_structured["headerAuthName"],
+            "X-LLM-Wiki-Upload-Token"
+        );
+        assert_eq!(guide_structured["uploadPort"], addr.port());
+        assert_eq!(
+            guide_structured["resolvedEndpoint"],
+            format!("http://127.0.0.1:{}/uploads", addr.port())
+        );
 
         let search_arguments = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
             "query": "OpenAI",
@@ -1542,7 +2711,9 @@ OpenAI builds GPT models and AI systems.
         }))
         .expect("search args should deserialize");
         let search_result = client
-            .call_tool(CallToolRequestParams::new("llm_wiki_search").with_arguments(search_arguments))
+            .call_tool(
+                CallToolRequestParams::new("llm_wiki_search").with_arguments(search_arguments),
+            )
             .await
             .expect("search tool call should succeed");
 
@@ -1550,7 +2721,7 @@ OpenAI builds GPT models and AI systems.
         let structured = search_result
             .structured_content
             .expect("search should include structured content");
-        assert_eq!(structured["projectPath"], project_path);
+        assert_eq!(structured["projectId"], project_public_id(&project_path));
         assert_eq!(structured["results"][0]["title"], "OpenAI");
 
         let read_arguments = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
@@ -1559,7 +2730,9 @@ OpenAI builds GPT models and AI systems.
         }))
         .expect("read args should deserialize");
         let read_result = client
-            .call_tool(CallToolRequestParams::new("llm_wiki_read_page").with_arguments(read_arguments))
+            .call_tool(
+                CallToolRequestParams::new("llm_wiki_read_page").with_arguments(read_arguments),
+            )
             .await
             .expect("read tool call should succeed");
 
@@ -1567,7 +2740,10 @@ OpenAI builds GPT models and AI systems.
         let read_structured = read_result
             .structured_content
             .expect("read should include structured content");
-        assert_eq!(read_structured["page"]["relativePath"], "entities/openai.md");
+        assert_eq!(
+            read_structured["page"]["relativePath"],
+            "entities/openai.md"
+        );
 
         client.cancel().await.expect("client should cancel cleanly");
         token.cancel();
@@ -1580,14 +2756,17 @@ OpenAI builds GPT models and AI systems.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test listener should bind");
-        let addr = listener.local_addr().expect("listener should have local addr");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
         let token = CancellationToken::new();
 
         let service: StreamableHttpService<EmbeddedMcpServer, LocalSessionManager> =
             StreamableHttpService::new(
                 {
                     let shared = manager.shared();
-                    move || Ok(EmbeddedMcpServer::new(shared.clone()))
+                    let uploads = manager.file_receiver.clone();
+                    move || Ok(EmbeddedMcpServer::new(shared.clone(), uploads.clone()))
                 },
                 Default::default(),
                 StreamableHttpServerConfig::default()
@@ -1609,17 +2788,16 @@ OpenAI builds GPT models and AI systems.
             "http://{}{}",
             addr, MCP_ENDPOINT_PATH
         ));
-        let client = ()
-            .serve(transport)
-            .await
-            .expect("client should connect");
+        let client = ().serve(transport).await.expect("client should connect");
 
         let search_arguments = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
             "query": "OpenAI"
         }))
         .expect("search args should deserialize");
         let search_result = client
-            .call_tool(CallToolRequestParams::new("llm_wiki_search").with_arguments(search_arguments))
+            .call_tool(
+                CallToolRequestParams::new("llm_wiki_search").with_arguments(search_arguments),
+            )
             .await
             .expect("search tool call should succeed");
 

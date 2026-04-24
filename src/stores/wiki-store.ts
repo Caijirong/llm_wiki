@@ -32,8 +32,6 @@ interface McpConfig {
 interface FileReceiverConfig {
   enabled: boolean
   autoStart: boolean
-  host: string
-  port: number
   staticToken: string
   maxFileSizeBytes: number
   uploadTtlHours: number
@@ -113,8 +111,6 @@ export const useWikiStore = create<WikiState>((set) => ({
   fileReceiverConfig: {
     enabled: false,
     autoStart: false,
-    host: "127.0.0.1",
-    port: 18766,
     staticToken: "",
     maxFileSizeBytes: 1024 * 1024 * 1024,
     uploadTtlHours: 24 * 7,

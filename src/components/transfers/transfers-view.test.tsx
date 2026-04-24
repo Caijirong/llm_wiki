@@ -7,7 +7,7 @@ const { fileReceiverStatus, listUploads } = vi.hoisted(() => ({
   fileReceiverStatus: vi.fn(async () => ({
     status: "running",
     host: "127.0.0.1",
-    port: 18766,
+    port: 18765,
     knownProjects: ["/tmp/wiki"],
     lastError: null,
     maxFileSizeBytes: 1024 * 1024 * 1024,

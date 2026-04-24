@@ -16,8 +16,6 @@ const { saveMcpConfig, loadMcpConfig, saveFileReceiverConfig, loadFileReceiverCo
   loadFileReceiverConfig: vi.fn(async () => ({
     enabled: true,
     autoStart: true,
-    host: "127.0.0.1",
-    port: 18766,
     staticToken: "secret",
     maxFileSizeBytes: 1024 * 1024 * 1024,
     uploadTtlHours: 168,
@@ -36,7 +34,7 @@ const { mcpStatus, fileReceiverStatus } = vi.hoisted(() => ({
   fileReceiverStatus: vi.fn(async () => ({
     status: "running",
     host: "127.0.0.1",
-    port: 18766,
+    port: 18765,
     knownProjects: ["/tmp/wiki"],
     lastError: null,
     maxFileSizeBytes: 1024 * 1024 * 1024,
@@ -79,8 +77,6 @@ describe("SettingsView MCP settings", () => {
       fileReceiverConfig: {
         enabled: false,
         autoStart: false,
-        host: "127.0.0.1",
-        port: 18766,
         staticToken: "",
         maxFileSizeBytes: 1024 * 1024 * 1024,
         uploadTtlHours: 168,
@@ -101,8 +97,6 @@ describe("SettingsView MCP settings", () => {
     loadFileReceiverConfig.mockResolvedValue({
       enabled: false,
       autoStart: false,
-      host: "127.0.0.1",
-      port: 18766,
       staticToken: "",
       maxFileSizeBytes: 1024 * 1024 * 1024,
       uploadTtlHours: 168,
@@ -196,8 +190,8 @@ describe("SettingsView MCP settings", () => {
     await user.click(screen.getByLabelText(/Auto-start file receiver/i))
     await user.clear(screen.getByLabelText(/Static token/i))
     await user.type(screen.getByLabelText(/Static token/i), "team-secret")
-    await user.clear(screen.getByLabelText(/Port/i, { selector: "#fileReceiverPort" }))
-    await user.type(screen.getByLabelText(/Port/i, { selector: "#fileReceiverPort" }), "19090")
+    await user.clear(screen.getByLabelText(/Port/i, { selector: "#mcpPort" }))
+    await user.type(screen.getByLabelText(/Port/i, { selector: "#mcpPort" }), "19090")
     await user.clear(screen.getByLabelText(/Max file size \(MB\)/i))
     await user.type(screen.getByLabelText(/Max file size \(MB\)/i), "2048")
     await user.clear(screen.getByLabelText(/Upload retention \(hours\)/i))
@@ -207,12 +201,61 @@ describe("SettingsView MCP settings", () => {
     expect(saveFileReceiverConfig).toHaveBeenCalledWith({
       enabled: true,
       autoStart: true,
-      host: "127.0.0.1",
-      port: 19090,
       staticToken: "team-secret",
       maxFileSizeBytes: 2048 * 1024 * 1024,
       uploadTtlHours: 72,
     })
     expect(screen.getByText(/http:\/\/127\.0\.0\.1:19090\/uploads/i)).toBeInTheDocument()
+    expect(screen.getByText(/shares the same host and port as the MCP server/i)).toBeInTheDocument()
+  })
+
+  it("keeps shared host and port editable when only file receiver is enabled", async () => {
+    useWikiStore.setState({
+      mcpConfig: {
+        enabled: false,
+        autoStart: false,
+        host: "0.0.0.0",
+        port: 19090,
+      },
+      fileReceiverConfig: {
+        enabled: true,
+        autoStart: true,
+        staticToken: "team-secret",
+        maxFileSizeBytes: 1024 * 1024 * 1024,
+        uploadTtlHours: 168,
+      },
+    })
+    loadMcpConfig.mockResolvedValueOnce({
+      enabled: false,
+      autoStart: false,
+      host: "0.0.0.0",
+      port: 19090,
+    })
+    loadFileReceiverConfig.mockResolvedValueOnce({
+      enabled: true,
+      autoStart: true,
+      staticToken: "team-secret",
+      maxFileSizeBytes: 1024 * 1024 * 1024,
+      uploadTtlHours: 168,
+    })
+
+    const user = userEvent.setup()
+    render(<SettingsView />)
+
+    await waitFor(() => expect(loadMcpConfig).toHaveBeenCalled())
+    expect(screen.getByLabelText(/Host/i)).toHaveValue("0.0.0.0")
+    expect(screen.getByLabelText(/Port/i)).toHaveValue(19090)
+    expect(screen.getByText(/exposes MCP and uploads to your network/i)).toBeInTheDocument()
+
+    await user.clear(screen.getByLabelText(/Port/i))
+    await user.type(screen.getByLabelText(/Port/i), "19191")
+    await user.click(screen.getByRole("button", { name: /save settings/i }))
+
+    expect(saveMcpConfig).toHaveBeenCalledWith({
+      enabled: false,
+      autoStart: false,
+      host: "0.0.0.0",
+      port: 19191,
+    })
   })
 })

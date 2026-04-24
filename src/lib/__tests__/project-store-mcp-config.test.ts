@@ -41,13 +41,31 @@ describe("project-store mcp config", () => {
     const config = {
       autoStart: true,
       enabled: true,
-      host: "0.0.0.0",
-      port: 18766,
       staticToken: "secret",
       maxFileSizeBytes: 1024 * 1024 * 512,
       uploadTtlHours: 72,
     }
     await saveFileReceiverConfig(config)
     await expect(loadFileReceiverConfig()).resolves.toEqual(config)
+  })
+
+  it("strips legacy host and port fields when loading file receiver config", async () => {
+    memoryStore.set("fileReceiverConfig", {
+      autoStart: true,
+      enabled: true,
+      host: "0.0.0.0",
+      port: 19090,
+      staticToken: "secret",
+      maxFileSizeBytes: 1024 * 1024 * 512,
+      uploadTtlHours: 72,
+    })
+
+    await expect(loadFileReceiverConfig()).resolves.toEqual({
+      autoStart: true,
+      enabled: true,
+      staticToken: "secret",
+      maxFileSizeBytes: 1024 * 1024 * 512,
+      uploadTtlHours: 72,
+    })
   })
 })

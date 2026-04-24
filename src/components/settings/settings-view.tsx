@@ -64,8 +64,6 @@ export function SettingsView() {
   const [mcpRuntime, setMcpRuntime] = useState<McpRuntimeStatus | null>(null)
   const [fileReceiverEnabled, setFileReceiverEnabled] = useState(fileReceiverConfig.enabled)
   const [fileReceiverAutoStart, setFileReceiverAutoStart] = useState(fileReceiverConfig.autoStart)
-  const [fileReceiverHost, setFileReceiverHost] = useState(fileReceiverConfig.host)
-  const [fileReceiverPort, setFileReceiverPort] = useState(String(fileReceiverConfig.port))
   const [fileReceiverToken, setFileReceiverToken] = useState(fileReceiverConfig.staticToken)
   const [fileReceiverMaxFileSizeMb, setFileReceiverMaxFileSizeMb] = useState(
     String(Math.max(1, Math.round(fileReceiverConfig.maxFileSizeBytes / (1024 * 1024))))
@@ -95,8 +93,6 @@ export function SettingsView() {
   useEffect(() => {
     setFileReceiverEnabled(fileReceiverConfig.enabled)
     setFileReceiverAutoStart(fileReceiverConfig.autoStart)
-    setFileReceiverHost(fileReceiverConfig.host)
-    setFileReceiverPort(String(fileReceiverConfig.port))
     setFileReceiverToken(fileReceiverConfig.staticToken)
     setFileReceiverMaxFileSizeMb(
       String(Math.max(1, Math.round(fileReceiverConfig.maxFileSizeBytes / (1024 * 1024))))
@@ -121,8 +117,6 @@ export function SettingsView() {
       if (mounted && persistedFileReceiver && !hasTouchedFileReceiverSettings.current) {
         setFileReceiverEnabled(persistedFileReceiver.enabled)
         setFileReceiverAutoStart(persistedFileReceiver.autoStart)
-        setFileReceiverHost(persistedFileReceiver.host)
-        setFileReceiverPort(String(persistedFileReceiver.port))
         setFileReceiverToken(persistedFileReceiver.staticToken)
         setFileReceiverMaxFileSizeMb(
           String(Math.max(1, Math.round(persistedFileReceiver.maxFileSizeBytes / (1024 * 1024))))
@@ -153,8 +147,8 @@ export function SettingsView() {
     } catch (err) {
       setFileReceiverRuntime({
         status: "error",
-        host: fileReceiverHost.trim() || "127.0.0.1",
-        port: parseFileReceiverPort(fileReceiverPort),
+        host: mcpHost.trim() || "127.0.0.1",
+        port: parseMcpPort(mcpPort),
         knownProjects: [],
         lastError: err instanceof Error ? err.message : String(err),
         maxFileSizeBytes: parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb),
@@ -184,8 +178,8 @@ export function SettingsView() {
           })
           setFileReceiverRuntime({
             status: "error",
-            host: fileReceiverHost.trim() || "127.0.0.1",
-            port: parseFileReceiverPort(fileReceiverPort),
+            host: mcpHost.trim() || "127.0.0.1",
+            port: parseMcpPort(mcpPort),
             knownProjects: [],
             lastError: err instanceof Error ? err.message : String(err),
             maxFileSizeBytes: parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb),
@@ -210,11 +204,14 @@ export function SettingsView() {
   const mcpRuntimeLabel = mcpRuntime
     ? formatRuntimeStatus(mcpRuntime.status)
     : t("settings.mcpStatusPlaceholder")
-  const mcpEndpointPreview = `http://${mcpHost.trim() || "127.0.0.1"}:${mcpPort || "18765"}/mcp`
+  const sharedListenerSettingsVisible = mcpEnabled || fileReceiverEnabled
+  const sharedExternalHost = mcpHost.trim() || "127.0.0.1"
+  const sharedExternalPort = parseMcpPort(mcpPort)
+  const mcpEndpointPreview = `http://${sharedExternalHost}:${sharedExternalPort}/mcp`
   const fileReceiverRuntimeLabel = fileReceiverRuntime
     ? formatRuntimeStatus(fileReceiverRuntime.status)
     : t("settings.fileReceiverStatusPlaceholder")
-  const fileReceiverEndpointPreview = `http://${fileReceiverHost.trim() || "127.0.0.1"}:${fileReceiverPort || "18766"}/uploads`
+  const fileReceiverEndpointPreview = `http://${sharedExternalHost}:${sharedExternalPort}/uploads`
 
   async function handleSave() {
     const {
@@ -226,8 +223,6 @@ export function SettingsView() {
     } = await import("@/lib/project-store")
     const normalizedMcpPort = parseMcpPort(mcpPort)
     const normalizedMcpHost = mcpHost.trim() || "127.0.0.1"
-    const normalizedFileReceiverPort = parseFileReceiverPort(fileReceiverPort)
-    const normalizedFileReceiverHost = fileReceiverHost.trim() || "127.0.0.1"
     const newConfig = { provider, apiKey, model, ollamaUrl, customEndpoint, maxContextSize }
     const newSearchConfig = { provider: searchProvider, apiKey: searchApiKey }
     const newEmbeddingConfig = { enabled: embeddingEnabled, endpoint: embeddingEndpoint, apiKey: embeddingApiKey, model: embeddingModel }
@@ -235,8 +230,6 @@ export function SettingsView() {
     const newFileReceiverConfig = {
       enabled: fileReceiverEnabled,
       autoStart: fileReceiverAutoStart,
-      host: normalizedFileReceiverHost,
-      port: normalizedFileReceiverPort,
       staticToken: fileReceiverToken.trim(),
       maxFileSizeBytes: parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb),
       uploadTtlHours: parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours),
@@ -533,20 +526,22 @@ export function SettingsView() {
             <p className="text-xs text-muted-foreground">{t("settings.mcpDescription")}</p>
 
             {mcpEnabled && (
-              <>
-                <div className="flex items-center gap-2">
-                  <input
-                    id="mcpAutoStart"
-                    type="checkbox"
-                    checked={mcpAutoStart}
-                    onChange={(e) => {
-                      hasTouchedMcpSettings.current = true
-                      setMcpAutoStart(e.target.checked)
-                    }}
-                  />
-                  <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
-                </div>
+              <div className="flex items-center gap-2">
+                <input
+                  id="mcpAutoStart"
+                  type="checkbox"
+                  checked={mcpAutoStart}
+                  onChange={(e) => {
+                    hasTouchedMcpSettings.current = true
+                    setMcpAutoStart(e.target.checked)
+                  }}
+                />
+                <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
+              </div>
+            )}
 
+            {sharedListenerSettingsVisible && (
+              <>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-2">
                     <Label htmlFor="mcpHost">{t("settings.host")}</Label>
@@ -641,35 +636,7 @@ export function SettingsView() {
                   <Label htmlFor="fileReceiverAutoStart">{t("settings.autoStartFileReceiver")}</Label>
                 </div>
 
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="space-y-2">
-                    <Label htmlFor="fileReceiverHost">{t("settings.host")}</Label>
-                    <Input
-                      id="fileReceiverHost"
-                      value={fileReceiverHost}
-                      onChange={(e) => {
-                        hasTouchedFileReceiverSettings.current = true
-                        setFileReceiverHost(e.target.value)
-                      }}
-                      placeholder="127.0.0.1"
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <Label htmlFor="fileReceiverPort">{t("settings.port")}</Label>
-                    <Input
-                      id="fileReceiverPort"
-                      type="number"
-                      min={1}
-                      value={fileReceiverPort}
-                      onChange={(e) => {
-                        hasTouchedFileReceiverSettings.current = true
-                        setFileReceiverPort(e.target.value)
-                      }}
-                      placeholder="18766"
-                    />
-                  </div>
-                </div>
+                <p className="text-xs text-muted-foreground">{t("settings.fileReceiverSharedEndpointHint")}</p>
 
                 <div className="space-y-2">
                   <Label htmlFor="fileReceiverToken">{t("settings.fileReceiverToken")}</Label>
@@ -716,10 +683,6 @@ export function SettingsView() {
                     />
                   </div>
                 </div>
-
-                {fileReceiverHost.trim() === "0.0.0.0" && (
-                  <p className="text-xs text-amber-600">{t("settings.fileReceiverHostWarning")}</p>
-                )}
 
                 <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
                   <p>
@@ -857,14 +820,6 @@ function parseMcpPort(value: string): number {
   if (!/^\d+$/.test(normalized)) return 18765
   const port = Number(normalized)
   if (!Number.isInteger(port) || port < 1 || port > 65535) return 18765
-  return port
-}
-
-function parseFileReceiverPort(value: string): number {
-  const normalized = value.trim()
-  if (!/^\d+$/.test(normalized)) return 18766
-  const port = Number(normalized)
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return 18766
   return port
 }
 

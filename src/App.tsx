@@ -99,9 +99,7 @@ function App() {
     fileReceiverConfigLoaded,
     fileReceiverConfig.autoStart,
     fileReceiverConfig.enabled,
-    fileReceiverConfig.host,
     fileReceiverConfig.maxFileSizeBytes,
-    fileReceiverConfig.port,
     fileReceiverConfig.staticToken,
     fileReceiverConfig.uploadTtlHours,
   ])
