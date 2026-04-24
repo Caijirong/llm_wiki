@@ -29,17 +29,26 @@ interface McpConfig {
   port: number
 }
 
+interface FileReceiverConfig {
+  enabled: boolean
+  autoStart: boolean
+  staticToken: string
+  maxFileSizeBytes: number
+  uploadTtlHours: number
+}
+
 interface WikiState {
   project: WikiProject | null
   fileTree: FileNode[]
   selectedFile: string | null
   fileContent: string
   chatExpanded: boolean
-  activeView: "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "settings"
+  activeView: "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "transfers" | "settings"
   llmConfig: LlmConfig
   searchApiConfig: SearchApiConfig
   embeddingConfig: EmbeddingConfig
   mcpConfig: McpConfig
+  fileReceiverConfig: FileReceiverConfig
   dataVersion: number
 
   setProject: (project: WikiProject | null) => void
@@ -52,6 +61,7 @@ interface WikiState {
   setSearchApiConfig: (config: SearchApiConfig) => void
   setEmbeddingConfig: (config: EmbeddingConfig) => void
   setMcpConfig: (config: McpConfig) => void
+  setFileReceiverConfig: (config: FileReceiverConfig) => void
   bumpDataVersion: () => void
 }
 
@@ -98,11 +108,20 @@ export const useWikiStore = create<WikiState>((set) => ({
     port: 18765,
   },
 
+  fileReceiverConfig: {
+    enabled: false,
+    autoStart: false,
+    staticToken: "",
+    maxFileSizeBytes: 1024 * 1024 * 1024,
+    uploadTtlHours: 24 * 7,
+  },
+
   setLlmConfig: (llmConfig) => set({ llmConfig }),
   setSearchApiConfig: (searchApiConfig) => set({ searchApiConfig }),
   setEmbeddingConfig: (embeddingConfig) => set({ embeddingConfig }),
   setMcpConfig: (mcpConfig) => set({ mcpConfig }),
+  setFileReceiverConfig: (fileReceiverConfig) => set({ fileReceiverConfig }),
   bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),
 }))
 
-export type { WikiState, LlmConfig, SearchApiConfig, EmbeddingConfig, McpConfig }
+export type { WikiState, LlmConfig, SearchApiConfig, EmbeddingConfig, McpConfig, FileReceiverConfig }

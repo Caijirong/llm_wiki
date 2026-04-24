@@ -1,6 +1,8 @@
 import { useWikiStore } from "@/stores/wiki-store"
 import { useChatStore } from "@/stores/chat-store"
 import {
+  fileReceiverStatus as fetchFileReceiverStatus,
+  type FileReceiverStatus as FileReceiverRuntimeState,
   mcpStatus as fetchMcpStatus,
   type McpStatus as McpRuntimeStatus,
 } from "@/commands/fs"
@@ -38,6 +40,8 @@ export function SettingsView() {
   const setEmbeddingConfig = useWikiStore((s) => s.setEmbeddingConfig)
   const mcpConfig = useWikiStore((s) => s.mcpConfig)
   const setMcpConfig = useWikiStore((s) => s.setMcpConfig)
+  const fileReceiverConfig = useWikiStore((s) => s.fileReceiverConfig)
+  const setFileReceiverConfig = useWikiStore((s) => s.setFileReceiverConfig)
   const maxHistoryMessages = useChatStore((s) => s.maxHistoryMessages)
   const setMaxHistoryMessages = useChatStore((s) => s.setMaxHistoryMessages)
 
@@ -58,9 +62,20 @@ export function SettingsView() {
   const [mcpHost, setMcpHost] = useState(mcpConfig.host)
   const [mcpPort, setMcpPort] = useState(String(mcpConfig.port))
   const [mcpRuntime, setMcpRuntime] = useState<McpRuntimeStatus | null>(null)
+  const [fileReceiverEnabled, setFileReceiverEnabled] = useState(fileReceiverConfig.enabled)
+  const [fileReceiverAutoStart, setFileReceiverAutoStart] = useState(fileReceiverConfig.autoStart)
+  const [fileReceiverToken, setFileReceiverToken] = useState(fileReceiverConfig.staticToken)
+  const [fileReceiverMaxFileSizeMb, setFileReceiverMaxFileSizeMb] = useState(
+    String(Math.max(1, Math.round(fileReceiverConfig.maxFileSizeBytes / (1024 * 1024))))
+  )
+  const [fileReceiverUploadTtlHours, setFileReceiverUploadTtlHours] = useState(
+    String(fileReceiverConfig.uploadTtlHours)
+  )
+  const [fileReceiverRuntime, setFileReceiverRuntime] = useState<FileReceiverRuntimeState | null>(null)
   const [saved, setSaved] = useState(false)
   const [currentLang, setCurrentLang] = useState(i18n.language)
   const hasTouchedMcpSettings = useRef(false)
+  const hasTouchedFileReceiverSettings = useRef(false)
 
   useEffect(() => {
     setProvider(llmConfig.provider)
@@ -76,15 +91,38 @@ export function SettingsView() {
   }, [searchApiConfig])
 
   useEffect(() => {
+    setFileReceiverEnabled(fileReceiverConfig.enabled)
+    setFileReceiverAutoStart(fileReceiverConfig.autoStart)
+    setFileReceiverToken(fileReceiverConfig.staticToken)
+    setFileReceiverMaxFileSizeMb(
+      String(Math.max(1, Math.round(fileReceiverConfig.maxFileSizeBytes / (1024 * 1024))))
+    )
+    setFileReceiverUploadTtlHours(String(fileReceiverConfig.uploadTtlHours))
+  }, [fileReceiverConfig])
+
+  useEffect(() => {
     let mounted = true
     void (async () => {
-      const { loadMcpConfig } = await import("@/lib/project-store")
-      const persisted = await loadMcpConfig()
-      if (!mounted || !persisted || hasTouchedMcpSettings.current) return
-      setMcpEnabled(persisted.enabled)
-      setMcpAutoStart(persisted.autoStart)
-      setMcpHost(persisted.host)
-      setMcpPort(String(persisted.port))
+      const { loadFileReceiverConfig, loadMcpConfig } = await import("@/lib/project-store")
+      const [persistedMcp, persistedFileReceiver] = await Promise.all([
+        loadMcpConfig(),
+        loadFileReceiverConfig(),
+      ])
+      if (mounted && persistedMcp && !hasTouchedMcpSettings.current) {
+        setMcpEnabled(persistedMcp.enabled)
+        setMcpAutoStart(persistedMcp.autoStart)
+        setMcpHost(persistedMcp.host)
+        setMcpPort(String(persistedMcp.port))
+      }
+      if (mounted && persistedFileReceiver && !hasTouchedFileReceiverSettings.current) {
+        setFileReceiverEnabled(persistedFileReceiver.enabled)
+        setFileReceiverAutoStart(persistedFileReceiver.autoStart)
+        setFileReceiverToken(persistedFileReceiver.staticToken)
+        setFileReceiverMaxFileSizeMb(
+          String(Math.max(1, Math.round(persistedFileReceiver.maxFileSizeBytes / (1024 * 1024))))
+        )
+        setFileReceiverUploadTtlHours(String(persistedFileReceiver.uploadTtlHours))
+      }
     })()
 
     return () => {
@@ -103,20 +141,49 @@ export function SettingsView() {
     }
   }
 
+  async function refreshFileReceiverRuntime() {
+    try {
+      setFileReceiverRuntime(await fetchFileReceiverStatus())
+    } catch (err) {
+      setFileReceiverRuntime({
+        status: "error",
+        host: mcpHost.trim() || "127.0.0.1",
+        port: parseMcpPort(mcpPort),
+        knownProjects: [],
+        lastError: err instanceof Error ? err.message : String(err),
+        maxFileSizeBytes: parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb),
+        uploadTtlHours: parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours),
+      })
+    }
+  }
+
   useEffect(() => {
     let active = true
 
     const refresh = async () => {
       try {
-        const runtime = await fetchMcpStatus()
+        const [mcpRuntimeState, fileReceiverRuntimeState] = await Promise.all([
+          fetchMcpStatus(),
+          fetchFileReceiverStatus(),
+        ])
         if (active) {
-          setMcpRuntime(runtime)
+          setMcpRuntime(mcpRuntimeState)
+          setFileReceiverRuntime(fileReceiverRuntimeState)
         }
       } catch (err) {
         if (active) {
           setMcpRuntime({
             status: "error",
             lastError: err instanceof Error ? err.message : String(err),
+          })
+          setFileReceiverRuntime({
+            status: "error",
+            host: mcpHost.trim() || "127.0.0.1",
+            port: parseMcpPort(mcpPort),
+            knownProjects: [],
+            lastError: err instanceof Error ? err.message : String(err),
+            maxFileSizeBytes: parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb),
+            uploadTtlHours: parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours),
           })
         }
       }
@@ -135,27 +202,50 @@ export function SettingsView() {
 
   const currentProvider = PROVIDERS.find((p) => p.value === provider)
   const mcpRuntimeLabel = mcpRuntime
-    ? formatMcpRuntimeStatus(mcpRuntime.status)
+    ? formatRuntimeStatus(mcpRuntime.status)
     : t("settings.mcpStatusPlaceholder")
-  const mcpEndpointPreview = `http://${mcpHost.trim() || "127.0.0.1"}:${mcpPort || "18765"}/mcp`
+  const sharedListenerSettingsVisible = mcpEnabled || fileReceiverEnabled
+  const sharedExternalHost = mcpHost.trim() || "127.0.0.1"
+  const sharedExternalPort = parseMcpPort(mcpPort)
+  const mcpEndpointPreview = `http://${sharedExternalHost}:${sharedExternalPort}/mcp`
+  const fileReceiverRuntimeLabel = fileReceiverRuntime
+    ? formatRuntimeStatus(fileReceiverRuntime.status)
+    : t("settings.fileReceiverStatusPlaceholder")
+  const fileReceiverEndpointPreview = `http://${sharedExternalHost}:${sharedExternalPort}/uploads`
 
   async function handleSave() {
-    const { saveLlmConfig, saveSearchApiConfig, saveEmbeddingConfig, saveMcpConfig } = await import("@/lib/project-store")
+    const {
+      saveEmbeddingConfig,
+      saveFileReceiverConfig,
+      saveLlmConfig,
+      saveMcpConfig,
+      saveSearchApiConfig,
+    } = await import("@/lib/project-store")
     const normalizedMcpPort = parseMcpPort(mcpPort)
     const normalizedMcpHost = mcpHost.trim() || "127.0.0.1"
     const newConfig = { provider, apiKey, model, ollamaUrl, customEndpoint, maxContextSize }
     const newSearchConfig = { provider: searchProvider, apiKey: searchApiKey }
     const newEmbeddingConfig = { enabled: embeddingEnabled, endpoint: embeddingEndpoint, apiKey: embeddingApiKey, model: embeddingModel }
     const newMcpConfig = { enabled: mcpEnabled, autoStart: mcpAutoStart, host: normalizedMcpHost, port: normalizedMcpPort }
+    const newFileReceiverConfig = {
+      enabled: fileReceiverEnabled,
+      autoStart: fileReceiverAutoStart,
+      staticToken: fileReceiverToken.trim(),
+      maxFileSizeBytes: parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb),
+      uploadTtlHours: parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours),
+    }
     setSearchApiConfig(newSearchConfig)
     await saveSearchApiConfig(newSearchConfig)
     setEmbeddingConfig(newEmbeddingConfig)
     await saveEmbeddingConfig(newEmbeddingConfig)
     setMcpConfig(newMcpConfig)
     await saveMcpConfig(newMcpConfig)
+    setFileReceiverConfig(newFileReceiverConfig)
+    await saveFileReceiverConfig(newFileReceiverConfig)
     setLlmConfig(newConfig)
     await saveLlmConfig(newConfig)
     await refreshMcpRuntime()
+    await refreshFileReceiverRuntime()
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
   }
@@ -436,20 +526,22 @@ export function SettingsView() {
             <p className="text-xs text-muted-foreground">{t("settings.mcpDescription")}</p>
 
             {mcpEnabled && (
-              <>
-                <div className="flex items-center gap-2">
-                  <input
-                    id="mcpAutoStart"
-                    type="checkbox"
-                    checked={mcpAutoStart}
-                    onChange={(e) => {
-                      hasTouchedMcpSettings.current = true
-                      setMcpAutoStart(e.target.checked)
-                    }}
-                  />
-                  <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
-                </div>
+              <div className="flex items-center gap-2">
+                <input
+                  id="mcpAutoStart"
+                  type="checkbox"
+                  checked={mcpAutoStart}
+                  onChange={(e) => {
+                    hasTouchedMcpSettings.current = true
+                    setMcpAutoStart(e.target.checked)
+                  }}
+                />
+                <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
+              </div>
+            )}
 
+            {sharedListenerSettingsVisible && (
+              <>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-2">
                     <Label htmlFor="mcpHost">{t("settings.host")}</Label>
@@ -496,6 +588,120 @@ export function SettingsView() {
                   )}
                   {mcpRuntime?.lastError && (
                     <p className="text-red-600">{mcpRuntime.lastError}</p>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* File receiver section */}
+          <div className="space-y-4 rounded-lg border p-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold">{t("settings.fileReceiver")}</h3>
+              <button
+                id="fileReceiverEnabled"
+                type="button"
+                role="switch"
+                aria-checked={fileReceiverEnabled}
+                aria-label={t("settings.enableFileReceiver")}
+                onClick={() => {
+                  hasTouchedFileReceiverSettings.current = true
+                  setFileReceiverEnabled(!fileReceiverEnabled)
+                }}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                  fileReceiverEnabled ? "bg-primary" : "bg-muted"
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                    fileReceiverEnabled ? "translate-x-4.5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+            <p className="text-xs text-muted-foreground">{t("settings.fileReceiverDescription")}</p>
+
+            {fileReceiverEnabled && (
+              <>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="fileReceiverAutoStart"
+                    type="checkbox"
+                    checked={fileReceiverAutoStart}
+                    onChange={(e) => {
+                      hasTouchedFileReceiverSettings.current = true
+                      setFileReceiverAutoStart(e.target.checked)
+                    }}
+                  />
+                  <Label htmlFor="fileReceiverAutoStart">{t("settings.autoStartFileReceiver")}</Label>
+                </div>
+
+                <p className="text-xs text-muted-foreground">{t("settings.fileReceiverSharedEndpointHint")}</p>
+
+                <div className="space-y-2">
+                  <Label htmlFor="fileReceiverToken">{t("settings.fileReceiverToken")}</Label>
+                  <Input
+                    id="fileReceiverToken"
+                    type="password"
+                    value={fileReceiverToken}
+                    onChange={(e) => {
+                      hasTouchedFileReceiverSettings.current = true
+                      setFileReceiverToken(e.target.value)
+                    }}
+                    placeholder={t("settings.fileReceiverTokenPlaceholder")}
+                  />
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="fileReceiverMaxFileSizeMb">{t("settings.fileReceiverMaxSizeMb")}</Label>
+                    <Input
+                      id="fileReceiverMaxFileSizeMb"
+                      type="number"
+                      min={1}
+                      value={fileReceiverMaxFileSizeMb}
+                      onChange={(e) => {
+                        hasTouchedFileReceiverSettings.current = true
+                        setFileReceiverMaxFileSizeMb(e.target.value)
+                      }}
+                      placeholder="1024"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="fileReceiverUploadTtlHours">{t("settings.fileReceiverUploadTtlHours")}</Label>
+                    <Input
+                      id="fileReceiverUploadTtlHours"
+                      type="number"
+                      min={1}
+                      value={fileReceiverUploadTtlHours}
+                      onChange={(e) => {
+                        hasTouchedFileReceiverSettings.current = true
+                        setFileReceiverUploadTtlHours(e.target.value)
+                      }}
+                      placeholder="168"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
+                  <p>
+                    {t("settings.fileReceiverRuntimeStatus")}: {fileReceiverRuntimeLabel}
+                  </p>
+                  <p>
+                    {t("settings.fileReceiverEndpointPreview")}: {fileReceiverEndpointPreview}
+                  </p>
+                  <p>
+                    {t("settings.fileReceiverKnownProjects")}: {fileReceiverRuntime?.knownProjects.length ?? 0}
+                  </p>
+                  <p>
+                    {t("settings.fileReceiverMaxSizeCurrent")}: {formatFileSize(fileReceiverRuntime?.maxFileSizeBytes ?? parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb))}
+                  </p>
+                  <p>
+                    {t("settings.fileReceiverTtlCurrent")}: {fileReceiverRuntime?.uploadTtlHours ?? parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours)}h
+                  </p>
+                  {fileReceiverRuntime?.lastError && (
+                    <p className="text-red-600">{fileReceiverRuntime.lastError}</p>
                   )}
                 </div>
               </>
@@ -602,7 +808,7 @@ function formatSize(chars: number): string {
   return `${chars} characters`
 }
 
-function formatMcpRuntimeStatus(status: McpRuntimeStatus["status"]): string {
+function formatRuntimeStatus(status: string): string {
   return status
     .split("_")
     .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
@@ -615,4 +821,33 @@ function parseMcpPort(value: string): number {
   const port = Number(normalized)
   if (!Number.isInteger(port) || port < 1 || port > 65535) return 18765
   return port
+}
+
+function parseFileReceiverMaxFileSizeBytes(value: string): number {
+  const normalized = value.trim()
+  if (!/^\d+$/.test(normalized)) return 1024 * 1024 * 1024
+  const megabytes = Number(normalized)
+  if (!Number.isInteger(megabytes) || megabytes < 1) return 1024 * 1024 * 1024
+  return megabytes * 1024 * 1024
+}
+
+function parseFileReceiverUploadTtlHours(value: string): number {
+  const normalized = value.trim()
+  if (!/^\d+$/.test(normalized)) return 24 * 7
+  const hours = Number(normalized)
+  if (!Number.isInteger(hours) || hours < 1) return 24 * 7
+  return hours
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+  }
+  if (bytes >= 1024 * 1024) {
+    return `${Math.round(bytes / (1024 * 1024))} MB`
+  }
+  if (bytes >= 1024) {
+    return `${Math.round(bytes / 1024)} KB`
+  }
+  return `${bytes} B`
 }

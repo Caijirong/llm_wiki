@@ -7,7 +7,7 @@ import {
 import { useActivityStore, type ActivityItem } from "@/stores/activity-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, getFileName } from "@/lib/path-utils"
-import { getQueue, getQueueSummary, retryTask, cancelTask, type IngestTask } from "@/lib/ingest-queue"
+import { getQueue, getQueueSummary, retryTask, cancelTask, syncQueueFromDisk, type IngestTask } from "@/lib/ingest-queue"
 
 const FILE_TYPE_ICONS: Record<string, typeof FileText> = {
   sources: BookOpen,
@@ -42,11 +42,32 @@ export function ActivityPanel() {
 
   // Poll queue state
   useEffect(() => {
+    let cancelled = false
+
+    const refreshQueue = async () => {
+      if (project) {
+        try {
+          await syncQueueFromDisk(normalizePath(project.path))
+        } catch (err) {
+          console.error("Failed to sync ingest queue from disk:", err)
+        }
+      }
+
+      if (!cancelled) {
+        setQueueTasks([...getQueue()])
+      }
+    }
+
+    void refreshQueue()
     const interval = setInterval(() => {
-      setQueueTasks([...getQueue()])
+      void refreshQueue()
     }, 1000)
-    return () => clearInterval(interval)
-  }, [])
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [project])
 
   const queueSummary = getQueueSummary()
   const hasQueue = queueSummary.total > 0

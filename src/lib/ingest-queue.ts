@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "@/commands/fs"
-import { autoIngest } from "./ingest"
+import { autoIngest, type IngestQueueMetadataPatch } from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath } from "@/lib/path-utils"
 
@@ -13,6 +13,13 @@ export interface IngestTask {
   addedAt: number
   error: string | null
   retryCount: number
+  origin?: "desktop" | "mcp"
+  mimeType?: string
+  startedAt?: number
+  finishedAt?: number
+  filesWritten?: string[]
+  reviewItemCount?: number
+  cacheHit?: boolean
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
@@ -31,18 +38,50 @@ function queueFilePath(projectPath: string): string {
 
 async function saveQueue(projectPath: string): Promise<void> {
   try {
-    // Only save pending and failed tasks (done tasks are removed)
-    const toSave = queue.filter((t) => t.status !== "done")
-    await writeFile(queueFilePath(projectPath), JSON.stringify(toSave, null, 2))
+    await writeFile(queueFilePath(projectPath), JSON.stringify(queue, null, 2))
   } catch {
     // non-critical
+  }
+}
+
+function normalizeTask(raw: unknown): IngestTask | null {
+  if (!raw || typeof raw !== "object") return null
+  const task = raw as Partial<IngestTask>
+
+  if (typeof task.sourcePath !== "string" || task.sourcePath.length === 0) return null
+
+  const status = task.status === "pending" || task.status === "processing" || task.status === "done" || task.status === "failed"
+    ? task.status
+    : "pending"
+
+  return {
+    id: typeof task.id === "string" && task.id.length > 0 ? task.id : generateId(),
+    sourcePath: task.sourcePath,
+    folderContext: typeof task.folderContext === "string" ? task.folderContext : "",
+    status,
+    addedAt: typeof task.addedAt === "number" ? task.addedAt : Date.now(),
+    error: typeof task.error === "string" ? task.error : null,
+    retryCount: typeof task.retryCount === "number" ? task.retryCount : 0,
+    origin: task.origin === "desktop" || task.origin === "mcp" ? task.origin : undefined,
+    mimeType: typeof task.mimeType === "string" ? task.mimeType : undefined,
+    startedAt: typeof task.startedAt === "number" ? task.startedAt : undefined,
+    finishedAt: typeof task.finishedAt === "number" ? task.finishedAt : undefined,
+    filesWritten: Array.isArray(task.filesWritten) && task.filesWritten.every((item) => typeof item === "string")
+      ? task.filesWritten
+      : undefined,
+    reviewItemCount: typeof task.reviewItemCount === "number" ? task.reviewItemCount : undefined,
+    cacheHit: typeof task.cacheHit === "boolean" ? task.cacheHit : undefined,
   }
 }
 
 async function loadQueue(projectPath: string): Promise<IngestTask[]> {
   try {
     const raw = await readFile(queueFilePath(projectPath))
-    return JSON.parse(raw) as IngestTask[]
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map((task) => normalizeTask(task))
+      .filter((task): task is IngestTask => task !== null)
   } catch {
     return []
   }
@@ -73,6 +112,7 @@ export async function enqueueIngest(
     addedAt: Date.now(),
     error: null,
     retryCount: 0,
+    origin: "desktop",
   }
 
   queue.push(task)
@@ -104,6 +144,7 @@ export async function enqueueBatch(
       addedAt: Date.now(),
       error: null,
       retryCount: 0,
+      origin: "desktop",
     }
     queue.push(task)
     ids.push(task.id)
@@ -179,21 +220,70 @@ export async function clearCompletedTasks(projectPath: string): Promise<void> {
 }
 
 /**
+ * Patch persisted metadata for a task without changing status transitions.
+ */
+export async function updateTaskMetadata(
+  projectPath: string,
+  taskId: string,
+  patch: Partial<IngestQueueMetadataPatch>,
+): Promise<void> {
+  const task = queue.find((t) => t.id === taskId)
+  if (!task) return
+
+  if (typeof patch.cacheHit === "boolean") {
+    task.cacheHit = patch.cacheHit
+  }
+  if (Array.isArray(patch.filesWritten)) {
+    task.filesWritten = patch.filesWritten
+  }
+  if (typeof patch.reviewItemCount === "number") {
+    task.reviewItemCount = patch.reviewItemCount
+  }
+  if (typeof patch.finishedAt === "number") {
+    task.finishedAt = patch.finishedAt
+  }
+
+  await saveQueue(normalizePath(projectPath))
+}
+
+/**
  * Get current queue state.
  */
 export function getQueue(): readonly IngestTask[] {
-  return queue
+  return queue.filter((t) => t.status !== "done")
 }
 
 /**
  * Get queue summary.
  */
-export function getQueueSummary(): { pending: number; processing: number; failed: number; total: number } {
+export function getQueueSummary(): {
+  pending: number
+  processing: number
+  failed: number
+  done: number
+  active: number
+  history: number
+  recordsTotal: number
+  total: number
+} {
+  const visibleQueue = queue.filter((t) => t.status !== "done")
+  const pending = visibleQueue.filter((t) => t.status === "pending").length
+  const processingCount = visibleQueue.filter((t) => t.status === "processing").length
+  const failed = visibleQueue.filter((t) => t.status === "failed").length
+  const done = queue.filter((t) => t.status === "done").length
+  const active = pending + processingCount
+  const recordsTotal = queue.length
+  const total = visibleQueue.length
+
   return {
-    pending: queue.filter((t) => t.status === "pending").length,
-    processing: queue.filter((t) => t.status === "processing").length,
-    failed: queue.filter((t) => t.status === "failed").length,
-    total: queue.length,
+    pending,
+    processing: processingCount,
+    failed,
+    done,
+    active,
+    history: done + failed,
+    recordsTotal,
+    total,
   }
 }
 
@@ -208,7 +298,10 @@ export async function restoreQueue(projectPath: string): Promise<void> {
   currentProjectPath = pp
   const saved = await loadQueue(pp)
 
-  if (saved.length === 0) return
+  if (saved.length === 0) {
+    queue = []
+    return
+  }
 
   // Reset any "processing" tasks back to "pending" (interrupted by app close)
   let restored = 0
@@ -231,6 +324,34 @@ export async function restoreQueue(projectPath: string): Promise<void> {
   }
 }
 
+/**
+ * Pull in tasks that were appended externally to the persisted queue file,
+ * such as MCP uploads arriving while the desktop app is already running.
+ */
+export async function syncQueueFromDisk(projectPath: string): Promise<void> {
+  const pp = normalizePath(projectPath)
+  currentProjectPath = pp
+  const saved = await loadQueue(pp)
+
+  if (saved.length === 0) return
+
+  const knownTaskIds = new Set(queue.map((task) => task.id))
+  let added = 0
+
+  for (const task of saved) {
+    if (knownTaskIds.has(task.id)) continue
+    queue.push(task)
+    knownTaskIds.add(task.id)
+    added++
+  }
+
+  if (added === 0) return
+
+  await saveQueue(pp)
+  console.log(`[Ingest Queue] Synced ${added} external task(s) from disk`)
+  processNext(pp)
+}
+
 // ── Processing ────────────────────────────────────────────────────────────
 
 const MAX_RETRIES = 3
@@ -243,6 +364,8 @@ async function processNext(projectPath: string): Promise<void> {
 
   processing = true
   next.status = "processing"
+  next.startedAt = Date.now()
+  next.error = null
   await saveQueue(projectPath)
 
   const pp = normalizePath(projectPath)
@@ -269,13 +392,26 @@ async function processNext(projectPath: string): Promise<void> {
   lastWrittenFiles = []
 
   try {
-    const writtenFiles = await autoIngest(pp, fullSourcePath, llmConfig, currentAbortController.signal, next.folderContext)
+    const writtenFiles = await autoIngest(
+      pp,
+      fullSourcePath,
+      llmConfig,
+      currentAbortController.signal,
+      next.folderContext,
+      {
+        queueTaskId: next.id,
+        onQueueMetadata: (taskId, patch) => updateTaskMetadata(pp, taskId, patch),
+      },
+    )
     lastWrittenFiles = writtenFiles
 
-    // Success: remove from queue
+    // Success: keep as done for persisted history
     currentAbortController = null
     lastWrittenFiles = []
-    queue = queue.filter((t) => t.id !== next.id)
+    next.status = "done"
+    next.error = null
+    next.finishedAt = Date.now()
+    next.filesWritten = writtenFiles
     await saveQueue(pp)
 
     console.log(`[Ingest Queue] Done: ${next.sourcePath}`)

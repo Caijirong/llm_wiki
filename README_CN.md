@@ -40,7 +40,7 @@
 - **深度研究** — LLM 智能生成搜索主题，多查询网络搜索，研究结果自动摄入 Wiki
 - **异步审核系统** — LLM 在摄入时标记需人工判断的项，预定义操作，预生成搜索查询
 - **Chrome 网页剪藏** — 一键捕获网页内容，自动摄入知识库
-- **只读 MCP Server** — 向外部 agent（如 Codex、Claude）暴露项目发现、Wiki 搜索、页面读取和上下文打包能力
+- **内嵌 MCP Server + 上传指引** — 向外部 agent（如 Codex、Claude）暴露项目发现、Wiki 搜索、页面读取、ingest 队列查询和 `/uploads` 上传协议说明；文件内容本身统一走独立上传服务
 
 ## 这是什么？
 
@@ -392,41 +392,63 @@ npm run tauri build    # 生产构建
 
 ### 给外部 Agent 用的 MCP Server
 
-仓库内本地开发时，构建并启动 stdio MCP 服务：
+当前维护的方案是桌面应用内嵌的 MCP Server 和文件接收服务：
 
 ```bash
 npm install
-npm run mcp -- --project /absolute/path/to/wiki
+npm run tauri dev
 ```
 
-发布 npm 包后，外部 Agent 可直接通过：
+启动桌面应用后，在设置里启用：
+- MCP Server
+- 文件接收服务
 
-```bash
-npx -y @haowan36/llm-wiki-mcp --project /absolute/path/to/wiki
-```
+当前推荐边界：
+- MCP 用于项目发现、知识检索、页面读取、ingest 队列查询、上传协议说明
+- 文件导入统一走文件接收服务的 `POST /uploads`
 
-独立 MCP 包现在必须显式传入且只能传入一个目标：`--project` 或 `--workspace`，并通过 `http://<host>:<port>/mcp` 以 Streamable HTTP 方式提供服务。当前暴露 4 个只读工具：
+内嵌 MCP 通过 `http://<host>:<port>/mcp` 以 Streamable HTTP 提供服务。当前工具包括：
 - `llm_wiki_list_projects`
 - `llm_wiki_search`
 - `llm_wiki_read_page`
 - `llm_wiki_get_context`
+- `llm_wiki_get_ingest_queue`
+- `llm_wiki_get_ingest_task`
+- `llm_wiki_get_upload_guide`
 
-示例：
+其中：
+- `llm_wiki_get_upload_guide` 会返回 `/uploads` 的字段、鉴权方式和 `curl` 示例
+- `llm_wiki_list_projects` 返回的是不透明的 `projectId`；MCP 和对外的上传接口都不会暴露本地 wiki 路径
+- MCP 不再接收文件内容，不再通过 base64 导入资料
+- `/uploads` 现在与 MCP 服务共用同一个对外 host 和 port，只是路径是 `/uploads`
+- `/uploads` 同时接受 `Authorization: Bearer <token>` 和 `X-LLM-Wiki-Upload-Token: <token>`
+
+如果你的 MCP 客户端支持自定义 HTTP headers，推荐方式是：
+- 在 MCP 请求上配置 `X-LLM-Wiki-Upload-Token: <token>`
+- 先调用 `llm_wiki_get_upload_guide`
+- 上传时直接复用返回的 `forwardHeaders` 到 `/uploads`
+
+文件接收服务默认上传地址示例：
 
 ```bash
-npx -y @haowan36/llm-wiki-mcp --workspace /absolute/path/to/workspace
+curl -X POST http://127.0.0.1:18765/uploads \
+  -H 'X-LLM-Wiki-Upload-Token: <token>' \
+  -F 'projectId=<project-id>' \
+  -F 'fileName=source.pdf' \
+  -F 'mimeType=application/pdf' \
+  -F 'folderContext=docs/reference' \
+  -F 'file=@/absolute/path/to/source.pdf'
 ```
 
-如果你要启用语义检索或混合检索，还需要提供 embedding 配置。服务会把 query 转成 embedding，并查询 `.llm-wiki/lancedb` 下已有的向量索引：
+历史上的独立 npm MCP 包仍在仓库中，但当前不是维护重点，也不应作为新的外部接入路径。
+
+如果你要启用语义检索或混合检索，仍需要提供 embedding 配置。内嵌服务会把 query 转成 embedding，并查询 `.llm-wiki/lancedb` 下已有的向量索引：
 
 ```bash
 LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
 LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
 LLM_WIKI_EMBEDDING_API_KEY=optional-key \
-  npx -y @haowan36/llm-wiki-mcp \
-    --workspace /absolute/path/to/workspace \
-    --host 0.0.0.0 \
-    --port 18765
+  npm run tauri dev
 ```
 
 `llm_wiki_search` 和 `llm_wiki_get_context` 支持 `mode: "keyword" | "semantic" | "hybrid"`。推荐默认使用 `hybrid`。如果没有 embedding 配置，`hybrid` 会自动降级为纯关键词检索。

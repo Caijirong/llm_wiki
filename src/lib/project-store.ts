@@ -5,6 +5,7 @@ import type {
   SearchApiConfig,
   EmbeddingConfig,
   McpConfig,
+  FileReceiverConfig,
 } from "@/stores/wiki-store"
 
 const STORE_NAME = "app-state.json"
@@ -80,6 +81,14 @@ export async function loadEmbeddingConfig(): Promise<EmbeddingConfig | null> {
 }
 
 const MCP_CONFIG_KEY = "mcpConfig"
+const FILE_RECEIVER_CONFIG_KEY = "fileReceiverConfig"
+const DEFAULT_FILE_RECEIVER_CONFIG: FileReceiverConfig = {
+  enabled: false,
+  autoStart: false,
+  staticToken: "",
+  maxFileSizeBytes: 1024 * 1024 * 1024,
+  uploadTtlHours: 24 * 7,
+}
 
 export async function saveMcpConfig(config: McpConfig): Promise<void> {
   const store = await getStore()
@@ -89,6 +98,36 @@ export async function saveMcpConfig(config: McpConfig): Promise<void> {
 export async function loadMcpConfig(): Promise<McpConfig | null> {
   const store = await getStore()
   return (await store.get<McpConfig>(MCP_CONFIG_KEY)) ?? null
+}
+
+export async function saveFileReceiverConfig(config: FileReceiverConfig): Promise<void> {
+  const store = await getStore()
+  await store.set(FILE_RECEIVER_CONFIG_KEY, {
+    enabled: config.enabled,
+    autoStart: config.autoStart,
+    staticToken: config.staticToken,
+    maxFileSizeBytes: config.maxFileSizeBytes,
+    uploadTtlHours: config.uploadTtlHours,
+  } satisfies FileReceiverConfig)
+}
+
+export async function loadFileReceiverConfig(): Promise<FileReceiverConfig | null> {
+  const store = await getStore()
+  const raw = await store.get<Record<string, unknown>>(FILE_RECEIVER_CONFIG_KEY)
+  if (!raw || typeof raw !== "object") return null
+
+  return {
+    enabled:
+      typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_FILE_RECEIVER_CONFIG.enabled,
+    autoStart:
+      typeof raw.autoStart === "boolean" ? raw.autoStart : DEFAULT_FILE_RECEIVER_CONFIG.autoStart,
+    staticToken:
+      typeof raw.staticToken === "string" ? raw.staticToken : DEFAULT_FILE_RECEIVER_CONFIG.staticToken,
+    maxFileSizeBytes:
+      typeof raw.maxFileSizeBytes === "number" ? raw.maxFileSizeBytes : DEFAULT_FILE_RECEIVER_CONFIG.maxFileSizeBytes,
+    uploadTtlHours:
+      typeof raw.uploadTtlHours === "number" ? raw.uploadTtlHours : DEFAULT_FILE_RECEIVER_CONFIG.uploadTtlHours,
+  }
 }
 
 export async function removeFromRecentProjects(

@@ -5,6 +5,8 @@ import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useChatStore } from "@/stores/chat-store"
 import {
+  fileReceiverUpdateConfig,
+  fileReceiverUpdateKnownProjects,
   listDirectory,
   mcpUpdateConfig,
   mcpUpdateKnownProjects,
@@ -19,6 +21,7 @@ import {
   loadLanguage,
   loadSearchApiConfig,
   loadEmbeddingConfig,
+  loadFileReceiverConfig,
   loadMcpConfig,
 } from "@/lib/project-store"
 import { loadReviewItems, loadChatHistory } from "@/lib/persist"
@@ -32,6 +35,7 @@ import type { WikiProject } from "@/types/wiki"
 function App() {
   const project = useWikiStore((s) => s.project)
   const mcpConfig = useWikiStore((s) => s.mcpConfig)
+  const fileReceiverConfig = useWikiStore((s) => s.fileReceiverConfig)
   const setProject = useWikiStore((s) => s.setProject)
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
@@ -39,6 +43,7 @@ function App() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [loading, setLoading] = useState(true)
   const [mcpConfigLoaded, setMcpConfigLoaded] = useState(false)
+  const [fileReceiverConfigLoaded, setFileReceiverConfigLoaded] = useState(false)
 
   async function syncMcpConfigOnInit() {
     const savedMcpConfig = await loadMcpConfig()
@@ -46,6 +51,22 @@ function App() {
       useWikiStore.getState().setMcpConfig(savedMcpConfig)
     }
     setMcpConfigLoaded(true)
+  }
+
+  async function syncFileReceiverConfigOnInit() {
+    const savedConfig = await loadFileReceiverConfig()
+    if (savedConfig) {
+      useWikiStore.getState().setFileReceiverConfig(savedConfig)
+    }
+    setFileReceiverConfigLoaded(true)
+  }
+
+  async function syncKnownProjectsToServices(projects: WikiProject[]) {
+    const paths = projects.map((p) => p.path)
+    await Promise.all([
+      mcpUpdateKnownProjects(paths),
+      fileReceiverUpdateKnownProjects(paths),
+    ])
   }
 
   // Set up auto-save and clip watcher once on mount
@@ -68,6 +89,21 @@ function App() {
     mcpConfig.port,
   ])
 
+  useEffect(() => {
+    if (!fileReceiverConfigLoaded) return
+
+    fileReceiverUpdateConfig(fileReceiverConfig).catch((err) => {
+      console.error("Failed to sync file receiver config to Tauri:", err)
+    })
+  }, [
+    fileReceiverConfigLoaded,
+    fileReceiverConfig.autoStart,
+    fileReceiverConfig.enabled,
+    fileReceiverConfig.maxFileSizeBytes,
+    fileReceiverConfig.staticToken,
+    fileReceiverConfig.uploadTtlHours,
+  ])
+
   // Auto-open last project on startup
   useEffect(() => {
     async function init() {
@@ -85,6 +121,13 @@ function App() {
           useWikiStore.getState().setEmbeddingConfig(savedEmbeddingConfig)
         }
         await syncMcpConfigOnInit()
+        await syncFileReceiverConfigOnInit()
+        const recentProjects = await getRecentProjects()
+        try {
+          await syncKnownProjectsToServices(recentProjects)
+        } catch (err) {
+          console.error("Failed to sync known projects to Tauri services:", err)
+        }
         const savedLang = await loadLanguage()
         if (savedLang) {
           await i18n.changeLanguage(savedLang)
@@ -122,7 +165,7 @@ function App() {
         console.error("Failed to restore ingest queue:", err)
       )
     })
-    // Notify local clip server of the current project + all recent projects
+    // Notify local services of current project + all recent projects
     mcpUpdateProject(proj.path).catch((err) => {
       console.error(`Failed to sync MCP current project (${proj.path}) to Tauri:`, err)
     })
@@ -135,9 +178,8 @@ function App() {
     // Send all recent projects to clip server for extension project picker
     getRecentProjects().then((recents) => {
       const projects = recents.map((p) => ({ name: p.name, path: p.path }))
-      const paths = recents.map((p) => p.path)
-      mcpUpdateKnownProjects(paths).catch((err) => {
-        console.error("Failed to sync MCP known projects to Tauri:", err)
+      syncKnownProjectsToServices(recents).catch((err) => {
+        console.error("Failed to sync known projects to Tauri services:", err)
       })
       fetch("http://127.0.0.1:19827/projects", {
         method: "POST",

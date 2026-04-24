@@ -40,7 +40,7 @@
 - **Deep Research** — LLM-optimized search topics, multi-query web search, auto-ingest results into wiki
 - **Async Review System** — LLM flags items for human judgment, predefined actions, pre-generated search queries
 - **Chrome Web Clipper** — one-click web page capture with auto-ingest into knowledge base
-- **Read-Only MCP Server** — expose project discovery, wiki search, page read, and context bundle tools to external agents like Codex or Claude
+- **Embedded MCP Server + Upload Guide** — expose project discovery, wiki search, page read, ingest queue queries, and `/uploads` upload protocol guidance to external agents; file bytes themselves go through the standalone upload service
 
 ## What is this?
 
@@ -392,41 +392,63 @@ npm run tauri build    # Production build
 
 ### MCP Server for External Agents
 
-For local development in this repo, build and launch the stdio MCP server:
+The maintained path is the MCP server and file receiver embedded in the desktop app:
 
 ```bash
 npm install
-npm run mcp -- --project /absolute/path/to/wiki
+npm run tauri dev
 ```
 
-After publishing the MCP package, external agents can connect through:
+After launching the desktop app, enable:
+- MCP Server
+- File Receiver service
 
-```bash
-npx -y @haowan36/llm-wiki-mcp --project /absolute/path/to/wiki
-```
+Recommended boundary:
+- Use MCP for project discovery, knowledge retrieval, page reads, ingest queue queries, and upload guidance
+- Use `POST /uploads` for every source import
 
-The standalone package now requires exactly one of `--project` or `--workspace`, and it serves MCP over Streamable HTTP on `http://<host>:<port>/mcp`. It exposes four read-only tools:
+The embedded MCP server is served over Streamable HTTP at `http://<host>:<port>/mcp`. It exposes:
 - `llm_wiki_list_projects`
 - `llm_wiki_search`
 - `llm_wiki_read_page`
 - `llm_wiki_get_context`
+- `llm_wiki_get_ingest_queue`
+- `llm_wiki_get_ingest_task`
+- `llm_wiki_get_upload_guide`
 
-Example:
+In particular:
+- `llm_wiki_get_upload_guide` returns the `/uploads` field contract, auth scheme, and a `curl` example
+- `llm_wiki_list_projects` returns opaque `projectId` values; MCP and public upload APIs do not expose local wiki filesystem paths
+- MCP no longer accepts file content and no longer imports sources via base64
+- `/uploads` now shares the same external host and port as the MCP server, under the `/uploads` path
+- `/uploads` accepts either `Authorization: Bearer <token>` or `X-LLM-Wiki-Upload-Token: <token>`
+
+If your MCP client supports custom HTTP headers, the recommended setup is:
+- configure the MCP client to send `X-LLM-Wiki-Upload-Token: <token>` on MCP requests
+- call `llm_wiki_get_upload_guide`
+- reuse the returned `forwardHeaders` when uploading to `/uploads`
+
+Default upload example:
 
 ```bash
-npx -y @haowan36/llm-wiki-mcp --workspace /absolute/path/to/workspace
+curl -X POST http://127.0.0.1:18765/uploads \
+  -H 'X-LLM-Wiki-Upload-Token: <token>' \
+  -F 'projectId=<project-id>' \
+  -F 'fileName=source.pdf' \
+  -F 'mimeType=application/pdf' \
+  -F 'folderContext=docs/reference' \
+  -F 'file=@/absolute/path/to/source.pdf'
 ```
 
-For semantic or hybrid retrieval, also set embedding config so the server can embed the query and search the existing LanceDB index under `.llm-wiki/lancedb`:
+The historical standalone npm MCP package is still present in the repo, but it is no longer the maintained integration path and should not be used for new agent integrations.
+
+For semantic or hybrid retrieval, also set embedding config so the embedded service can embed the query and search the existing LanceDB index under `.llm-wiki/lancedb`:
 
 ```bash
 LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
 LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
 LLM_WIKI_EMBEDDING_API_KEY=optional-key \
-  npx -y @haowan36/llm-wiki-mcp \
-    --workspace /absolute/path/to/workspace \
-    --host 0.0.0.0 \
-    --port 18765
+  npm run tauri dev
 ```
 
 `llm_wiki_search` and `llm_wiki_get_context` support `mode: "keyword" | "semantic" | "hybrid"`. `hybrid` is the recommended default. If embedding config is missing, hybrid falls back to keyword-only retrieval.

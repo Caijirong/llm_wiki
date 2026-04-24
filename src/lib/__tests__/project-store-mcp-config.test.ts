@@ -11,7 +11,12 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   })),
 }))
 
-import { loadMcpConfig, saveMcpConfig } from "@/lib/project-store"
+import {
+  loadFileReceiverConfig,
+  loadMcpConfig,
+  saveFileReceiverConfig,
+  saveMcpConfig,
+} from "@/lib/project-store"
 
 describe("project-store mcp config", () => {
   beforeEach(() => {
@@ -26,5 +31,41 @@ describe("project-store mcp config", () => {
     const config = { autoStart: true, enabled: true, host: "127.0.0.1", port: 18765 }
     await saveMcpConfig(config)
     await expect(loadMcpConfig()).resolves.toEqual(config)
+  })
+
+  it("returns null when file receiver config is not persisted", async () => {
+    await expect(loadFileReceiverConfig()).resolves.toBeNull()
+  })
+
+  it("saves and loads file receiver config", async () => {
+    const config = {
+      autoStart: true,
+      enabled: true,
+      staticToken: "secret",
+      maxFileSizeBytes: 1024 * 1024 * 512,
+      uploadTtlHours: 72,
+    }
+    await saveFileReceiverConfig(config)
+    await expect(loadFileReceiverConfig()).resolves.toEqual(config)
+  })
+
+  it("strips legacy host and port fields when loading file receiver config", async () => {
+    memoryStore.set("fileReceiverConfig", {
+      autoStart: true,
+      enabled: true,
+      host: "0.0.0.0",
+      port: 19090,
+      staticToken: "secret",
+      maxFileSizeBytes: 1024 * 1024 * 512,
+      uploadTtlHours: 72,
+    })
+
+    await expect(loadFileReceiverConfig()).resolves.toEqual({
+      autoStart: true,
+      enabled: true,
+      staticToken: "secret",
+      maxFileSizeBytes: 1024 * 1024 * 512,
+      uploadTtlHours: 72,
+    })
   })
 })
