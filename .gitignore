@@ -42,3 +42,5 @@ pnpm-debug.log*
 
 # Brainstorm assets (not tracked in source control)
 .superpowers/
+.codex/
+.claude/
