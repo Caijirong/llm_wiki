@@ -40,7 +40,7 @@
 - **深度研究** — LLM 智能生成搜索主题，多查询网络搜索，研究结果自动摄入 Wiki
 - **异步审核系统** — LLM 在摄入时标记需人工判断的项，预定义操作，预生成搜索查询
 - **Chrome 网页剪藏** — 一键捕获网页内容，自动摄入知识库
-- **内嵌 MCP Server + 上传指引** — 向外部 agent（如 Codex、Claude）暴露项目发现、Wiki 搜索、页面读取、ingest 队列查询和 `/uploads` 上传协议说明；文件内容本身统一走独立上传服务
+- **内嵌 MCP Server + 上传指引** — 向外部 agent（如 Codex、Claude）暴露项目发现、Wiki 搜索、页面读取、ingest 队列查询和 `/uploads` 上传协议说明；文件内容本身统一走内嵌上传端点
 
 ## 这是什么？
 
@@ -439,8 +439,6 @@ curl -X POST http://127.0.0.1:18765/uploads \
   -F 'folderContext=docs/reference' \
   -F 'file=@/absolute/path/to/source.pdf'
 ```
-
-历史上的独立 npm MCP 包仍在仓库中，但当前不是维护重点，也不应作为新的外部接入路径。
 
 如果你要启用语义检索或混合检索，仍需要提供 embedding 配置。内嵌服务会把 query 转成 embedding，并查询 `.llm-wiki/lancedb` 下已有的向量索引：
 
