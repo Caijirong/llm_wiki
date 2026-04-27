@@ -59,7 +59,7 @@ def main():
             'params': {
                 'protocolVersion': '2024-11-05',
                 'capabilities': {},
-                'clientInfo': {'name': 'llm-wiki-usage', 'version': '1.0'},
+                'clientInfo': {'name': 'using-llm-wiki', 'version': '1.0'},
             },
         }
         resp_headers, raw = post(args.url, headers, payload)

@@ -1,9 +1,9 @@
 ---
-name: llm-wiki-usage
-description: "Use this skill when the user asks about knowledge base, wiki, internal docs, saved materials, existing notes, project memory, documented knowledge, source-grounded answers, or importing materials into a knowledge base. Triggers include: 知识库, wiki, 文档库, 资料库, 项目记忆, 已有资料, 历史资料, 沉淀内容, 根据资料回答, 基于知识回答, 查一下有没有, 总结资料, 上传资料, 导入资料, 加入知识库."
+name: using-llm-wiki
+description: "Use when the user asks about a knowledge base, wiki, internal docs, saved materials, existing notes, project memory, documented knowledge, source-grounded answers, or importing materials into a knowledge base. Triggers include: 知识库, wiki, 文档库, 资料库, 项目记忆, 已有资料, 历史资料, 沉淀内容, 根据资料回答, 基于知识回答, 查一下有没有, 总结资料, 上传资料, 导入资料, 加入知识库."
 ---
 
-# LLM Wiki Usage
+# Using LLM Wiki
 
 Use this skill for knowledge-base workflows backed by an `llm-wiki` MCP server. The user does not need to mention `llm-wiki`; if the request is about existing knowledge, wiki content, saved materials, or importing sources, use this skill and route the work through `llm-wiki`.
 
