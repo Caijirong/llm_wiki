@@ -537,7 +537,7 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_get_upload_guide",
-        description = "Return the file upload contract for importing sources. MCP does not accept file content; upload through /uploads instead."
+        description = "Return the current upload contract for importing source files through the shared /uploads endpoint."
     )]
     async fn get_upload_guide(
         &self,
@@ -550,7 +550,7 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_get_ingest_task",
-        description = "Query a single ingest task by task id from the shared ingest queue file. Ingest is asynchronous and may take a while; avoid aggressive polling and ask the user to check again later when a task is still processing."
+        description = "Return one ingest task by task id from the shared ingest queue."
     )]
     async fn get_ingest_task(
         &self,
@@ -568,7 +568,7 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_get_ingest_queue",
-        description = "Return the persisted ingest queue and summary from the shared queue file. Ingest is asynchronous and may take a while; avoid aggressive polling and ask the user to check again later when tasks are still processing."
+        description = "Return the persisted ingest queue, current task, recent tasks, and queue summary."
     )]
     async fn get_ingest_queue(
         &self,
@@ -586,7 +586,7 @@ impl EmbeddedMcpServer {
 impl ServerHandler for EmbeddedMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "LLM Wiki MCP server embedded in the desktop app. MCP does not accept file uploads. Import sources through the desktop app's /uploads endpoint and use llm_wiki_get_upload_guide for the upload contract. If the client already sends X-LLM-Wiki-Upload-Token on MCP requests, llm_wiki_get_upload_guide returns forwardHeaders that can be reused directly for /uploads.",
+            "LLM Wiki MCP server embedded in the desktop app. Query wiki content with the read tools. Import source files by first calling llm_wiki_get_upload_guide and then uploading to the returned /uploads contract.",
         )
     }
 }
@@ -1363,7 +1363,7 @@ impl EmbeddedMcpTools {
 
         McpUploadGuideResponse {
             upload_mode: "uploads_only".to_string(),
-            summary: "MCP does not accept file uploads. Import sources by sending multipart/form-data to the desktop app's file receiver service, then use ingest queue tools to monitor processing.".to_string(),
+            summary: "Import sources by sending multipart/form-data to the shared /uploads endpoint, then monitor processing with ingest queue tools.".to_string(),
             current_project_id,
             service_status: file_receiver_status_label(&upload_state.status).to_string(),
             endpoint_path: UPLOADS_ENDPOINT_PATH.to_string(),
@@ -1385,16 +1385,10 @@ impl EmbeddedMcpTools {
             get_upload_path_template: UPLOADS_ITEM_PATH_TEMPLATE.to_string(),
             curl_example,
             notes: vec![
-                "Reuse the same scheme, host/domain, and port that reached this MCP server; uploads live on the same external listener.".to_string(),
-                "defaultEndpoint is the upload service bind address; resolvedEndpoint is the externally reachable URL inferred from the current MCP request.".to_string(),
-                "Use projectId from llm_wiki_list_projects or currentProjectId from this guide. MCP does not expose local filesystem paths.".to_string(),
-                "The upload service also accepts the custom header X-LLM-Wiki-Upload-Token. If the current MCP request already included that header, forwardHeaders returns it so external agents can reuse the same header set for /uploads.".to_string(),
-                "Metadata fields must be sent before the file part in the multipart payload."
-                    .to_string(),
-                "fileName is optional when the multipart file part already includes a filename."
-                    .to_string(),
-                "Use GET /uploads to inspect recent upload records and GET /uploads/{upload_id} to inspect one upload.".to_string(),
-                "Use llm_wiki_get_ingest_queue and llm_wiki_get_ingest_task to monitor the downstream ingest queue after upload.".to_string(),
+                "resolvedEndpoint is inferred from the current MCP request and points at the externally reachable upload endpoint.".to_string(),
+                "Use currentProjectId or a project id from llm_wiki_list_projects as projectId.".to_string(),
+                "Metadata fields must be sent before the file part in the multipart payload.".to_string(),
+                "Use ingest queue tools to monitor downstream processing after upload.".to_string(),
             ],
         }
     }
@@ -2350,11 +2344,11 @@ OpenAI builds GPT models and AI systems.
         assert_eq!(guide.authorization_scheme, "Bearer");
         assert_eq!(guide.header_auth_name, "X-LLM-Wiki-Upload-Token");
         assert!(guide.forward_headers.is_empty());
-        assert!(guide.summary.contains("MCP does not accept file uploads"));
+        assert!(guide.summary.contains("multipart/form-data"));
         assert!(guide
             .notes
             .iter()
-            .any(|note| note.contains("same scheme, host/domain, and port")));
+            .any(|note| note.contains("resolvedEndpoint is inferred")));
         assert!(guide.curl_example.contains("Authorization: Bearer <token>"));
         assert!(guide.curl_example.contains("-F 'projectId=wiki-"));
         assert!(guide
