@@ -40,7 +40,7 @@
 - **Deep Research** — LLM-optimized search topics, multi-query web search, auto-ingest results into wiki
 - **Async Review System** — LLM flags items for human judgment, predefined actions, pre-generated search queries
 - **Chrome Web Clipper** — one-click web page capture with auto-ingest into knowledge base
-- **Embedded MCP Server + Upload Guide** — expose project discovery, wiki search, page read, ingest queue queries, and `/uploads` upload protocol guidance to external agents; file bytes themselves go through the standalone upload service
+- **Embedded MCP Server + Upload Guide** — expose project discovery, wiki search, page read, ingest queue queries, and `/uploads` upload protocol guidance to external agents; file bytes themselves go through the embedded upload endpoint
 
 ## What is this?
 
@@ -439,8 +439,6 @@ curl -X POST http://127.0.0.1:18765/uploads \
   -F 'folderContext=docs/reference' \
   -F 'file=@/absolute/path/to/source.pdf'
 ```
-
-The historical standalone npm MCP package is still present in the repo, but it is no longer the maintained integration path and should not be used for new agent integrations.
 
 For semantic or hybrid retrieval, also set embedding config so the embedded service can embed the query and search the existing LanceDB index under `.llm-wiki/lancedb`:
 

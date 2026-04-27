@@ -5,12 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Development Commands
 
 ```bash
-npm install                    # Install all deps (root + workspace packages)
+npm install                    # Install dependencies
 npm run tauri dev              # Desktop app with hot reload (Vite on :1420)
-npm run build                  # tsc + vite build + build MCP workspace package
+npm run build                  # tsc + vite build
 npm test                       # Run Vitest suite
 npx vitest run src/lib/__tests__/some.test.ts  # Single test file
-npm run mcp -- --project /path/to/wiki         # Launch read-only MCP server
 cd src-tauri && cargo build    # Rust-only check
 ```
 
@@ -21,9 +20,8 @@ cd src-tauri && cargo build    # Rust-only check
 ### Frontend (`src/`)
 
 - **Components** (`src/components/`): Feature views grouped by area — `chat/`, `graph/`, `layout/`, `settings/`, `sources/`, `review/`, `lint/`, `search/`, `editor/`, `project/`. Shared shadcn/ui primitives in `components/ui/`.
-- **Business logic** (`src/lib/`): Core engine modules — `ingest.ts` (two-step chain-of-thought), `llm-client.ts` (multi-provider streaming), `retrieval-core.ts` → `retrieval-text.ts` + `retrieval-graph-core.ts` (multi-phase query pipeline), `wiki-graph.ts` + `graph-relevance.ts` (4-signal relevance model), `wiki-query.ts` (query orchestration), `deep-research.ts`, `lint.ts`, `embedding.ts`, `search.ts`.
+- **Business logic** (`src/lib/`): Core engine modules — `ingest.ts` (two-step chain-of-thought), `llm-client.ts` (multi-provider streaming), `retrieval-core.ts` → `retrieval-text.ts` + `retrieval-graph-core.ts` (multi-phase query pipeline), `wiki-graph.ts` + `graph-relevance.ts` (4-signal relevance model), `deep-research.ts`, `lint.ts`, `embedding.ts`, `search.ts`.
 - **State** (`src/stores/`): Zustand stores — `wiki-store.ts` (project + files), `chat-store.ts`, `review-store.ts`, `activity-store.ts`, `research-store.ts`.
-- **MCP** (`src/mcp/`): In-app MCP server — `server.ts` (tool definitions), `http-server.ts` (Streamable HTTP transport), `project-discovery.ts`, `vector-search.ts`.
 - **Types** (`src/types/`): Shared TypeScript definitions.
 - **i18n** (`src/i18n/`): English + Chinese via react-i18next.
 
@@ -33,10 +31,7 @@ cd src-tauri && cargo build    # Rust-only check
 - Document parsers: pdf-extract, docx-rs, calamine (XLSX/XLS/ODS), ZIP+XML (PPTX).
 - `tiny_http` server on port 19827 for Chrome extension web clipper.
 - Axum-based web search endpoint.
-
-### MCP Workspace Package (`packages/llm-wiki-mcp/`)
-
-Publishable `@haowan36/llm-wiki-mcp` — standalone read-only MCP server with Streamable HTTP transport. Shares source from `src/mcp/` at build time.
+- Embedded MCP and upload services live in `mcp_server.rs` and `file_receiver_server.rs`.
 
 ### Browser Extension (`extension/`)
 
