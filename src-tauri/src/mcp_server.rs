@@ -2116,7 +2116,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock should be after unix epoch")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("llm-wiki-mcp-{}-{}", name, unique));
+            let path =
+                std::env::temp_dir().join(format!("llm-wiki-embedded-mcp-{}-{}", name, unique));
 
             fs::create_dir_all(path.join("wiki/entities"))
                 .expect("test wiki dir should be created");
