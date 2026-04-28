@@ -12,7 +12,16 @@ interface ProviderConfig {
   parseStream: (line: string) => string | null
 }
 
+export interface ProviderTestRequest {
+  url: string
+  headers: Record<string, string>
+  body: unknown
+}
+
 const JSON_CONTENT_TYPE = "application/json"
+const TEST_MESSAGES: ChatMessage[] = [
+  { role: "user", content: "Reply with ok." },
+]
 
 function parseOpenAiLine(line: string): string | null {
   if (!line.startsWith("data: ")) return null
@@ -63,11 +72,15 @@ function parseGoogleLine(line: string): string | null {
   }
 }
 
-function buildOpenAiBody(messages: ChatMessage[]): unknown {
-  return { messages, stream: true }
+function buildOpenAiBody(messages: ChatMessage[], stream = true): unknown {
+  return { messages, stream }
 }
 
-function buildAnthropicBody(messages: ChatMessage[]): unknown {
+function buildAnthropicBody(
+  messages: ChatMessage[],
+  stream = true,
+  maxTokens = 4096,
+): unknown {
   const systemMessages = messages.filter((m) => m.role === "system")
   const conversationMessages = messages.filter((m) => m.role !== "system")
   const system = systemMessages.map((m) => m.content).join("\n") || undefined
@@ -75,8 +88,8 @@ function buildAnthropicBody(messages: ChatMessage[]): unknown {
   return {
     messages: conversationMessages,
     ...(system !== undefined ? { system } : {}),
-    stream: true,
-    max_tokens: 4096,
+    stream,
+    max_tokens: maxTokens,
   }
 }
 
@@ -187,6 +200,101 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
           model,
         }),
         parseStream: parseOpenAiLine,
+      }
+
+    default: {
+      const exhaustive: never = provider
+      throw new Error(`Unknown provider: ${String(exhaustive)}`)
+    }
+  }
+}
+
+export function getProviderTestRequest(config: LlmConfig): ProviderTestRequest {
+  const { provider, apiKey, model, ollamaUrl, customEndpoint } = config
+
+  switch (provider) {
+    case "openai":
+      return {
+        url: "https://api.openai.com/v1/chat/completions",
+        headers: {
+          "Content-Type": JSON_CONTENT_TYPE,
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: {
+          ...(buildOpenAiBody(TEST_MESSAGES, false) as object),
+          model,
+          max_tokens: 1,
+        },
+      }
+
+    case "anthropic":
+      return {
+        url: "https://api.anthropic.com/v1/messages",
+        headers: {
+          "Content-Type": JSON_CONTENT_TYPE,
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: {
+          ...(buildAnthropicBody(TEST_MESSAGES, false, 1) as object),
+          model,
+        },
+      }
+
+    case "google":
+      return {
+        url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        headers: {
+          "Content-Type": JSON_CONTENT_TYPE,
+          "x-goog-api-key": apiKey,
+        },
+        body: {
+          ...(buildGoogleBody(TEST_MESSAGES) as object),
+          generationConfig: { maxOutputTokens: 1 },
+        },
+      }
+
+    case "ollama":
+      return {
+        url: `${ollamaUrl}/v1/chat/completions`,
+        headers: {
+          "Content-Type": JSON_CONTENT_TYPE,
+        },
+        body: {
+          ...(buildOpenAiBody(TEST_MESSAGES, false) as object),
+          model,
+          max_tokens: 1,
+        },
+      }
+
+    case "minimax":
+      return {
+        url: "https://api.minimax.io/v1/chat/completions",
+        headers: {
+          "Content-Type": JSON_CONTENT_TYPE,
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: {
+          ...(buildOpenAiBody(TEST_MESSAGES, false) as object),
+          model,
+          max_tokens: 1,
+          temperature: 1.0,
+        },
+      }
+
+    case "custom":
+      return {
+        url: `${customEndpoint}/chat/completions`,
+        headers: {
+          "Content-Type": JSON_CONTENT_TYPE,
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: {
+          ...(buildOpenAiBody(TEST_MESSAGES, false) as object),
+          model,
+          max_tokens: 1,
+        },
       }
 
     default: {

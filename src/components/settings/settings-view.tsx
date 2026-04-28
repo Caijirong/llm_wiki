@@ -13,6 +13,13 @@ import { useState, useEffect, useRef } from "react"
 import { useTranslation } from "react-i18next"
 import i18n from "@/i18n"
 import { saveLanguage } from "@/lib/project-store"
+import {
+  testEmbeddingConnection,
+  testLlmConnection,
+  testSearchConnection,
+  type ConnectionTestResult,
+} from "@/lib/connection-tests"
+import { AlertCircle, CheckCircle2, Loader2, RefreshCw } from "lucide-react"
 
 const PROVIDERS = [
   { value: "openai" as const, label: "OpenAI", models: ["gpt-4o", "gpt-4.1", "gpt-4o-mini"] },
@@ -29,6 +36,16 @@ const LANGUAGES = [
 ]
 
 const HISTORY_OPTIONS = [2, 4, 6, 8, 10, 20]
+
+type ConnectionTestState = {
+  status: "idle" | "testing" | "success" | "error"
+  message: string
+}
+
+const IDLE_CONNECTION_TEST_STATE: ConnectionTestState = {
+  status: "idle",
+  message: "",
+}
 
 export function SettingsView() {
   const { t } = useTranslation()
@@ -74,6 +91,9 @@ export function SettingsView() {
   const [fileReceiverRuntime, setFileReceiverRuntime] = useState<FileReceiverRuntimeState | null>(null)
   const [saved, setSaved] = useState(false)
   const [currentLang, setCurrentLang] = useState(i18n.language)
+  const [llmConnectionStatus, setLlmConnectionStatus] = useState<ConnectionTestState>(IDLE_CONNECTION_TEST_STATE)
+  const [searchConnectionStatus, setSearchConnectionStatus] = useState<ConnectionTestState>(IDLE_CONNECTION_TEST_STATE)
+  const [embeddingConnectionStatus, setEmbeddingConnectionStatus] = useState<ConnectionTestState>(IDLE_CONNECTION_TEST_STATE)
   const hasTouchedMcpSettings = useRef(false)
   const hasTouchedFileReceiverSettings = useRef(false)
 
@@ -89,6 +109,18 @@ export function SettingsView() {
     setSearchProvider(searchApiConfig.provider)
     setSearchApiKey(searchApiConfig.apiKey)
   }, [searchApiConfig])
+
+  useEffect(() => {
+    setLlmConnectionStatus(IDLE_CONNECTION_TEST_STATE)
+  }, [provider, apiKey, model, ollamaUrl, customEndpoint])
+
+  useEffect(() => {
+    setSearchConnectionStatus(IDLE_CONNECTION_TEST_STATE)
+  }, [searchProvider, searchApiKey])
+
+  useEffect(() => {
+    setEmbeddingConnectionStatus(IDLE_CONNECTION_TEST_STATE)
+  }, [embeddingEnabled, embeddingEndpoint, embeddingApiKey, embeddingModel])
 
   useEffect(() => {
     setFileReceiverEnabled(fileReceiverConfig.enabled)
@@ -256,6 +288,51 @@ export function SettingsView() {
     await saveLanguage(lang)
   }
 
+  async function runConnectionTest(
+    setStatus: (state: ConnectionTestState) => void,
+    test: () => Promise<ConnectionTestResult>,
+  ) {
+    setStatus({ status: "testing", message: t("settings.testingConnection") })
+    try {
+      const result = await test()
+      setStatus({
+        status: "success",
+        message: t("settings.connectionSuccess", { target: result.label }),
+      })
+    } catch (err) {
+      setStatus({
+        status: "error",
+        message: t("settings.connectionFailed", { error: getErrorMessage(err) }),
+      })
+    }
+  }
+
+  async function handleTestLlmConnection() {
+    await runConnectionTest(
+      setLlmConnectionStatus,
+      () => testLlmConnection({ provider, apiKey, model, ollamaUrl, customEndpoint, maxContextSize })
+    )
+  }
+
+  async function handleTestSearchConnection() {
+    await runConnectionTest(
+      setSearchConnectionStatus,
+      () => testSearchConnection({ provider: searchProvider, apiKey: searchApiKey })
+    )
+  }
+
+  async function handleTestEmbeddingConnection() {
+    await runConnectionTest(
+      setEmbeddingConnectionStatus,
+      () => testEmbeddingConnection({
+        enabled: embeddingEnabled,
+        endpoint: embeddingEndpoint,
+        apiKey: embeddingApiKey,
+        model: embeddingModel,
+      })
+    )
+  }
+
   return (
     <div className="h-full overflow-auto p-8">
       <div className="mx-auto max-w-xl">
@@ -387,6 +464,16 @@ export function SettingsView() {
                 />
               )}
             </div>
+
+            <div className="space-y-2">
+              <ConnectionTestButton
+                label={t("settings.testLlmConnection")}
+                loadingLabel={t("settings.testingConnection")}
+                state={llmConnectionStatus}
+                onClick={handleTestLlmConnection}
+              />
+              <ConnectionStatusMessage state={llmConnectionStatus} />
+            </div>
           </div>
 
           {/* Context Window Size */}
@@ -431,16 +518,28 @@ export function SettingsView() {
             </div>
 
             {searchProvider !== "none" && (
-              <div className="space-y-2">
-                <Label htmlFor="searchApiKey">API Key</Label>
-                <Input
-                  id="searchApiKey"
-                  type="password"
-                  value={searchApiKey}
-                  onChange={(e) => setSearchApiKey(e.target.value)}
-                  placeholder="Enter your Tavily API key (tavily.com)"
-                />
-              </div>
+              <>
+                <div className="space-y-2">
+                  <Label htmlFor="searchApiKey">API Key</Label>
+                  <Input
+                    id="searchApiKey"
+                    type="password"
+                    value={searchApiKey}
+                    onChange={(e) => setSearchApiKey(e.target.value)}
+                    placeholder="Enter your Tavily API key (tavily.com)"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <ConnectionTestButton
+                    label={t("settings.testSearchConnection")}
+                    loadingLabel={t("settings.testingConnection")}
+                    state={searchConnectionStatus}
+                    onClick={handleTestSearchConnection}
+                  />
+                  <ConnectionStatusMessage state={searchConnectionStatus} />
+                </div>
+              </>
             )}
           </div>
 
@@ -467,16 +566,18 @@ export function SettingsView() {
             {embeddingEnabled && (
               <div className="space-y-3">
                 <div className="space-y-2">
-                  <Label>Endpoint</Label>
+                  <Label htmlFor="embeddingEndpoint">Endpoint</Label>
                   <Input
+                    id="embeddingEndpoint"
                     value={embeddingEndpoint}
                     onChange={(e) => setEmbeddingEndpoint(e.target.value)}
                     placeholder="e.g. http://127.0.0.1:1234/v1/embeddings"
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>API Key (optional)</Label>
+                  <Label htmlFor="embeddingApiKey">API Key (optional)</Label>
                   <Input
+                    id="embeddingApiKey"
                     type="password"
                     value={embeddingApiKey}
                     onChange={(e) => setEmbeddingApiKey(e.target.value)}
@@ -484,8 +585,9 @@ export function SettingsView() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Model</Label>
+                  <Label htmlFor="embeddingModel">Model</Label>
                   <Input
+                    id="embeddingModel"
                     value={embeddingModel}
                     onChange={(e) => setEmbeddingModel(e.target.value)}
                     placeholder="e.g. text-embedding-qwen3-embedding-0.6b"
@@ -494,6 +596,15 @@ export function SettingsView() {
                 <p className="text-xs text-muted-foreground">
                   Embedding service can be different from the chat LLM. Supports any OpenAI-compatible /v1/embeddings endpoint.
                 </p>
+                <div className="space-y-2">
+                  <ConnectionTestButton
+                    label={t("settings.testEmbeddingConnection")}
+                    loadingLabel={t("settings.testingConnection")}
+                    state={embeddingConnectionStatus}
+                    onClick={handleTestEmbeddingConnection}
+                  />
+                  <ConnectionStatusMessage state={embeddingConnectionStatus} />
+                </div>
               </div>
             )}
           </div>
@@ -744,6 +855,66 @@ export function SettingsView() {
       </div>
     </div>
   )
+}
+
+function ConnectionTestButton({
+  label,
+  loadingLabel,
+  state,
+  onClick,
+}: {
+  label: string
+  loadingLabel: string
+  state: ConnectionTestState
+  onClick: () => void
+}) {
+  const testing = state.status === "testing"
+
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      onClick={onClick}
+      disabled={testing}
+    >
+      {testing ? (
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      ) : (
+        <RefreshCw className="h-3.5 w-3.5" />
+      )}
+      {testing ? loadingLabel : label}
+    </Button>
+  )
+}
+
+function ConnectionStatusMessage({ state }: { state: ConnectionTestState }) {
+  if (state.status === "idle") return null
+
+  const Icon =
+    state.status === "testing"
+      ? Loader2
+      : state.status === "success"
+        ? CheckCircle2
+        : AlertCircle
+  const colorClass =
+    state.status === "testing"
+      ? "text-muted-foreground"
+      : state.status === "success"
+        ? "text-emerald-600"
+        : "text-destructive"
+  const role = state.status === "error" ? "alert" : "status"
+
+  return (
+    <p role={role} className={`flex items-start gap-1.5 text-xs ${colorClass}`}>
+      <Icon className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${state.status === "testing" ? "animate-spin" : ""}`} />
+      <span>{state.message}</span>
+    </p>
+  )
+}
+
+function getErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
 }
 
 // Context size presets matching common model context windows

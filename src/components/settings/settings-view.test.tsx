@@ -42,9 +42,21 @@ const { mcpStatus, fileReceiverStatus } = vi.hoisted(() => ({
   })),
 }))
 
+const { testLlmConnection, testSearchConnection, testEmbeddingConnection } = vi.hoisted(() => ({
+  testLlmConnection: vi.fn(async () => ({ label: "OpenAI (gpt-4o-mini)" })),
+  testSearchConnection: vi.fn(async () => ({ label: "Tavily" })),
+  testEmbeddingConnection: vi.fn(async () => ({ label: "text-embedding-test (3 dimensions)" })),
+}))
+
 vi.mock("@/commands/fs", () => ({
   mcpStatus,
   fileReceiverStatus,
+}))
+
+vi.mock("@/lib/connection-tests", () => ({
+  testLlmConnection,
+  testSearchConnection,
+  testEmbeddingConnection,
 }))
 
 vi.mock("@/lib/project-store", () => ({
@@ -81,6 +93,24 @@ describe("SettingsView MCP settings", () => {
         maxFileSizeBytes: 1024 * 1024 * 1024,
         uploadTtlHours: 168,
       },
+      llmConfig: {
+        provider: "openai",
+        apiKey: "",
+        model: "",
+        ollamaUrl: "http://localhost:11434",
+        customEndpoint: "",
+        maxContextSize: 204800,
+      },
+      searchApiConfig: {
+        provider: "none",
+        apiKey: "",
+      },
+      embeddingConfig: {
+        enabled: false,
+        endpoint: "",
+        apiKey: "",
+        model: "",
+      },
     })
     saveMcpConfig.mockClear()
     loadMcpConfig.mockReset()
@@ -88,6 +118,9 @@ describe("SettingsView MCP settings", () => {
     loadFileReceiverConfig.mockReset()
     mcpStatus.mockClear()
     fileReceiverStatus.mockClear()
+    testLlmConnection.mockClear()
+    testSearchConnection.mockClear()
+    testEmbeddingConnection.mockClear()
     loadMcpConfig.mockResolvedValue({
       enabled: true,
       autoStart: true,
@@ -257,5 +290,65 @@ describe("SettingsView MCP settings", () => {
       host: "0.0.0.0",
       port: 19191,
     })
+  })
+
+  it("tests configured LLM, search, and embedding connections from the current form values", async () => {
+    useWikiStore.setState({
+      llmConfig: {
+        provider: "openai",
+        apiKey: "",
+        model: "",
+        ollamaUrl: "http://localhost:11434",
+        customEndpoint: "",
+        maxContextSize: 204800,
+      },
+      searchApiConfig: {
+        provider: "tavily",
+        apiKey: "",
+      },
+      embeddingConfig: {
+        enabled: true,
+        endpoint: "",
+        apiKey: "",
+        model: "",
+      },
+    })
+
+    const user = userEvent.setup()
+    render(<SettingsView />)
+
+    await user.type(screen.getByPlaceholderText(/Enter your OpenAI API key/i), "sk-test")
+    await user.type(screen.getByPlaceholderText(/or type a custom model name/i), "gpt-4o-mini")
+    await user.type(screen.getByPlaceholderText(/Enter your Tavily API key/i), "tvly-test")
+    await user.type(screen.getByPlaceholderText(/127\.0\.0\.1:1234/i), "http://127.0.0.1:1234/v1/embeddings")
+    await user.type(screen.getByPlaceholderText(/Leave empty for local models/i), "embed-test")
+    await user.type(screen.getByPlaceholderText(/text-embedding-qwen3/i), "text-embedding-test")
+
+    await user.click(screen.getByRole("button", { name: /test llm connection/i }))
+    await user.click(screen.getByRole("button", { name: /test search connection/i }))
+    await user.click(screen.getByRole("button", { name: /test embedding connection/i }))
+
+    await waitFor(() =>
+      expect(testLlmConnection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: "openai",
+          apiKey: "sk-test",
+          model: "gpt-4o-mini",
+        })
+      )
+    )
+    expect(testSearchConnection).toHaveBeenCalledWith({
+      provider: "tavily",
+      apiKey: "tvly-test",
+    })
+    expect(testEmbeddingConnection).toHaveBeenCalledWith({
+      enabled: true,
+      endpoint: "http://127.0.0.1:1234/v1/embeddings",
+      apiKey: "embed-test",
+      model: "text-embedding-test",
+    })
+    expect(screen.getByText(/Connected: OpenAI \(gpt-4o-mini\)/i)).toBeInTheDocument()
+    expect(screen.getByText(/Connected: Tavily/i)).toBeInTheDocument()
+    expect(screen.getByText(/Connected: text-embedding-test \(3 dimensions\)/i)).toBeInTheDocument()
   })
 })
