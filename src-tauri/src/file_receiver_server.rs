@@ -136,7 +136,6 @@ pub struct PublicUploadRecord {
     pub status: UploadStatus,
     pub received_bytes: u64,
     pub total_size: Option<u64>,
-    pub stored_source_path: Option<String>,
     pub task_id: Option<String>,
     pub error: Option<String>,
     pub started_at: u64,
@@ -156,7 +155,6 @@ pub struct UploadResponse {
     pub upload_id: String,
     pub status: String,
     pub project_id: String,
-    pub stored_source_path: String,
     pub task_id: String,
     pub received_bytes: u64,
 }
@@ -696,21 +694,6 @@ fn resolve_public_project_scope(
     Ok((known_projects.to_vec(), false))
 }
 
-fn resolve_requested_project_paths(
-    requested_project_path: Option<&str>,
-    known_projects: &[String],
-) -> Result<(Vec<String>, bool), String> {
-    if let Some(project_path) = requested_project_path.and_then(non_empty_trimmed) {
-        let normalized = normalize_project_path(project_path)?;
-        if !known_projects.iter().any(|known| known == &normalized) {
-            return Err(format!("Unknown projectPath '{}'", normalized));
-        }
-        return Ok((vec![normalized], true));
-    }
-
-    Ok((known_projects.to_vec(), false))
-}
-
 fn to_public_upload_record(record: UploadRecord) -> PublicUploadRecord {
     PublicUploadRecord {
         upload_id: record.upload_id,
@@ -721,7 +704,6 @@ fn to_public_upload_record(record: UploadRecord) -> PublicUploadRecord {
         status: record.status,
         received_bytes: record.received_bytes,
         total_size: record.total_size,
-        stored_source_path: record.stored_source_path,
         task_id: record.task_id,
         error: sanitize_public_error(record.error, &record.project_path),
         started_at: record.started_at,
@@ -1303,7 +1285,7 @@ async fn post_upload(
         now_millis(),
         UPLOAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let commit_result: Result<String, String> = 'commit: {
+    let commit_result: Result<(), String> = 'commit: {
         let _guard = current_project_lock.lock().await;
         let mut queue = match read_ingest_queue_values(&normalized_project_path) {
             Ok(queue) => queue,
@@ -1374,11 +1356,11 @@ async fn post_upload(
         }
 
         record = completed;
-        Ok(stored_relative_path)
+        Ok(())
     };
 
-    let stored_relative_path = match commit_result {
-        Ok(path) => path,
+    match commit_result {
+        Ok(()) => {}
         Err(err) => {
             mark_upload_failed(
                 current_project_lock.clone(),
@@ -1390,7 +1372,7 @@ async fn post_upload(
             let _ = cleanup_temp_upload_dir(&normalized_project_path, &record.upload_id);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-    };
+    }
     let _ = cleanup_temp_upload_dir(&normalized_project_path, &record.upload_id);
 
     Ok((
@@ -1399,7 +1381,6 @@ async fn post_upload(
             upload_id: record.upload_id.clone(),
             status: "pending".to_string(),
             project_id: project_public_id(&normalized_project_path),
-            stored_source_path: stored_relative_path,
             task_id,
             received_bytes,
         }),
@@ -1413,11 +1394,9 @@ async fn http_list_uploads(
 ) -> Result<Json<PublicUploadListResponse>, StatusCode> {
     authorize(&headers, &shared_state)?;
     let known_projects = shared_state.known_projects();
-    let (project_paths, scoped_project) = resolve_public_project_scope(
-        query.project_id.as_deref(),
-        &known_projects,
-    )
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (project_paths, scoped_project) =
+        resolve_public_project_scope(query.project_id.as_deref(), &known_projects)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
     let response =
         collect_uploads_for_projects(project_paths, query.status, query.limit, scoped_project)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1602,10 +1581,6 @@ impl FileReceiverRuntimeManager {
     pub(crate) fn router(&self) -> Router {
         build_file_receiver_router(lock_or_recover(&self.inner).server_state.clone())
     }
-
-    fn known_project_paths(&self) -> Vec<String> {
-        lock_or_recover(&self.inner).known_projects.clone()
-    }
 }
 
 #[tauri::command]
@@ -1632,31 +1607,6 @@ pub fn file_receiver_update_known_projects(
 ) -> Result<(), String> {
     manager.update_known_projects(project_paths);
     Ok(())
-}
-
-#[tauri::command]
-pub fn list_uploads(
-    project_path: Option<String>,
-    status: Option<UploadStatus>,
-    limit: Option<usize>,
-    manager: State<'_, FileReceiverRuntimeManager>,
-) -> Result<UploadListResponse, String> {
-    let known_projects = manager.known_project_paths();
-    let (project_paths, scoped_project) =
-        resolve_requested_project_paths(project_path.as_deref(), &known_projects)?;
-    collect_uploads_for_projects(project_paths, status, limit, scoped_project)
-}
-
-#[tauri::command]
-pub fn get_upload(
-    upload_id: String,
-    project_path: Option<String>,
-    manager: State<'_, FileReceiverRuntimeManager>,
-) -> Result<Option<UploadRecord>, String> {
-    let known_projects = manager.known_project_paths();
-    let (project_paths, scoped_project) =
-        resolve_requested_project_paths(project_path.as_deref(), &known_projects)?;
-    find_upload_for_projects(project_paths, &upload_id, scoped_project)
 }
 
 #[cfg(test)]
@@ -1955,8 +1905,8 @@ mod tests {
         let body = response_body_json::<serde_json::Value>(response).await;
         assert_eq!(body["projectId"], project_public_id(&project.path_string()));
         assert_eq!(body["status"], "pending");
-        assert_eq!(body["storedSourcePath"], "raw/sources/report.pdf");
         assert!(body.get("projectPath").is_none());
+        assert!(body.get("storedSourcePath").is_none());
         assert!(Path::new(&project.path_string())
             .join("raw/sources/report.pdf")
             .exists());
@@ -2094,7 +2044,10 @@ mod tests {
                 test_file_receiver_config(),
                 vec![project_a.path_string(), project_b.path_string()],
             ),
-            &format!("/uploads?projectId={}", project_public_id(&project_a.path_string())),
+            &format!(
+                "/uploads?projectId={}",
+                project_public_id(&project_a.path_string())
+            ),
         )
         .await;
 
@@ -2154,8 +2107,12 @@ mod tests {
         .await;
         let list_body = response_body_json::<serde_json::Value>(list_response).await;
         let list_upload = &list_body["uploads"][0];
-        assert_eq!(list_upload["projectId"], project_public_id(&project.path_string()));
+        assert_eq!(
+            list_upload["projectId"],
+            project_public_id(&project.path_string())
+        );
         assert!(list_upload.get("projectPath").is_none());
+        assert!(list_upload.get("storedSourcePath").is_none());
 
         let get_response = get_test_request(
             test_app_with_config(test_file_receiver_config(), vec![project.path_string()]),
@@ -2163,18 +2120,19 @@ mod tests {
         )
         .await;
         let get_body = response_body_json::<serde_json::Value>(get_response).await;
-        assert_eq!(get_body["projectId"], project_public_id(&project.path_string()));
+        assert_eq!(
+            get_body["projectId"],
+            project_public_id(&project.path_string())
+        );
         assert!(get_body.get("projectPath").is_none());
+        assert!(get_body.get("storedSourcePath").is_none());
     }
 
     #[tokio::test]
     async fn http_upload_queries_redact_project_path_from_error_messages() {
         let project = TempWikiProject::new("upload-public-error");
-        let mut record = sample_upload_record(
-            &project.path_string(),
-            "error.pdf",
-            UploadStatus::Failed,
-        );
+        let mut record =
+            sample_upload_record(&project.path_string(), "error.pdf", UploadStatus::Failed);
         record.error = Some(format!(
             "Failed to read '{}': permission denied",
             Path::new(&project.path_string())

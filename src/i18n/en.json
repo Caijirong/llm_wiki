@@ -255,32 +255,6 @@
       }
     }
   },
-  "transfers": {
-    "title": "Transfers",
-    "description": "Inspect file receiver runtime health, live upload progress, and ingest queue activity.",
-    "project": "Current project",
-    "refresh": "Refresh",
-    "runtime": "Service",
-    "uploading": "Uploading",
-    "recentUploads": "{{count}} recent upload record",
-    "recentUploads_plural": "{{count}} recent upload records",
-    "queuePending": "Queued",
-    "queueHistory": "{{count}} history",
-    "failures": "Failures",
-    "knownProjects": "{{count}} known project",
-    "knownProjects_plural": "{{count}} known projects",
-    "uploadHistory": "Upload history",
-    "uploadHistoryHint": "Recent upload records written by the file receiver service.",
-    "ingestQueue": "Ingest queue",
-    "ingestQueueHint": "Local ingest queue state for the current project.",
-    "queueProcessing": "Processing",
-    "queueFailed": "Failed",
-    "queueDone": "Done",
-    "noUploads": "No upload records for the current project yet.",
-    "noQueueTasks": "No pending ingest tasks right now.",
-    "noProject": "No project open",
-    "loading": "Loading..."
-  },
   "preview": {
     "selectFile": "Select a file to preview",
     "notAvailable": "Preview not available for this file type"

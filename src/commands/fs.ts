@@ -122,29 +122,6 @@ export interface FileReceiverStatus {
   uploadTtlHours: number
 }
 
-export type UploadStatus = "uploading" | "completed" | "failed" | "expired"
-
-export interface UploadRecord {
-  uploadId: string
-  projectPath: string
-  fileName: string
-  mimeType: string | null
-  folderContext: string
-  status: UploadStatus
-  receivedBytes: number
-  totalSize: number | null
-  storedSourcePath: string | null
-  taskId: string | null
-  error: string | null
-  startedAt: number
-  updatedAt: number
-}
-
-export interface UploadListResponse {
-  uploads: UploadRecord[]
-  total: number
-}
-
 export async function mcpStatus(): Promise<McpStatus> {
   return invoke<McpStatus>("mcp_status")
 }
@@ -179,23 +156,4 @@ export async function fileReceiverUpdateConfig(config: FileReceiverConfig): Prom
 
 export async function fileReceiverUpdateKnownProjects(projectPaths: string[]): Promise<void> {
   return invoke("file_receiver_update_known_projects", { projectPaths })
-}
-
-export async function listUploads(params?: {
-  projectPath?: string
-  status?: UploadStatus
-  limit?: number
-}): Promise<UploadListResponse> {
-  return invoke<UploadListResponse>("list_uploads", {
-    projectPath: params?.projectPath ?? null,
-    status: params?.status ?? null,
-    limit: params?.limit ?? null,
-  })
-}
-
-export async function getUpload(uploadId: string, projectPath?: string): Promise<UploadRecord | null> {
-  return invoke<UploadRecord | null>("get_upload", {
-    uploadId,
-    projectPath: projectPath ?? null,
-  })
 }

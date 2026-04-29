@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 import {
-  FileText, FolderOpen, Search, Network, ClipboardCheck, Settings, ArrowLeftRight, ClipboardList, Globe, Upload,
+  FileText, FolderOpen, Search, Network, ClipboardCheck, Settings, ArrowLeftRight, ClipboardList, Globe,
 } from "lucide-react"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -136,19 +136,6 @@ export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
               {daemonStatus === "port_conflict" && "Port 19827 is occupied. Web Clipper unavailable."}
               {daemonStatus === "error" && "Clip server error. Restarting..."}
             </TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger
-              onClick={() => setActiveView("transfers")}
-              className={`flex h-10 w-10 items-center justify-center rounded-md transition-colors ${
-                activeView === "transfers"
-                  ? "bg-accent text-accent-foreground"
-                  : "text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
-              }`}
-            >
-              <Upload className="h-5 w-5" />
-            </TooltipTrigger>
-            <TooltipContent side="right">{t("nav.transfers")}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger

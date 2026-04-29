@@ -255,32 +255,6 @@
       }
     }
   },
-  "transfers": {
-    "title": "传输",
-    "description": "查看文件接收服务运行状态、实时上传进度和 ingest 队列活动。",
-    "project": "当前项目",
-    "refresh": "刷新",
-    "runtime": "服务",
-    "uploading": "上传中",
-    "recentUploads": "{{count}} 条最近上传记录",
-    "recentUploads_plural": "{{count}} 条最近上传记录",
-    "queuePending": "排队中",
-    "queueHistory": "{{count}} 条历史",
-    "failures": "失败",
-    "knownProjects": "{{count}} 个已知项目",
-    "knownProjects_plural": "{{count}} 个已知项目",
-    "uploadHistory": "上传历史",
-    "uploadHistoryHint": "文件接收服务写入的最近上传记录。",
-    "ingestQueue": "Ingest 队列",
-    "ingestQueueHint": "当前项目的本地 ingest 队列状态。",
-    "queueProcessing": "处理中",
-    "queueFailed": "失败",
-    "queueDone": "完成",
-    "noUploads": "当前项目还没有上传记录。",
-    "noQueueTasks": "当前没有等待处理的 ingest 任务。",
-    "noProject": "未打开项目",
-    "loading": "加载中..."
-  },
   "preview": {
     "selectFile": "选择文件以预览",
     "notAvailable": "该文件类型暂不支持预览"
