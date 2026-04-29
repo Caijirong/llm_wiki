@@ -13,6 +13,7 @@ import { useState, useEffect, useRef } from "react"
 import { useTranslation } from "react-i18next"
 import i18n from "@/i18n"
 import { saveLanguage } from "@/lib/project-store"
+import { normalizeFileReceiverConfigForMcp } from "@/lib/runtime-service-config"
 import {
   testEmbeddingConnection,
   testLlmConnection,
@@ -79,8 +80,6 @@ export function SettingsView() {
   const [mcpHost, setMcpHost] = useState(mcpConfig.host)
   const [mcpPort, setMcpPort] = useState(String(mcpConfig.port))
   const [mcpRuntime, setMcpRuntime] = useState<McpRuntimeStatus | null>(null)
-  const [fileReceiverEnabled, setFileReceiverEnabled] = useState(fileReceiverConfig.enabled)
-  const [fileReceiverAutoStart, setFileReceiverAutoStart] = useState(fileReceiverConfig.autoStart)
   const [fileReceiverToken, setFileReceiverToken] = useState(fileReceiverConfig.staticToken)
   const [fileReceiverMaxFileSizeMb, setFileReceiverMaxFileSizeMb] = useState(
     String(Math.max(1, Math.round(fileReceiverConfig.maxFileSizeBytes / (1024 * 1024))))
@@ -123,8 +122,6 @@ export function SettingsView() {
   }, [embeddingEnabled, embeddingEndpoint, embeddingApiKey, embeddingModel])
 
   useEffect(() => {
-    setFileReceiverEnabled(fileReceiverConfig.enabled)
-    setFileReceiverAutoStart(fileReceiverConfig.autoStart)
     setFileReceiverToken(fileReceiverConfig.staticToken)
     setFileReceiverMaxFileSizeMb(
       String(Math.max(1, Math.round(fileReceiverConfig.maxFileSizeBytes / (1024 * 1024))))
@@ -147,9 +144,7 @@ export function SettingsView() {
         setMcpPort(String(persistedMcp.port))
       }
       if (mounted && persistedFileReceiver && !hasTouchedFileReceiverSettings.current) {
-        setFileReceiverEnabled(persistedFileReceiver.enabled)
-        setFileReceiverAutoStart(persistedFileReceiver.autoStart)
-        setFileReceiverToken(persistedFileReceiver.staticToken)
+        setFileReceiverToken(persistedFileReceiver.staticToken.trim())
         setFileReceiverMaxFileSizeMb(
           String(Math.max(1, Math.round(persistedFileReceiver.maxFileSizeBytes / (1024 * 1024))))
         )
@@ -236,7 +231,7 @@ export function SettingsView() {
   const mcpRuntimeLabel = mcpRuntime
     ? formatRuntimeStatus(mcpRuntime.status)
     : t("settings.mcpStatusPlaceholder")
-  const sharedListenerSettingsVisible = mcpEnabled || fileReceiverEnabled
+  const sharedListenerSettingsVisible = mcpEnabled
   const sharedExternalHost = mcpHost.trim() || "127.0.0.1"
   const sharedExternalPort = parseMcpPort(mcpPort)
   const mcpEndpointPreview = `http://${sharedExternalHost}:${sharedExternalPort}/mcp`
@@ -259,13 +254,13 @@ export function SettingsView() {
     const newSearchConfig = { provider: searchProvider, apiKey: searchApiKey }
     const newEmbeddingConfig = { enabled: embeddingEnabled, endpoint: embeddingEndpoint, apiKey: embeddingApiKey, model: embeddingModel }
     const newMcpConfig = { enabled: mcpEnabled, autoStart: mcpAutoStart, host: normalizedMcpHost, port: normalizedMcpPort }
-    const newFileReceiverConfig = {
-      enabled: fileReceiverEnabled,
-      autoStart: fileReceiverAutoStart,
+    const newFileReceiverConfig = normalizeFileReceiverConfigForMcp(newMcpConfig, {
+      enabled: mcpEnabled,
+      autoStart: mcpAutoStart,
       staticToken: fileReceiverToken.trim(),
       maxFileSizeBytes: parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb),
       uploadTtlHours: parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours),
-    }
+    })
     setSearchApiConfig(newSearchConfig)
     await saveSearchApiConfig(newSearchConfig)
     setEmbeddingConfig(newEmbeddingConfig)
@@ -273,6 +268,7 @@ export function SettingsView() {
     setMcpConfig(newMcpConfig)
     await saveMcpConfig(newMcpConfig)
     setFileReceiverConfig(newFileReceiverConfig)
+    setFileReceiverToken(newFileReceiverConfig.staticToken)
     await saveFileReceiverConfig(newFileReceiverConfig)
     setLlmConfig(newConfig)
     await saveLlmConfig(newConfig)
@@ -701,119 +697,79 @@ export function SettingsView() {
                     <p className="text-red-600">{mcpRuntime.lastError}</p>
                   )}
                 </div>
-              </>
-            )}
-          </div>
 
-          {/* File receiver section */}
-          <div className="space-y-4 rounded-lg border p-4">
-            <div className="flex items-center justify-between">
-              <h3 className="font-semibold">{t("settings.fileReceiver")}</h3>
-              <button
-                id="fileReceiverEnabled"
-                type="button"
-                role="switch"
-                aria-checked={fileReceiverEnabled}
-                aria-label={t("settings.enableFileReceiver")}
-                onClick={() => {
-                  hasTouchedFileReceiverSettings.current = true
-                  setFileReceiverEnabled(!fileReceiverEnabled)
-                }}
-                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-                  fileReceiverEnabled ? "bg-primary" : "bg-muted"
-                }`}
-              >
-                <span
-                  className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
-                    fileReceiverEnabled ? "translate-x-4.5" : "translate-x-0.5"
-                  }`}
-                />
-              </button>
-            </div>
-            <p className="text-xs text-muted-foreground">{t("settings.fileReceiverDescription")}</p>
-
-            {fileReceiverEnabled && (
-              <>
-                <div className="flex items-center gap-2">
-                  <input
-                    id="fileReceiverAutoStart"
-                    type="checkbox"
-                    checked={fileReceiverAutoStart}
-                    onChange={(e) => {
-                      hasTouchedFileReceiverSettings.current = true
-                      setFileReceiverAutoStart(e.target.checked)
-                    }}
-                  />
-                  <Label htmlFor="fileReceiverAutoStart">{t("settings.autoStartFileReceiver")}</Label>
-                </div>
-
-                <p className="text-xs text-muted-foreground">{t("settings.fileReceiverSharedEndpointHint")}</p>
-
-                <div className="space-y-2">
-                  <Label htmlFor="fileReceiverToken">{t("settings.fileReceiverToken")}</Label>
-                  <Input
-                    id="fileReceiverToken"
-                    type="password"
-                    value={fileReceiverToken}
-                    onChange={(e) => {
-                      hasTouchedFileReceiverSettings.current = true
-                      setFileReceiverToken(e.target.value)
-                    }}
-                    placeholder={t("settings.fileReceiverTokenPlaceholder")}
-                  />
-                </div>
-
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="space-y-2">
-                    <Label htmlFor="fileReceiverMaxFileSizeMb">{t("settings.fileReceiverMaxSizeMb")}</Label>
-                    <Input
-                      id="fileReceiverMaxFileSizeMb"
-                      type="number"
-                      min={1}
-                      value={fileReceiverMaxFileSizeMb}
-                      onChange={(e) => {
-                        hasTouchedFileReceiverSettings.current = true
-                        setFileReceiverMaxFileSizeMb(e.target.value)
-                      }}
-                      placeholder="1024"
-                    />
+                <div className="space-y-4 border-t pt-4">
+                  <div className="space-y-1">
+                    <h4 className="text-sm font-semibold">{t("settings.uploadImport")}</h4>
+                    <p className="text-xs text-muted-foreground">{t("settings.fileReceiverSharedEndpointHint")}</p>
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="fileReceiverUploadTtlHours">{t("settings.fileReceiverUploadTtlHours")}</Label>
+                    <Label htmlFor="fileReceiverToken">{t("settings.fileReceiverToken")}</Label>
                     <Input
-                      id="fileReceiverUploadTtlHours"
-                      type="number"
-                      min={1}
-                      value={fileReceiverUploadTtlHours}
+                      id="fileReceiverToken"
+                      type="password"
+                      value={fileReceiverToken}
                       onChange={(e) => {
                         hasTouchedFileReceiverSettings.current = true
-                        setFileReceiverUploadTtlHours(e.target.value)
+                        setFileReceiverToken(e.target.value)
                       }}
-                      placeholder="168"
+                      placeholder={t("settings.fileReceiverTokenPlaceholder")}
                     />
                   </div>
-                </div>
 
-                <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
-                  <p>
-                    {t("settings.fileReceiverRuntimeStatus")}: {fileReceiverRuntimeLabel}
-                  </p>
-                  <p>
-                    {t("settings.fileReceiverEndpointPreview")}: {fileReceiverEndpointPreview}
-                  </p>
-                  <p>
-                    {t("settings.fileReceiverKnownProjects")}: {fileReceiverRuntime?.knownProjects.length ?? 0}
-                  </p>
-                  <p>
-                    {t("settings.fileReceiverMaxSizeCurrent")}: {formatFileSize(fileReceiverRuntime?.maxFileSizeBytes ?? parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb))}
-                  </p>
-                  <p>
-                    {t("settings.fileReceiverTtlCurrent")}: {fileReceiverRuntime?.uploadTtlHours ?? parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours)}h
-                  </p>
-                  {fileReceiverRuntime?.lastError && (
-                    <p className="text-red-600">{fileReceiverRuntime.lastError}</p>
-                  )}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="fileReceiverMaxFileSizeMb">{t("settings.fileReceiverMaxSizeMb")}</Label>
+                      <Input
+                        id="fileReceiverMaxFileSizeMb"
+                        type="number"
+                        min={1}
+                        value={fileReceiverMaxFileSizeMb}
+                        onChange={(e) => {
+                          hasTouchedFileReceiverSettings.current = true
+                          setFileReceiverMaxFileSizeMb(e.target.value)
+                        }}
+                        placeholder="1024"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label htmlFor="fileReceiverUploadTtlHours">{t("settings.fileReceiverUploadTtlHours")}</Label>
+                      <Input
+                        id="fileReceiverUploadTtlHours"
+                        type="number"
+                        min={1}
+                        value={fileReceiverUploadTtlHours}
+                        onChange={(e) => {
+                          hasTouchedFileReceiverSettings.current = true
+                          setFileReceiverUploadTtlHours(e.target.value)
+                        }}
+                        placeholder="168"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
+                    <p>
+                      {t("settings.fileReceiverRuntimeStatus")}: {fileReceiverRuntimeLabel}
+                    </p>
+                    <p>
+                      {t("settings.fileReceiverEndpointPreview")}: {fileReceiverEndpointPreview}
+                    </p>
+                    <p>
+                      {t("settings.fileReceiverKnownProjects")}: {fileReceiverRuntime?.knownProjects.length ?? 0}
+                    </p>
+                    <p>
+                      {t("settings.fileReceiverMaxSizeCurrent")}: {formatFileSize(fileReceiverRuntime?.maxFileSizeBytes ?? parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb))}
+                    </p>
+                    <p>
+                      {t("settings.fileReceiverTtlCurrent")}: {fileReceiverRuntime?.uploadTtlHours ?? parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours)}h
+                    </p>
+                    {fileReceiverRuntime?.lastError && (
+                      <p className="text-red-600">{fileReceiverRuntime.lastError}</p>
+                    )}
+                  </div>
                 </div>
               </>
             )}

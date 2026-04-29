@@ -985,10 +985,11 @@ fn authorize(
     shared_state: &FileReceiverSharedState,
 ) -> Result<(), StatusCode> {
     let config = shared_state.config();
-    if !config.enabled || !config.auto_start {
+    let expected_token = config.static_token.trim();
+    if !config.enabled || expected_token.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let expected_bearer = format!("Bearer {}", config.static_token);
+    let expected_bearer = format!("Bearer {}", expected_token);
     let provided_bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -999,7 +1000,7 @@ fn authorize(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
 
-    if provided_bearer == expected_bearer || provided_custom == config.static_token {
+    if provided_bearer == expected_bearer || provided_custom == expected_token {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -1413,11 +1414,9 @@ async fn http_list_uploads(
 ) -> Result<Json<PublicUploadListResponse>, StatusCode> {
     authorize(&headers, &shared_state)?;
     let known_projects = shared_state.known_projects();
-    let (project_paths, scoped_project) = resolve_public_project_scope(
-        query.project_id.as_deref(),
-        &known_projects,
-    )
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (project_paths, scoped_project) =
+        resolve_public_project_scope(query.project_id.as_deref(), &known_projects)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
     let response =
         collect_uploads_for_projects(project_paths, query.status, query.limit, scoped_project)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1517,7 +1516,7 @@ impl FileReceiverRuntimeCore {
         self.server_state
             .set_known_projects(self.known_projects.clone());
 
-        if !self.config.enabled || !self.config.auto_start {
+        if !self.config.enabled {
             self.status = FileReceiverStatus::Stopped;
             self.last_error = None;
             return;
@@ -1969,6 +1968,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_authorization_does_not_depend_on_legacy_auto_start() {
+        let project = TempWikiProject::new("upload-legacy-auto-start");
+        let mut config = test_file_receiver_config();
+        config.auto_start = false;
+
+        let response = post_test_upload(
+            test_app_with_config(config, vec![project.path_string()]),
+            valid_upload_body(&project.path_string(), "manual.pdf", b"hello"),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn accepts_custom_upload_token_header() {
         let project = TempWikiProject::new("upload-custom-header");
         let response = post_test_upload_with_headers(
@@ -2094,7 +2108,10 @@ mod tests {
                 test_file_receiver_config(),
                 vec![project_a.path_string(), project_b.path_string()],
             ),
-            &format!("/uploads?projectId={}", project_public_id(&project_a.path_string())),
+            &format!(
+                "/uploads?projectId={}",
+                project_public_id(&project_a.path_string())
+            ),
         )
         .await;
 
@@ -2154,7 +2171,10 @@ mod tests {
         .await;
         let list_body = response_body_json::<serde_json::Value>(list_response).await;
         let list_upload = &list_body["uploads"][0];
-        assert_eq!(list_upload["projectId"], project_public_id(&project.path_string()));
+        assert_eq!(
+            list_upload["projectId"],
+            project_public_id(&project.path_string())
+        );
         assert!(list_upload.get("projectPath").is_none());
 
         let get_response = get_test_request(
@@ -2163,18 +2183,18 @@ mod tests {
         )
         .await;
         let get_body = response_body_json::<serde_json::Value>(get_response).await;
-        assert_eq!(get_body["projectId"], project_public_id(&project.path_string()));
+        assert_eq!(
+            get_body["projectId"],
+            project_public_id(&project.path_string())
+        );
         assert!(get_body.get("projectPath").is_none());
     }
 
     #[tokio::test]
     async fn http_upload_queries_redact_project_path_from_error_messages() {
         let project = TempWikiProject::new("upload-public-error");
-        let mut record = sample_upload_record(
-            &project.path_string(),
-            "error.pdf",
-            UploadStatus::Failed,
-        );
+        let mut record =
+            sample_upload_record(&project.path_string(), "error.pdf", UploadStatus::Failed);
         record.error = Some(format!(
             "Failed to read '{}': permission denied",
             Path::new(&project.path_string())

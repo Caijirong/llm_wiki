@@ -7,6 +7,7 @@ const {
   persistedFileReceiverConfig,
   loadMcpConfig,
   loadFileReceiverConfig,
+  saveFileReceiverConfig,
   fileReceiverUpdateConfig,
   fileReceiverUpdateKnownProjects,
   mcpUpdateConfig,
@@ -40,6 +41,7 @@ const {
     maxFileSizeBytes: 1024 * 1024 * 1024,
     uploadTtlHours: 168,
   })),
+  saveFileReceiverConfig: vi.fn(async () => {}),
   fileReceiverUpdateConfig: vi.fn(async () => {}),
   fileReceiverUpdateKnownProjects: vi.fn(async () => {}),
   mcpUpdateConfig: vi.fn(async () => {}),
@@ -77,6 +79,7 @@ vi.mock("@/lib/project-store", () => ({
   loadLanguage: vi.fn(async () => null),
   loadMcpConfig,
   loadFileReceiverConfig,
+  saveFileReceiverConfig,
 }))
 
 vi.mock("@/lib/persist", () => ({
@@ -115,7 +118,11 @@ describe("App runtime startup sync", () => {
       expect(mcpUpdateConfig).toHaveBeenCalledWith(persistedMcpConfig)
     )
     await waitFor(() =>
-      expect(fileReceiverUpdateConfig).toHaveBeenCalledWith(persistedFileReceiverConfig)
+      expect(fileReceiverUpdateConfig).toHaveBeenCalledWith({
+        ...persistedFileReceiverConfig,
+        enabled: persistedMcpConfig.enabled,
+        autoStart: persistedMcpConfig.autoStart,
+      })
     )
     await waitFor(() =>
       expect(mcpUpdateProject).toHaveBeenCalledWith("/tmp/wiki")

@@ -23,7 +23,9 @@ import {
   loadEmbeddingConfig,
   loadFileReceiverConfig,
   loadMcpConfig,
+  saveFileReceiverConfig,
 } from "@/lib/project-store"
+import { normalizeFileReceiverConfigForMcp } from "@/lib/runtime-service-config"
 import { loadReviewItems, loadChatHistory } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
@@ -31,6 +33,7 @@ import { AppLayout } from "@/components/layout/app-layout"
 import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
 import type { WikiProject } from "@/types/wiki"
+import type { FileReceiverConfig } from "@/stores/wiki-store"
 
 function App() {
   const project = useWikiStore((s) => s.project)
@@ -55,8 +58,17 @@ function App() {
 
   async function syncFileReceiverConfigOnInit() {
     const savedConfig = await loadFileReceiverConfig()
-    if (savedConfig) {
-      useWikiStore.getState().setFileReceiverConfig(savedConfig)
+    const normalizedConfig = normalizeFileReceiverConfigForMcp(
+      useWikiStore.getState().mcpConfig,
+      savedConfig
+    )
+    useWikiStore.getState().setFileReceiverConfig(normalizedConfig)
+    if (hasFileReceiverConfigChanged(savedConfig, normalizedConfig)) {
+      try {
+        await saveFileReceiverConfig(normalizedConfig)
+      } catch (err) {
+        console.error("Failed to persist normalized file receiver config:", err)
+      }
     }
     setFileReceiverConfigLoaded(true)
   }
@@ -292,3 +304,18 @@ function App() {
 }
 
 export default App
+
+function hasFileReceiverConfigChanged(
+  savedConfig: FileReceiverConfig | null,
+  normalizedConfig: FileReceiverConfig
+): boolean {
+  if (!savedConfig) return true
+
+  return (
+    savedConfig.enabled !== normalizedConfig.enabled ||
+    savedConfig.autoStart !== normalizedConfig.autoStart ||
+    savedConfig.staticToken !== normalizedConfig.staticToken ||
+    savedConfig.maxFileSizeBytes !== normalizedConfig.maxFileSizeBytes ||
+    savedConfig.uploadTtlHours !== normalizedConfig.uploadTtlHours
+  )
+}

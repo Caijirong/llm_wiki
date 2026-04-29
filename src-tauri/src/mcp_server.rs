@@ -600,12 +600,14 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl McpRuntimeCore {
     fn sync_file_receiver_runtime(&self, file_receiver: &FileReceiverRuntimeManager) {
-        let status = if file_receiver
-            .config()
-            .enabled
-            && file_receiver.config().auto_start
-        {
-            if self.server.is_some() {
+        let upload_config = file_receiver.config();
+        let mcp_listener_running = self
+            .server
+            .as_ref()
+            .map(|server| server.mcp_route_enabled)
+            .unwrap_or(false);
+        let status = if upload_config.enabled {
+            if mcp_listener_running {
                 FileReceiverStatus::Running
             } else {
                 match self.status {
@@ -655,10 +657,9 @@ impl McpRuntimeCore {
         respect_auto_start: bool,
     ) -> Result<(), String> {
         let upload_config = file_receiver.config();
-        let uploads_enabled = upload_config.enabled && (!respect_auto_start || upload_config.auto_start);
         let mcp_requested = self.config.enabled && (!respect_auto_start || self.config.auto_start);
 
-        if !mcp_requested && !uploads_enabled {
+        if !mcp_requested {
             self.stop_server();
             self.status = McpStatus::Stopped;
             self.last_error = None;
@@ -705,7 +706,9 @@ impl McpRuntimeCore {
             self.last_error = None;
         }
 
-        if !mcp_route_enabled && !uploads_enabled {
+        let uploads_enabled = mcp_route_enabled && upload_config.enabled;
+
+        if !mcp_route_enabled {
             self.stop_server();
             self.sync_file_receiver_runtime(&file_receiver);
             return Err(startup_error.unwrap_or_else(|| NO_PROJECT_MESSAGE.to_string()));
@@ -726,11 +729,7 @@ impl McpRuntimeCore {
 
         self.stop_server();
         if uploads_enabled || mcp_route_enabled {
-            self.status = if mcp_route_enabled {
-                McpStatus::Starting
-            } else {
-                self.status.clone()
-            };
+            self.status = McpStatus::Starting;
         }
 
         let bind_address = format!("{}:{}", desired_host, desired_port);
@@ -825,12 +824,9 @@ impl McpRuntimeCore {
                 self.status = McpStatus::Stopped;
                 self.last_error = None;
             }
-            let upload_config = file_receiver.config();
-            if !(upload_config.enabled && upload_config.auto_start) {
-                self.stop_server();
-                self.sync_file_receiver_runtime(&file_receiver);
-                return Ok(());
-            }
+            self.stop_server();
+            self.sync_file_receiver_runtime(&file_receiver);
+            return Ok(());
         }
 
         self.start_server(shared, file_receiver, true)
@@ -858,12 +854,7 @@ impl McpRuntimeCore {
         })?;
 
         self.config = config;
-        let upload_config = file_receiver.config();
-        if self.current_project.is_none()
-            && self.config.enabled
-            && self.config.auto_start
-            && !(upload_config.enabled && upload_config.auto_start)
-        {
+        if self.current_project.is_none() && self.config.enabled && self.config.auto_start {
             self.stop_server();
             self.status = McpStatus::NoProject;
             self.last_error = Some(NO_PROJECT_MESSAGE.to_string());
@@ -2031,10 +2022,7 @@ fn project_public_id(path: &str) -> String {
     let normalized = fs::canonicalize(path)
         .map(|resolved| resolved.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| normalize_project_path(path));
-    format!(
-        "wiki-{:016x}",
-        stable_hash_hex(&normalized)
-    )
+    format!("wiki-{:016x}", stable_hash_hex(&normalized))
 }
 
 fn redact_project_path_text(message: &str, project_path: &str) -> String {
@@ -2368,6 +2356,66 @@ OpenAI builds GPT models and AI systems.
     }
 
     #[test]
+    fn upload_runtime_cannot_start_when_mcp_is_disabled() {
+        let uploads = FileReceiverRuntimeManager::default();
+        uploads
+            .update_config(FileReceiverConfig {
+                enabled: true,
+                auto_start: true,
+                static_token: "secret".to_string(),
+                max_file_size_bytes: 1024 * 1024,
+                upload_ttl_hours: 24,
+            })
+            .expect("upload config should apply");
+        let manager = McpRuntimeManager::with_file_receiver(uploads.clone());
+
+        manager
+            .update_config(McpConfig {
+                enabled: false,
+                auto_start: true,
+                host: "127.0.0.1".to_string(),
+                port: available_port(),
+            })
+            .expect("mcp config update should succeed");
+
+        assert_eq!(manager.snapshot().status, McpStatus::Stopped);
+        assert_eq!(uploads.snapshot().status, FileReceiverStatus::Stopped);
+    }
+
+    #[test]
+    fn manual_mcp_start_marks_upload_runtime_running_even_with_legacy_auto_start_disabled() {
+        let project = TempWikiProject::new("manual-mcp-upload");
+        let uploads = FileReceiverRuntimeManager::default();
+        uploads
+            .update_config(FileReceiverConfig {
+                enabled: true,
+                auto_start: false,
+                static_token: "secret".to_string(),
+                max_file_size_bytes: 1024 * 1024,
+                upload_ttl_hours: 24,
+            })
+            .expect("upload config should apply");
+        let manager = McpRuntimeManager::with_file_receiver(uploads.clone());
+        manager.update_known_projects(vec![project.path_string()]);
+        manager
+            .update_project(Some(project.path_string()))
+            .expect("project should update");
+        manager
+            .update_config(McpConfig {
+                enabled: true,
+                auto_start: false,
+                host: "127.0.0.1".to_string(),
+                port: available_port(),
+            })
+            .expect("mcp config update should succeed");
+
+        manager.start().expect("manual MCP start should succeed");
+
+        assert_eq!(manager.snapshot().status, McpStatus::Running);
+        assert_eq!(uploads.snapshot().status, FileReceiverStatus::Running);
+    }
+
+    #[test]
     fn upload_guide_explains_uploads_as_the_only_import_path() {
         let upload_state = FileReceiverRuntimeState {
             status: FileReceiverStatus::Running,
@@ -2530,9 +2578,7 @@ OpenAI builds GPT models and AI systems.
         assert_eq!(queue_response.recent_tasks.len(), 2);
         assert_eq!(queue_response.queue.len(), 2);
         assert_eq!(queue_response.recommended_poll_interval_seconds, 60);
-        assert!(queue_response
-            .status_hint
-            .contains("check again later"));
+        assert!(queue_response.status_hint.contains("check again later"));
         assert_eq!(queue_response.recent_tasks[0].id, "task-processing-1");
         assert_eq!(queue_response.recent_tasks[1].id, "task-done-1");
         assert_eq!(
@@ -2615,7 +2661,9 @@ OpenAI builds GPT models and AI systems.
             .expect_err("invalid current project should fail");
 
         assert_eq!(err.code, McpToolErrorCode::InvalidInput);
-        assert!(err.message.contains("Current project is not a valid LLM Wiki project."));
+        assert!(err
+            .message
+            .contains("Current project is not a valid LLM Wiki project."));
         assert!(!err.message.contains(path));
     }
 
@@ -2686,15 +2734,15 @@ title: 低空政务一体化
         {
             let mut core = lock_or_recover(&shared);
             core.config = McpConfig {
-                enabled: false,
-                auto_start: false,
+                enabled: true,
+                auto_start: true,
                 host: "127.0.0.1".to_string(),
                 port: 18765,
             };
             core.server = Some(EmbeddedMcpServerHandle {
                 host: "127.0.0.1".to_string(),
                 port: 18765,
-                mcp_route_enabled: false,
+                mcp_route_enabled: true,
                 cancellation_token: CancellationToken::new(),
                 task: tauri::async_runtime::spawn(async {}),
             });
