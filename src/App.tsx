@@ -31,6 +31,7 @@ import {
 } from "@/lib/project-store"
 import { normalizeFileReceiverConfigForMcp } from "@/lib/runtime-service-config"
 import { loadReviewItems, loadChatHistory } from "@/lib/persist"
+import { APP_RELEASE_REPO, APP_RELEASES_URL } from "@/lib/app-release"
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
 import { AppLayout } from "@/components/layout/app-layout"
@@ -152,7 +153,7 @@ function App() {
                 "- Bigger red dot on the Settings icon\n" +
                 "- Top banner with one-click dismiss\n" +
                 "- Once dismissed, won't reappear for this version",
-              html_url: "https://github.com/nashsu/llm_wiki/releases",
+              html_url: APP_RELEASES_URL,
               published_at: new Date().toISOString(),
             },
           },
@@ -226,7 +227,7 @@ function App() {
         )
         const result = await checkForUpdates({
           currentVersion: __APP_VERSION__,
-          repo: "nashsu/llm_wiki",
+          repo: APP_RELEASE_REPO,
         })
         if (cancelled) return
         useUpdateStore.getState().setResult(result, Date.now())

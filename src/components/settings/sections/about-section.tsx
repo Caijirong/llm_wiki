@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener"
 import { clipServerStatus } from "@/commands/fs"
 import { Button } from "@/components/ui/button"
 import { useUpdateStore, hasAvailableUpdate } from "@/stores/update-store"
+import { APP_RELEASE_REPO } from "@/lib/app-release"
 import { checkForUpdates, toLatestReleaseUrl } from "@/lib/update-check"
 import { saveUpdateCheckState } from "@/lib/project-store"
 
@@ -31,7 +32,7 @@ export function AboutSection() {
     useUpdateStore.getState().setChecking(true)
     const result = await checkForUpdates({
       currentVersion: __APP_VERSION__,
-      repo: "nashsu/llm_wiki",
+      repo: APP_RELEASE_REPO,
     })
     const now = Date.now()
     useUpdateStore.getState().setResult(result, now)
@@ -167,33 +168,6 @@ export function AboutSection() {
         </label>
       </div>
 
-      <div className="rounded-md border p-4 text-sm">
-        <div className="font-medium">LLM Wiki</div>
-        <p className="mt-1 text-xs text-muted-foreground">
-          {t("settings.sections.about.appDescription")}
-          {" "}
-          {/*
-           * Tauri 2's webview doesn't honor `target="_blank"` for
-           * external URLs by default — clicking would either do
-           * nothing or replace the in-app webview with the github
-           * page (terrible UX). Route through the opener plugin
-           * via onClick + preventDefault so it always lands in the
-           * system browser.
-           */}
-          <a
-            className="cursor-pointer underline underline-offset-2 hover:text-primary"
-            href="https://github.com/nashsu/llm_wiki"
-            onClick={(e) => {
-              e.preventDefault()
-              void openUrl("https://github.com/nashsu/llm_wiki").catch((err) => {
-                console.error("[about] openUrl failed:", err)
-              })
-            }}
-          >
-            github.com/nashsu/llm_wiki
-          </a>
-        </p>
-      </div>
     </div>
   )
 }

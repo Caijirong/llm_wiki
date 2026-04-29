@@ -1,6 +1,6 @@
 ---
 name: using-llm-wiki
-description: "Use when a request may benefit from local wiki or internal knowledge: what something is, how to use it, differences, company/project standards, prior solutions, existing docs, historical experience, writing explanations/design docs/guides/proposals/reports, or conversation mentions project-specific terms, modules, systems, products, clients, policies, or domain concepts. Triggers include: 是什么, 怎么用, 区别, 标准, 规范, 之前, 类似方案, 现成文档, 写说明, 设计文档, 使用指南, 基于知识, wiki, 知识库."
+description: "Use for local LLM Wiki lookups, grounded answers/drafts, prior knowledge reuse, internal standards, and wiki file imports. Triggers: 知识库, wiki, 之前, 规范, 说明, 导入."
 ---
 
 # Using LLM Wiki

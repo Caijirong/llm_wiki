@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Bot,
   Binary,
@@ -132,6 +132,10 @@ export function SettingsView() {
 
   const [active, setActive] = useState<CategoryId>("llm")
   const [saved, setSaved] = useState(false)
+  const [servicesSaved, setServicesSaved] = useState(false)
+  const [servicesSaveReady, setServicesSaveReady] = useState(false)
+  const servicesSaveRef = useRef<(() => Promise<void>) | null>(null)
+  const servicesSavedTimer = useRef<number | null>(null)
   const [draft, setDraftState] = useState<SettingsDraft>(() =>
     initialDraft(
       llmConfig,
@@ -168,6 +172,30 @@ export function SettingsView() {
 
   const setDraft: DraftSetter = useCallback((key, value) => {
     setDraftState((prev) => ({ ...prev, [key]: value }))
+  }, [])
+
+  const registerServicesSave = useCallback((handler: (() => Promise<void>) | null) => {
+    servicesSaveRef.current = handler
+    setServicesSaveReady(Boolean(handler))
+  }, [])
+
+  const markServicesSaved = useCallback(() => {
+    setServicesSaved(true)
+    if (servicesSavedTimer.current !== null) {
+      window.clearTimeout(servicesSavedTimer.current)
+    }
+    servicesSavedTimer.current = window.setTimeout(() => {
+      setServicesSaved(false)
+      servicesSavedTimer.current = null
+    }, 2000)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (servicesSavedTimer.current !== null) {
+        window.clearTimeout(servicesSavedTimer.current)
+      }
+    }
   }, [])
 
   const handleSave = useCallback(async () => {
@@ -244,6 +272,10 @@ export function SettingsView() {
     outputLanguage,
   ])
 
+  const handleServicesSave = useCallback(async () => {
+    await servicesSaveRef.current?.()
+  }, [])
+
   const body = useMemo(() => {
     switch (active) {
       case "llm":
@@ -262,11 +294,21 @@ export function SettingsView() {
       case "interface":
         return <InterfaceSection draft={draft} setDraft={setDraft} />
       case "services":
-        return <ServicesSection />
+        return (
+          <ServicesSection
+            onRegisterSave={registerServicesSave}
+            onSaved={markServicesSaved}
+          />
+        )
       case "about":
         return <AboutSection />
     }
-  }, [active, draft, setDraft])
+  }, [active, draft, markServicesSaved, registerServicesSave, setDraft])
+
+  const showSaveBar = active !== "about" && active !== "llm"
+  const activeSaved = active === "services" ? servicesSaved : saved
+  const activeSaveHandler = active === "services" ? handleServicesSave : handleSave
+  const activeSaveDisabled = active === "services" && !servicesSaveReady
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -328,14 +370,14 @@ export function SettingsView() {
         {/* Global Save bar hidden for sections that persist inline:
             - "llm" saves per-row on every edit (independent per-preset state)
             - "about" has no editable fields */}
-        {active !== "about" && active !== "llm" && active !== "services" && (
+        {showSaveBar && (
           <div className="shrink-0 border-t bg-background/80 backdrop-blur px-8 py-3">
             <div className="mx-auto flex max-w-2xl items-center justify-between gap-4">
               <p className="text-xs text-muted-foreground">
-                {saved ? t("settings.savedTick") : t("settings.changeHint")}
+                {activeSaved ? t("settings.savedTick") : t("settings.changeHint")}
               </p>
-              <Button onClick={handleSave}>
-                {saved ? t("settings.saved") : t("settings.save")}
+              <Button onClick={activeSaveHandler} disabled={activeSaveDisabled}>
+                {activeSaved ? t("settings.saved") : t("settings.save")}
               </Button>
             </div>
           </div>
@@ -345,7 +387,12 @@ export function SettingsView() {
   )
 }
 
-function ServicesSection() {
+interface ServicesSectionProps {
+  onRegisterSave: (handler: (() => Promise<void>) | null) => void
+  onSaved: () => void
+}
+
+function ServicesSection({ onRegisterSave, onSaved }: ServicesSectionProps) {
   const { t } = useTranslation()
   const mcpConfig = useWikiStore((s) => s.mcpConfig)
   const setMcpConfig = useWikiStore((s) => s.setMcpConfig)
@@ -364,7 +411,6 @@ function ServicesSection() {
     String(fileReceiverConfig.uploadTtlHours),
   )
   const [fileReceiverRuntime, setFileReceiverRuntime] = useState<FileReceiverRuntimeState | null>(null)
-  const [saved, setSaved] = useState(false)
 
   useEffect(() => {
     setMcpEnabled(mcpConfig.enabled)
@@ -381,7 +427,7 @@ function ServicesSection() {
     setFileReceiverUploadTtlHours(String(fileReceiverConfig.uploadTtlHours))
   }, [fileReceiverConfig])
 
-  async function refreshRuntime() {
+  const refreshRuntime = useCallback(async () => {
     try {
       const [mcpRuntimeState, fileReceiverRuntimeState] = await Promise.all([
         fetchMcpStatus(),
@@ -405,7 +451,7 @@ function ServicesSection() {
         uploadTtlHours: parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours),
       })
     }
-  }
+  }, [fileReceiverMaxFileSizeMb, fileReceiverUploadTtlHours, mcpHost, mcpPort])
 
   useEffect(() => {
     let active = true
@@ -423,7 +469,7 @@ function ServicesSection() {
     }
   }, [])
 
-  async function handleSave() {
+  const handleSave = useCallback(async () => {
     const { saveFileReceiverConfig, saveMcpConfig } = await import("@/lib/project-store")
     const normalizedMcpHost = mcpHost.trim() || "127.0.0.1"
     const normalizedMcpPort = parseMcpPort(mcpPort)
@@ -449,9 +495,25 @@ function ServicesSection() {
     await saveFileReceiverConfig(nextFileReceiverConfig)
     await fileReceiverUpdateConfig(nextFileReceiverConfig)
     await refreshRuntime()
-    setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
-  }
+    onSaved()
+  }, [
+    fileReceiverMaxFileSizeMb,
+    fileReceiverToken,
+    fileReceiverUploadTtlHours,
+    mcpAutoStart,
+    mcpEnabled,
+    mcpHost,
+    mcpPort,
+    onSaved,
+    refreshRuntime,
+    setFileReceiverConfig,
+    setMcpConfig,
+  ])
+
+  useEffect(() => {
+    onRegisterSave(handleSave)
+    return () => onRegisterSave(null)
+  }, [handleSave, onRegisterSave])
 
   const sharedListenerSettingsVisible = mcpEnabled
   const sharedExternalHost = mcpHost.trim() || "127.0.0.1"
@@ -474,149 +536,139 @@ function ServicesSection() {
         </p>
       </div>
 
-      <div className="space-y-4 rounded-md border p-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-sm font-semibold">{t("settings.mcpServer")}</h3>
-            <p className="mt-1 text-xs text-muted-foreground">{t("settings.mcpDescription")}</p>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={mcpEnabled}
-            aria-label={t("settings.enableMcp")}
-            onClick={() => setMcpEnabled(!mcpEnabled)}
-            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-              mcpEnabled ? "bg-primary" : "bg-muted"
-            }`}
-          >
-            <span
-              className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
-                mcpEnabled ? "translate-x-4.5" : "translate-x-0.5"
-              }`}
-            />
-          </button>
+      <div className="flex items-center justify-between rounded-md border p-3">
+        <div>
+          <div className="text-sm font-medium">{t("settings.mcpServer")}</div>
+          <div className="text-xs text-muted-foreground">{t("settings.mcpDescription")}</div>
         </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={mcpEnabled}
+          aria-label={t("settings.enableMcp")}
+          onClick={() => setMcpEnabled(!mcpEnabled)}
+          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+            mcpEnabled ? "bg-primary" : "bg-muted"
+          }`}
+        >
+          <span
+            className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+              mcpEnabled ? "translate-x-4.5" : "translate-x-0.5"
+            }`}
+          />
+        </button>
+      </div>
 
-        {mcpEnabled && (
-          <div className="flex items-center gap-2">
-            <input
-              id="mcpAutoStart"
-              type="checkbox"
-              checked={mcpAutoStart}
-              onChange={(e) => setMcpAutoStart(e.target.checked)}
-            />
-            <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
+      {mcpEnabled && (
+        <div className="flex items-center gap-2">
+          <input
+            id="mcpAutoStart"
+            type="checkbox"
+            checked={mcpAutoStart}
+            onChange={(e) => setMcpAutoStart(e.target.checked)}
+          />
+          <Label htmlFor="mcpAutoStart">{t("settings.autoStartMcp")}</Label>
+        </div>
+      )}
+
+      {sharedListenerSettingsVisible && (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="mcpHost">{t("settings.host")}</Label>
+              <Input
+                id="mcpHost"
+                value={mcpHost}
+                onChange={(e) => setMcpHost(e.target.value)}
+                placeholder="127.0.0.1"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="mcpPort">{t("settings.port")}</Label>
+              <Input
+                id="mcpPort"
+                type="number"
+                min={1}
+                value={mcpPort}
+                onChange={(e) => setMcpPort(e.target.value)}
+                placeholder="18765"
+              />
+            </div>
           </div>
-        )}
 
-        {sharedListenerSettingsVisible && (
-          <>
+          {mcpHost.trim() === "0.0.0.0" && (
+            <p className="text-xs text-amber-600">{t("settings.mcpHostWarning")}</p>
+          )}
+
+          <div className="space-y-1 rounded-md border p-3 text-xs">
+            <p>{t("settings.mcpRuntimeStatus")}: {mcpRuntimeLabel}</p>
+            <p>{t("settings.mcpEndpointPreview")}: {mcpEndpointPreview}</p>
+            {mcpRuntime?.currentProject && <p>Project: {mcpRuntime.currentProject}</p>}
+            {mcpRuntime?.lastError && <p className="text-red-600">{mcpRuntime.lastError}</p>}
+          </div>
+
+          <div className="space-y-4 rounded-md border p-3">
+            <div>
+              <div className="text-sm font-medium">{t("settings.uploadImport")}</div>
+              <p className="mt-1 text-xs text-muted-foreground">{t("settings.fileReceiverSharedEndpointHint")}</p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="fileReceiverToken">{t("settings.fileReceiverToken")}</Label>
+              <Input
+                id="fileReceiverToken"
+                type="password"
+                value={fileReceiverToken}
+                onChange={(e) => setFileReceiverToken(e.target.value)}
+                placeholder={t("settings.fileReceiverTokenPlaceholder")}
+              />
+            </div>
+
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="mcpHost">{t("settings.host")}</Label>
+                <Label htmlFor="fileReceiverMaxFileSizeMb">{t("settings.fileReceiverMaxSizeMb")}</Label>
                 <Input
-                  id="mcpHost"
-                  value={mcpHost}
-                  onChange={(e) => setMcpHost(e.target.value)}
-                  placeholder="127.0.0.1"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="mcpPort">{t("settings.port")}</Label>
-                <Input
-                  id="mcpPort"
+                  id="fileReceiverMaxFileSizeMb"
                   type="number"
                   min={1}
-                  value={mcpPort}
-                  onChange={(e) => setMcpPort(e.target.value)}
-                  placeholder="18765"
+                  value={fileReceiverMaxFileSizeMb}
+                  onChange={(e) => setFileReceiverMaxFileSizeMb(e.target.value)}
+                  placeholder="1024"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="fileReceiverUploadTtlHours">{t("settings.fileReceiverUploadTtlHours")}</Label>
+                <Input
+                  id="fileReceiverUploadTtlHours"
+                  type="number"
+                  min={1}
+                  value={fileReceiverUploadTtlHours}
+                  onChange={(e) => setFileReceiverUploadTtlHours(e.target.value)}
+                  placeholder="168"
                 />
               </div>
             </div>
-
-            {mcpHost.trim() === "0.0.0.0" && (
-              <p className="text-xs text-amber-600">{t("settings.mcpHostWarning")}</p>
-            )}
 
             <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
-              <p>{t("settings.mcpRuntimeStatus")}: {mcpRuntimeLabel}</p>
-              <p>{t("settings.mcpEndpointPreview")}: {mcpEndpointPreview}</p>
-              {mcpRuntime?.currentProject && <p>Project: {mcpRuntime.currentProject}</p>}
-              {mcpRuntime?.lastError && <p className="text-red-600">{mcpRuntime.lastError}</p>}
+              <p>{t("settings.fileReceiverRuntimeStatus")}: {fileReceiverRuntimeLabel}</p>
+              <p>{t("settings.fileReceiverEndpointPreview")}: {fileReceiverEndpointPreview}</p>
+              <p>{t("settings.fileReceiverKnownProjects")}: {fileReceiverRuntime?.knownProjects.length ?? 0}</p>
+              <p>
+                {t("settings.fileReceiverMaxSizeCurrent")}:{" "}
+                {formatFileSize(fileReceiverRuntime?.maxFileSizeBytes ?? parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb))}
+              </p>
+              <p>
+                {t("settings.fileReceiverTtlCurrent")}:{" "}
+                {fileReceiverRuntime?.uploadTtlHours ?? parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours)}h
+              </p>
+              {fileReceiverRuntime?.lastError && (
+                <p className="text-red-600">{fileReceiverRuntime.lastError}</p>
+              )}
             </div>
+          </div>
+        </>
+      )}
 
-            <div className="space-y-4 border-t pt-4">
-              <div className="space-y-1">
-                <h4 className="text-sm font-semibold">{t("settings.uploadImport")}</h4>
-                <p className="text-xs text-muted-foreground">{t("settings.fileReceiverSharedEndpointHint")}</p>
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="fileReceiverToken">{t("settings.fileReceiverToken")}</Label>
-                <Input
-                  id="fileReceiverToken"
-                  type="password"
-                  value={fileReceiverToken}
-                  onChange={(e) => setFileReceiverToken(e.target.value)}
-                  placeholder={t("settings.fileReceiverTokenPlaceholder")}
-                />
-              </div>
-
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="fileReceiverMaxFileSizeMb">{t("settings.fileReceiverMaxSizeMb")}</Label>
-                  <Input
-                    id="fileReceiverMaxFileSizeMb"
-                    type="number"
-                    min={1}
-                    value={fileReceiverMaxFileSizeMb}
-                    onChange={(e) => setFileReceiverMaxFileSizeMb(e.target.value)}
-                    placeholder="1024"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="fileReceiverUploadTtlHours">{t("settings.fileReceiverUploadTtlHours")}</Label>
-                  <Input
-                    id="fileReceiverUploadTtlHours"
-                    type="number"
-                    min={1}
-                    value={fileReceiverUploadTtlHours}
-                    onChange={(e) => setFileReceiverUploadTtlHours(e.target.value)}
-                    placeholder="168"
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-1 rounded-md bg-muted/40 p-3 text-xs">
-                <p>{t("settings.fileReceiverRuntimeStatus")}: {fileReceiverRuntimeLabel}</p>
-                <p>{t("settings.fileReceiverEndpointPreview")}: {fileReceiverEndpointPreview}</p>
-                <p>{t("settings.fileReceiverKnownProjects")}: {fileReceiverRuntime?.knownProjects.length ?? 0}</p>
-                <p>
-                  {t("settings.fileReceiverMaxSizeCurrent")}:{" "}
-                  {formatFileSize(fileReceiverRuntime?.maxFileSizeBytes ?? parseFileReceiverMaxFileSizeBytes(fileReceiverMaxFileSizeMb))}
-                </p>
-                <p>
-                  {t("settings.fileReceiverTtlCurrent")}:{" "}
-                  {fileReceiverRuntime?.uploadTtlHours ?? parseFileReceiverUploadTtlHours(fileReceiverUploadTtlHours)}h
-                </p>
-                {fileReceiverRuntime?.lastError && (
-                  <p className="text-red-600">{fileReceiverRuntime.lastError}</p>
-                )}
-              </div>
-            </div>
-          </>
-        )}
-      </div>
-
-      <div className="flex items-center justify-between gap-4 border-t pt-4">
-        <p className="text-xs text-muted-foreground">
-          {saved ? t("settings.savedTick") : t("settings.changeHint")}
-        </p>
-        <Button onClick={handleSave}>
-          {saved ? t("settings.saved") : t("settings.save")}
-        </Button>
-      </div>
     </div>
   )
 }
