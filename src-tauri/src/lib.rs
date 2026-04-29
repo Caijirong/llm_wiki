@@ -2,13 +2,18 @@ mod clip_server;
 mod commands;
 mod file_receiver_server;
 mod mcp_server;
+mod panic_guard;
 mod types;
 
+use panic_guard::run_guarded;
 use tauri::Manager;
 
 #[tauri::command]
 fn clip_server_status() -> String {
-    clip_server::get_daemon_status().to_string()
+    run_guarded("clip_server_status", || {
+        Ok(clip_server::get_daemon_status().to_string())
+    })
+    .unwrap_or_else(|e| format!("error: {e}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -24,6 +29,24 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        // Rust-backed fetch so third-party LLM APIs that reject
+        // browser-origin headers via CORS preflight (MiniMax, Volcengine
+        // Ark's api/coding/v3, etc.) still work. Requests leave the app
+        // from Rust, never the webview.
+        .plugin(tauri_plugin_http::init())
+        .setup(|app| {
+            // Let the PDF extractor find the bundled pdfium dynamic
+            // library via Tauri's platform-correct resource path.
+            use tauri::Manager;
+            if let Ok(dir) = app.path().resource_dir() {
+                commands::fs::set_resource_dir_hint(dir);
+            }
+            // Registry of running `claude` subprocesses, keyed by the
+            // frontend-generated stream id. Populated by claude_cli_spawn,
+            // drained on process exit or by claude_cli_kill.
+            app.manage(commands::claude_cli::ClaudeCliState::default());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::fs::read_file,
             commands::fs::write_file,
@@ -34,6 +57,8 @@ pub fn run() {
             commands::fs::delete_file,
             commands::fs::find_related_wiki_pages,
             commands::fs::create_directory,
+            commands::fs::file_exists,
+            commands::fs::read_file_as_base64,
             commands::project::create_project,
             commands::project::open_project,
             clip_server_status,
@@ -41,6 +66,19 @@ pub fn run() {
             commands::vectorstore::vector_search,
             commands::vectorstore::vector_delete,
             commands::vectorstore::vector_count,
+            commands::vectorstore::vector_upsert_chunks,
+            commands::vectorstore::vector_search_chunks,
+            commands::vectorstore::vector_delete_page,
+            commands::vectorstore::vector_count_chunks,
+            commands::vectorstore::vector_legacy_row_count,
+            commands::vectorstore::vector_drop_legacy,
+            commands::claude_cli::claude_cli_detect,
+            commands::claude_cli::claude_cli_spawn,
+            commands::claude_cli::claude_cli_kill,
+            commands::extract_images::extract_pdf_images_cmd,
+            commands::extract_images::extract_office_images_cmd,
+            commands::extract_images::extract_and_save_pdf_images_cmd,
+            commands::extract_images::extract_and_save_office_images_cmd,
             mcp_server::mcp_status,
             mcp_server::mcp_start,
             mcp_server::mcp_stop,
@@ -87,11 +125,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen {
-                has_visible_windows,
-                ..
-            } = event
-            {
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
                 if !has_visible_windows {
                     use tauri::Manager;
                     if let Some(window) = app.get_webview_window("main") {

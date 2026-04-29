@@ -88,6 +88,7 @@ describe("TransfersView", () => {
   beforeEach(() => {
     useWikiStore.setState({
       project: {
+        id: "wiki-demo",
         name: "Demo Project",
         path: "/tmp/wiki",
       },

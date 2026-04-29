@@ -1,6 +1,6 @@
 [package]
 name = "llm-wiki"
-version = "0.3.3"
+version = "0.4.3"
 description = "LLM Wiki - A personal knowledge base for LLM concepts"
 authors = []
 edition = "2021"
@@ -25,8 +25,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["clock"] }
 tauri-plugin-dialog = "2.7.0"
-pdf-extract = "0.10.0"
+pdfium-render = "0.9"
 tauri-plugin-store = "2.4.2"
+tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
 tiny_http = "0.12"
 zip = "2"
 calamine = "0.34.0"
@@ -36,7 +37,24 @@ lancedb = "0.27.2"
 arrow-array = "57"
 arrow-schema = "57"
 futures = "0.3"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+# Claude Code CLI subprocess transport, embedded MCP/upload runtimes, and
+# async fs commands share the Tauri tokio runtime.
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+which = "7"
+uuid = { version = "1", features = ["v4"] }
+# Multimodal image extraction (Phase 1):
+#   `image` re-encodes pdfium's raw bitmap output to PNG so the IPC
+#   payload is self-contained (the frontend doesn't need to know
+#   about pdfium's internal RGBA layout).
+#   `base64` serializes binary image data for Tauri IPC, which is
+#   JSON-only — Vec<u8> roundtrips ~1.33× larger than raw bytes but
+#   that's acceptable for our ~MB-scale per-image payloads.
+#   `sha2` is for the dedup cache (Phase 3) — same image hash =
+#   same caption, no redundant VLM calls. Pulled in here so the
+#   extraction layer can also expose the hash if a caller wants it.
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+sha2 = "0.10"
 axum = { version = "0.7", features = ["multipart"] }
 tokio-util = "0.7"
 rmcp = { version = "1.5.0", default-features = false, features = ["client", "macros", "server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
@@ -46,9 +64,15 @@ http-body-util = "0.1"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = "s"
-panic = "abort"
+# Unwind (not abort) so third-party parser panics can be caught at the
+# Tauri command boundary via panic_guard and turned into errors. Slightly
+# larger binary, but prevents single-file corruption from killing the app.
+panic = "unwind"
 strip = true

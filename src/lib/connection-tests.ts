@@ -17,6 +17,7 @@ const LLM_PROVIDER_LABELS: Record<LlmConfig["provider"], string> = {
   ollama: "Ollama",
   custom: "Custom",
   minimax: "MiniMax",
+  "claude-code": "Claude Code",
 }
 
 const SEARCH_PROVIDER_LABELS: Record<SearchApiConfig["provider"], string> = {
@@ -124,6 +125,10 @@ function validateLlmConfig(config: LlmConfig) {
       throw new Error("Custom API endpoint is required")
     }
     return
+  }
+
+  if (config.provider === "claude-code") {
+    throw new Error("Use the Claude Code CLI status check in the LLM settings row")
   }
 
   if (!config.apiKey) {

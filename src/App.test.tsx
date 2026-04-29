@@ -7,6 +7,10 @@ const {
   persistedFileReceiverConfig,
   loadMcpConfig,
   loadFileReceiverConfig,
+  loadProviderConfigs,
+  loadActivePresetId,
+  loadMultimodalConfig,
+  loadOutputLanguage,
   fileReceiverUpdateConfig,
   fileReceiverUpdateKnownProjects,
   mcpUpdateConfig,
@@ -40,12 +44,17 @@ const {
     maxFileSizeBytes: 1024 * 1024 * 1024,
     uploadTtlHours: 168,
   })),
+  loadProviderConfigs: vi.fn(async () => null),
+  loadActivePresetId: vi.fn(async () => null),
+  loadMultimodalConfig: vi.fn(async () => null),
+  loadOutputLanguage: vi.fn(async () => null),
   fileReceiverUpdateConfig: vi.fn(async () => {}),
   fileReceiverUpdateKnownProjects: vi.fn(async () => {}),
   mcpUpdateConfig: vi.fn(async () => {}),
   mcpUpdateKnownProjects: vi.fn(async () => {}),
   mcpUpdateProject: vi.fn(async () => {}),
   openProject: vi.fn(async (path: string) => ({
+    id: "wiki-demo",
     name: "Demo Project",
     path,
   })),
@@ -68,12 +77,16 @@ vi.mock("@/commands/fs", () => ({
 }))
 
 vi.mock("@/lib/project-store", () => ({
-  getLastProject: vi.fn(async () => ({ name: "Demo Project", path: "/tmp/wiki" })),
-  getRecentProjects: vi.fn(async () => [{ name: "Demo Project", path: "/tmp/wiki" }]),
+  getLastProject: vi.fn(async () => ({ id: "wiki-demo", name: "Demo Project", path: "/tmp/wiki" })),
+  getRecentProjects: vi.fn(async () => [{ id: "wiki-demo", name: "Demo Project", path: "/tmp/wiki" }]),
   saveLastProject: vi.fn(async () => {}),
   loadLlmConfig: vi.fn(async () => null),
+  loadProviderConfigs,
+  loadActivePresetId,
   loadSearchApiConfig: vi.fn(async () => null),
   loadEmbeddingConfig: vi.fn(async () => null),
+  loadMultimodalConfig,
+  loadOutputLanguage,
   loadLanguage: vi.fn(async () => null),
   loadMcpConfig,
   loadFileReceiverConfig,
@@ -90,6 +103,14 @@ vi.mock("@/lib/auto-save", () => ({
 
 vi.mock("@/lib/clip-watcher", () => ({
   startClipWatcher: vi.fn(() => {}),
+}))
+
+vi.mock("@/lib/reset-project-state", () => ({
+  resetProjectState: vi.fn(async () => {}),
+}))
+
+vi.mock("@/lib/ingest-queue", () => ({
+  restoreQueue: vi.fn(async () => {}),
 }))
 
 vi.mock("@/components/layout/app-layout", () => ({

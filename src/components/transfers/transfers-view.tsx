@@ -34,7 +34,7 @@ export function TransfersView() {
     if (!project) return
     setRefreshing(true)
     try {
-      await syncQueueFromDisk(normalizePath(project.path))
+      await syncQueueFromDisk(project.id, normalizePath(project.path))
       const [runtimeState, uploadList] = await Promise.all([
         fileReceiverStatus(),
         listUploads({ projectPath: project.path, limit: 50 }),
@@ -62,7 +62,7 @@ export function TransfersView() {
     return () => {
       window.clearInterval(timer)
     }
-  }, [project?.path])
+  }, [project?.id, project?.path])
 
   if (!project) {
     return (

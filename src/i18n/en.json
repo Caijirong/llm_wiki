@@ -10,9 +10,15 @@
     "graph": "Graph",
     "lint": "Lint",
     "review": "Review",
-    "transfers": "Transfers",
     "settings": "Settings",
-    "switchProject": "Switch Project"
+    "switchProject": "Switch Project",
+    "updateAvailable": "Update available",
+    "updateAvailableSuffix": " · update"
+  },
+  "updateBanner": {
+    "message": "Version {{version}} is available",
+    "openDownload": "Open download page",
+    "dismiss": "Dismiss"
   },
   "welcome": {
     "newProject": "New Project",
@@ -96,10 +102,6 @@
     "testingConnection": "Testing...",
     "connectionSuccess": "Connected: {{target}}",
     "connectionFailed": "Connection failed: {{error}}",
-    "save": "Save Settings",
-    "saved": "Saved!",
-    "language": "Language",
-    "languageHint": "Interface language (wiki content follows source material language)",
     "mcpServer": "MCP Server",
     "mcpDescription": "Configure local MCP settings for tool integration.",
     "enableMcp": "Enable MCP",
@@ -108,10 +110,10 @@
     "port": "Port",
     "mcpHostWarning": "Warning: 0.0.0.0 exposes MCP and uploads to your network.",
     "mcpRuntimeStatus": "Runtime status",
-    "mcpStatusPlaceholder": "Not connected (placeholder)",
+    "mcpStatusPlaceholder": "Not connected",
     "mcpEndpointPreview": "Endpoint preview",
     "fileReceiver": "File Receiver",
-    "fileReceiverDescription": "Accept large file uploads from external curl clients or agents, then hand completed files into the existing ingest queue.",
+    "fileReceiverDescription": "Accept large file uploads from external curl clients or agents, then hand completed files into the ingest queue.",
     "enableFileReceiver": "Enable file receiver",
     "autoStartFileReceiver": "Auto-start file receiver",
     "fileReceiverToken": "Static token",
@@ -120,11 +122,138 @@
     "fileReceiverMaxSizeMb": "Max file size (MB)",
     "fileReceiverUploadTtlHours": "Upload retention (hours)",
     "fileReceiverRuntimeStatus": "Runtime status",
-    "fileReceiverStatusPlaceholder": "Not connected (placeholder)",
+    "fileReceiverStatusPlaceholder": "Not connected",
     "fileReceiverEndpointPreview": "Upload endpoint",
     "fileReceiverKnownProjects": "Known projects",
     "fileReceiverMaxSizeCurrent": "Current max file size",
-    "fileReceiverTtlCurrent": "Current retention"
+    "fileReceiverTtlCurrent": "Current retention",
+    "save": "Save",
+    "saved": "Saved",
+    "savedTick": "Saved ✓",
+    "changeHint": "Changes apply after saving.",
+    "language": "Language",
+    "languageHint": "Interface language (wiki content follows source material language)",
+    "categories": {
+      "llm": "LLM Models",
+      "embedding": "Embeddings",
+      "multimodal": "Image Captioning",
+      "webSearch": "Web Search",
+      "output": "Output",
+      "interface": "Interface",
+      "services": "Services",
+      "about": "About"
+    },
+    "sections": {
+      "llm": {
+        "title": "LLM Models",
+        "description": "One row per vendor. Toggling one on automatically turns off the others. Changes save instantly; each vendor's API key is stored independently so switching doesn't lose data.",
+        "expand": "Expand config",
+        "collapse": "Collapse",
+        "toggleOff": "Click to deactivate",
+        "toggleOn": "Click to activate (turns off other providers)",
+        "wireOpenAi": "OpenAI-compat",
+        "wireAnthropic": "Anthropic-compat",
+        "apiKeyPlaceholderCustom": "Leave empty if no key (local models)",
+        "apiKeyPlaceholder": "Enter your API key",
+        "savedBadge": "saved",
+        "configuredBadge": "configured",
+        "activeBadge": "● active",
+        "endpointPreviewWillUse": "Will resolve to",
+        "endpointPreviewAutoApply": "(applied automatically when you leave the input)"
+      },
+      "embedding": {
+        "title": "Vector Embeddings",
+        "description": "Enable semantic search against your wiki. Works with any OpenAI-compatible /v1/embeddings endpoint. Local models (LM Studio, Ollama embedding) don't need an API key.",
+        "enableLabel": "Enable vector search",
+        "enableHint": "When off, search uses token matching only.",
+        "endpoint": "Endpoint",
+        "apiKey": "API Key (optional)",
+        "apiKeyPlaceholder": "Leave empty for local models",
+        "model": "Model",
+        "chunking": "Chunking",
+        "maxChunkChars": "Max chunk size (characters)",
+        "maxChunkCharsHint": "Target size of each chunk. Lower this (e.g. 500) when your endpoint's context is small (llama.cpp n_ctx=512, mxbai-embed-large, etc.).",
+        "overlapChunkChars": "Overlap (characters)",
+        "overlapChunkCharsHint": "Characters of overlap between adjacent chunks so ideas aren't severed at boundaries.",
+        "statsHeading": "Index status",
+        "chunkCount": "{{count}} chunks indexed",
+        "lastErrorHeading": "Last embedding error",
+        "reindexAll": "Re-index all pages",
+        "reindexing": "Indexing {{done}}/{{total}}…",
+        "reindexDone": "Indexed {{count}} pages.",
+        "legacyPromptTitle": "Legacy per-page index detected",
+        "legacyPromptBody": "Your project has {{count}} entries in the old per-page vector store. The new per-chunk index gives better retrieval but needs a one-time re-embed. Run \"Re-index all pages\" to upgrade.",
+        "dropLegacy": "Drop legacy index",
+        "dropLegacyDone": "Legacy index removed."
+      },
+      "multimodal": {
+        "title": "Image Captioning",
+        "description": "Generate factual captions for images extracted from PDFs / DOCX / PPTX during ingest. Captions are inserted as alt text inside the source markdown — they're what semantic search matches when you search for image content. Cached by image hash so duplicate logos / charts only call the LLM once.",
+        "enableLabel": "Enable captioning at ingest",
+        "enableHint": "Off: image references are stripped from ingested content — no images appear in wiki pages, search won't return them. (Files still extract to wiki/media/ for the raw-source preview.) On: each new image gets a factual caption from the vision LLM (cached by hash) and lands in the wiki page's alt text.",
+        "stateOn": "ON",
+        "stateOff": "OFF",
+        "useMainLabel": "Use main LLM for captions",
+        "useMainHint": "Reuse the model picked under Settings → LLM provider. Only enable this if that model accepts image input — text-only models will return a 400.",
+        "dedicatedHeading": "Dedicated vision endpoint",
+        "provider": "Provider",
+        "ollamaUrl": "Ollama URL",
+        "customEndpoint": "Endpoint URL",
+        "customEndpointHint": "OpenAI-compatible /v1 base. LM Studio, llama.cpp server, vLLM, LocalAI all work.",
+        "apiKey": "API key",
+        "apiKeyPlaceholder": "Leave blank for local / no-auth endpoints",
+        "model": "Model",
+        "modelHint": "Must be a vision-capable model. Text-only models will fail with a 400 / image-not-supported error at first ingest.",
+        "concurrency": "Concurrent caption requests",
+        "concurrencyHint": "How many caption requests run in parallel. 1 = strictly sequential. 4 is a good default for most setups; raise to 8+ only on a beefy GPU or hosted endpoint.",
+        "costHeading": "Cost guardrails",
+        "costPoint1": "Each new image triggers one vision-LLM call (~500-2000 tokens depending on model + thinking mode).",
+        "costPoint2": "Captions are cached by SHA-256 of image bytes. Duplicate logos / shared chart templates across documents only ever incur ONE call.",
+        "costPoint3": "Rust-side filter drops images smaller than 100×100 px and caps at 500 images per source — pathological PDFs can't blow up the bill.",
+        "costPoint4": "Prefer a local vision model (Qwen2.5-VL via LM Studio / Ollama) for bulk ingestion; reserve hosted vision APIs for one-off high-stakes documents."
+      },
+      "webSearch": {
+        "title": "Web Search",
+        "description": "Used by Deep Research to pull fresh external context."
+      },
+      "output": {
+        "title": "Output Preferences",
+        "description": "Controls for generated content — language, conversation history length.",
+        "aiLanguage": "AI Output Language",
+        "aiLanguageHint": "Force AI-generated content (chat replies, wiki pages, research output, lint reports) to use the selected language. Pick \"Auto\" to let the AI follow the user's input or source document language.",
+        "historyLength": "Conversation History Length",
+        "historyHint": "Number of prior messages sent to the AI on each request. More = richer context but more tokens.",
+        "historyCurrent": "Currently {{count}} messages (about {{turns}} turns)"
+      },
+      "interface": {
+        "title": "Interface",
+        "description": "UI language and appearance. Changes apply immediately and persist.",
+        "uiLanguage": "UI Language",
+        "uiLanguageHint": "Affects labels, buttons, and other UI strings only. The AI output language is set separately in Output Preferences."
+      },
+      "services": {
+        "title": "Services",
+        "description": "Local MCP and upload endpoints for external agents and command-line clients."
+      },
+      "about": {
+        "title": "About",
+        "description": "Build info and runtime status.",
+        "version": "Version",
+        "clipServer": "Clip Server",
+        "updateCheck": "Update Check",
+        "lastChecked": "Last checked",
+        "lastCheckedNever": "Never",
+        "unreachable": "couldn't reach GitHub",
+        "checkNow": "Check now",
+        "checking": "Checking…",
+        "upToDate": "Up to date (v{{version}}).",
+        "updateAvailable": "Update available: v{{version}}",
+        "openDownload": "Open download page",
+        "later": "Later",
+        "autoCheck": "Check for updates automatically on startup (at most once every 6 hours)",
+        "appDescription": "An LLM-driven personal knowledge base. Source:"
+      }
+    }
   },
   "transfers": {
     "title": "Transfers",
@@ -163,5 +292,11 @@
   },
   "fileTree": {
     "noProject": "No project open"
+  },
+  "time": {
+    "justNow": "just now",
+    "minutesAgo": "{{count}} min ago",
+    "hoursAgo": "{{count}} h ago",
+    "daysAgo": "{{count}} d ago"
   }
 }

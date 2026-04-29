@@ -3,14 +3,19 @@ use std::path::Path;
 
 use chrono::Local;
 
+use crate::panic_guard::run_guarded;
 use crate::types::wiki::WikiProject;
 
-pub fn is_valid_wiki_project_path(root: &Path) -> bool {
-    root.join("schema.md").is_file() && root.join("wiki/index.md").is_file()
+pub(crate) fn is_valid_wiki_project_path(root: &Path) -> bool {
+    root.is_dir() && root.join("schema.md").is_file() && root.join("wiki/index.md").is_file()
 }
 
 #[tauri::command]
 pub fn create_project(name: String, path: String) -> Result<WikiProject, String> {
+    run_guarded("create_project", || create_project_impl(name, path))
+}
+
+fn create_project_impl(name: String, path: String) -> Result<WikiProject, String> {
     let root = Path::new(&path).join(&name);
 
     if root.exists() {
@@ -226,55 +231,60 @@ related: []
   "outgoing-link": true,
   "starred": true
 }"#;
-    write_file_inner(
-        root.join(".obsidian/core-plugins.json"),
-        obsidian_core_plugins,
-    )?;
+    write_file_inner(root.join(".obsidian/core-plugins.json"), obsidian_core_plugins)?;
 
     Ok(WikiProject {
         name,
-        path: root.to_string_lossy().to_string(),
+        // Forward slashes for cross-platform consistency in the TS layer.
+        path: root.to_string_lossy().replace('\\', "/"),
     })
 }
 
 #[tauri::command]
 pub fn open_project(path: String) -> Result<WikiProject, String> {
-    let root = Path::new(&path);
+    run_guarded("open_project", || {
+        let root = Path::new(&path);
 
-    if !root.exists() {
-        return Err(format!("Path does not exist: '{}'", path));
-    }
-    if !root.is_dir() {
-        return Err(format!("Path is not a directory: '{}'", path));
-    }
+        if !root.exists() {
+            return Err(format!("Path does not exist: '{}'", path));
+        }
+        if !root.is_dir() {
+            return Err(format!("Path is not a directory: '{}'", path));
+        }
 
-    // Validate that this looks like a wiki project
-    if !is_valid_wiki_project_path(root) {
-        return Err(format!(
-            "Not a valid wiki project (missing schema.md or wiki/index.md): '{}'",
-            path
-        ));
-    }
+        // Validate that this looks like a wiki project
+        if !root.join("schema.md").exists() {
+            return Err(format!(
+                "Not a valid wiki project (missing schema.md): '{}'",
+                path
+            ));
+        }
+        if !root.join("wiki").is_dir() {
+            return Err(format!(
+                "Not a valid wiki project (missing wiki/ directory): '{}'",
+                path
+            ));
+        }
 
-    // Derive project name from the directory name
-    let name = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("Unknown")
-        .to_string();
+        // Derive project name from the directory name
+        let name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
 
-    Ok(WikiProject { name, path })
+        Ok(WikiProject {
+            name,
+            // Forward slashes for cross-platform consistency in the TS layer.
+            path: path.replace('\\', "/"),
+        })
+    })
 }
 
 fn write_file_inner(path: std::path::PathBuf, contents: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create parent dirs for '{}': {}",
-                path.display(),
-                e
-            )
-        })?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path.display(), e))?;
     }
     fs::write(&path, contents)
         .map_err(|e| format!("Failed to write file '{}': {}", path.display(), e))
