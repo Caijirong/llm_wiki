@@ -61,6 +61,24 @@ function App() {
   useEffect(() => {
     setupAutoSave()
     startClipWatcher()
+    let cancelled = false
+    let stopRetrievalBridge: (() => void) | undefined
+    import("@/lib/mcp-retrieval-bridge")
+      .then(({ startMcpRetrievalBridge }) => startMcpRetrievalBridge())
+      .then((stop) => {
+        if (cancelled) {
+          stop()
+          return
+        }
+        stopRetrievalBridge = stop
+      })
+      .catch((err) => {
+        console.error("Failed to start MCP retrieval bridge:", err)
+      })
+    return () => {
+      cancelled = true
+      stopRetrievalBridge?.()
+    }
   }, [])
 
   useEffect(() => {

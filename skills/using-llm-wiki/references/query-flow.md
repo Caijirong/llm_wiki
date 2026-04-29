@@ -78,7 +78,7 @@ Prefer tools by intent, not by memorized assumptions.
 Recommended order for broad question answering:
 
 1. `llm_wiki_get_context` with the user query
-2. inspect returned pages and warning/mode
+2. inspect returned pages and warning
 3. if needed, `llm_wiki_read_page` for the strongest matching page
 4. synthesize the answer
 
@@ -89,7 +89,7 @@ Recommended order for “知识库里有没有 X” style exploration:
 3. if needed, `llm_wiki_read_page` for the strongest matching page
 4. answer whether the KB contains relevant material
 
-If `semantic` or `hybrid` falls back to keyword mode, say so only when it materially affects the answer.
+If the tool returns a warning about fallback retrieval, say so only when it materially affects the answer.
 
 If the query returns zero relevant results, that still counts as a completed KB query. Report the empty/limited evidence directly.
 

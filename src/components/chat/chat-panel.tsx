@@ -7,13 +7,11 @@ import { useChatStore, chatMessagesToLLM } from "@/stores/chat-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { streamChat, type ChatMessage as LLMMessage } from "@/lib/llm-client"
 import { executeIngestWrites } from "@/lib/ingest"
-import { listDirectory, readFile, deleteFile } from "@/commands/fs"
-import { searchWiki } from "@/lib/search"
-import { buildRetrievalGraph, getRelatedNodes } from "@/lib/graph-relevance"
-import { normalizePath, getFileName, getRelativePath } from "@/lib/path-utils"
+import { listDirectory, deleteFile } from "@/commands/fs"
+import { normalizePath } from "@/lib/path-utils"
 import { getOutputLanguage, buildLanguageReminder } from "@/lib/output-language"
 import { isGreeting } from "@/lib/greeting-detector"
-import { computeContextBudget } from "@/lib/context-budget"
+import { buildChatRetrievalContext } from "@/lib/chat-retrieval"
 
 // Store the page mapping from the last query so SourceFilesBar can show which pages were cited
 export let lastQueryPages: { title: string; path: string }[] = []
@@ -190,121 +188,12 @@ export function ChatPanel() {
       } else if (project) {
         const pp = normalizePath(project.path)
         const dataVersion = useWikiStore.getState().dataVersion
-
-        // ── Budget allocation (see context-budget.ts) ─────────
-        // Page budget scales with the LLM's context window; we now
-        // also reserve ~15% as headroom for the response so the
-        // model isn't truncated mid-sentence on a packed prompt.
-        const {
-          indexBudget: INDEX_BUDGET,
-          pageBudget: PAGE_BUDGET,
-          maxPageSize: MAX_PAGE_SIZE,
-        } = computeContextBudget(llmConfig.maxContextSize)
-
-        const [rawIndex, purpose] = await Promise.all([
-          readFile(`${pp}/wiki/index.md`).catch(() => ""),
-          readFile(`${pp}/purpose.md`).catch(() => ""),
-        ])
-
-        // ── Phase 1: Tokenized search → top 10 ────────────────
-        const searchResults = await searchWiki(pp, text)
-        const topSearchResults = searchResults.slice(0, 10)
-
-        // ── Trim index by relevance if over budget ─────────────
-        let index = rawIndex
-        if (rawIndex.length > INDEX_BUDGET) {
-          const { tokenizeQuery } = await import("@/lib/search")
-          const tokens = tokenizeQuery(text)
-          const lines = rawIndex.split("\n")
-          const keptLines: string[] = []
-          let keptSize = 0
-
-          for (const line of lines) {
-            const isHeader = line.startsWith("##")
-            const lower = line.toLowerCase()
-            const isRelevant = tokens.some((t) => lower.includes(t))
-
-            if (isHeader || isRelevant) {
-              if (keptSize + line.length + 1 <= INDEX_BUDGET) {
-                keptLines.push(line)
-                keptSize += line.length + 1
-              }
-            }
-          }
-          index = keptLines.join("\n")
-          if (index.length < rawIndex.length) {
-            index += "\n\n[...index trimmed to relevant entries...]"
-          }
-        }
-
-        // ── Phase 2: Graph 1-level expansion ───────────────────
-        // Note: Vector search (if enabled) is already merged into searchResults
-        // by searchWiki() in search.ts — no duplicate code needed here.
-        const graph = await buildRetrievalGraph(pp, dataVersion)
-        const expandedIds = new Set<string>()
-        const searchHitPaths = new Set(topSearchResults.map((r) => r.path))
-        const graphExpansions: { title: string; path: string; relevance: number }[] = []
-
-        for (const result of topSearchResults) {
-          const fileName = getFileName(result.path)
-          const nodeId = fileName.replace(/\.md$/, "")
-          const related = getRelatedNodes(nodeId, graph, 3)
-          for (const { node, relevance } of related) {
-            if (relevance < 2.0) continue
-            if (searchHitPaths.has(node.path)) continue
-            if (expandedIds.has(node.id)) continue
-            expandedIds.add(node.id)
-            graphExpansions.push({ title: node.title, path: node.path, relevance })
-          }
-        }
-        graphExpansions.sort((a, b) => b.relevance - a.relevance)
-
-        // ── Phase 3 & 4: Page budget control ───────────────────
-        let usedChars = 0
-        type PageEntry = { title: string; path: string; content: string; priority: number }
-        const relevantPages: PageEntry[] = []
-
-        const tryAddPage = async (title: string, filePath: string, priority: number): Promise<boolean> => {
-          if (usedChars >= PAGE_BUDGET) return false
-          try {
-            const raw = await readFile(filePath)
-            const relativePath = getRelativePath(filePath, pp)
-            const truncated = raw.length > MAX_PAGE_SIZE
-              ? raw.slice(0, MAX_PAGE_SIZE) + "\n\n[...truncated...]"
-              : raw
-            if (usedChars + truncated.length > PAGE_BUDGET) return false
-            usedChars += truncated.length
-            relevantPages.push({ title, path: relativePath, content: truncated, priority })
-            return true
-          } catch { return false }
-        }
-
-        // P0: Title matches
-        for (const r of topSearchResults.filter((r) => r.titleMatch)) {
-          await tryAddPage(r.title, r.path, 0)
-        }
-        // P1: Content matches
-        for (const r of topSearchResults.filter((r) => !r.titleMatch)) {
-          await tryAddPage(r.title, r.path, 1)
-        }
-        // P2: Graph expansions
-        for (const exp of graphExpansions) {
-          await tryAddPage(exp.title, exp.path, 2)
-        }
-        // P3: Overview fallback
-        if (relevantPages.length === 0) {
-          await tryAddPage("Overview", `${pp}/wiki/overview.md`, 3)
-        }
-
-        const pagesContext = relevantPages.length > 0
-          ? relevantPages.map((p, i) =>
-              `### [${i + 1}] ${p.title}\nPath: ${p.path}\n\n${p.content}`
-            ).join("\n\n---\n\n")
-          : "(No wiki pages found)"
-
-        const pageList = relevantPages.map((p, i) =>
-          `[${i + 1}] ${p.title} (${p.path})`
-        ).join("\n")
+        const retrieval = await buildChatRetrievalContext({
+          projectPath: pp,
+          query: text,
+          maxContextSize: llmConfig.maxContextSize,
+          dataVersion,
+        })
 
         const outLang = getOutputLanguage(text)
 
@@ -323,10 +212,10 @@ export function ChatPanel() {
             "",
             "Use markdown formatting for clarity.",
             "",
-            purpose ? `## Wiki Purpose\n${purpose}` : "",
-            index ? `## Wiki Index\n${index}` : "",
-            relevantPages.length > 0 ? `## Page List\n${pageList}` : "",
-            `## Wiki Pages\n\n${pagesContext}`,
+            retrieval.purpose ? `## Wiki Purpose\n${retrieval.purpose}` : "",
+            retrieval.index ? `## Wiki Index\n${retrieval.index}` : "",
+            retrieval.pages.length > 0 ? `## Page List\n${retrieval.pageList}` : "",
+            `## Wiki Pages\n\n${retrieval.pagesContext}`,
             "",
             "---",
             "",
@@ -344,7 +233,7 @@ export function ChatPanel() {
         // (after history so it's the last system instruction the LLM sees).
         langReminder = buildLanguageReminder(text)
 
-        lastQueryPages = relevantPages.map((p) => ({ title: p.title, path: p.path }))
+        lastQueryPages = retrieval.references.map((p) => ({ title: p.title, path: p.path }))
         queryRefs = [...lastQueryPages]
       }
 
@@ -521,4 +410,3 @@ export function ChatPanel() {
     </div>
   )
 }
-

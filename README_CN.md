@@ -441,18 +441,7 @@ curl -X POST http://127.0.0.1:18765/uploads \
   -F 'file=@/absolute/path/to/source.pdf'
 ```
 
-如果你要启用语义检索或混合检索，仍需要提供 embedding 配置。内嵌服务会把 query 转成 embedding，并查询 `.llm-wiki/lancedb` 下已有的向量索引：
-
-```bash
-LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
-LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
-LLM_WIKI_EMBEDDING_API_KEY=optional-key \
-  npm run tauri dev
-```
-
-`llm_wiki_search` 和 `llm_wiki_get_context` 支持 `mode: "keyword" | "semantic" | "hybrid"`。推荐默认使用 `hybrid`。如果没有 embedding 配置，`hybrid` 会自动降级为纯关键词检索。
-
-这个第一版是只读访问，不负责 ingest，也不会修改 Wiki 内容。
+`llm_wiki_search` 和 `llm_wiki_get_context` 使用与应用内会话相同的检索路径。如果在设置中启用了 embeddings，MCP 查询会获得同样的向量/RRF 行为；如果未启用 embeddings，则使用与会话一致的分词 + 图谱检索。查询工具本身只读；导入资料通过 `/uploads` 完成，并可用 ingest queue 工具查看进度。
 
 ## 快速开始
 

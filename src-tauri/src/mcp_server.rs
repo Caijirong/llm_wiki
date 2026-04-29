@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs, io,
     net::TcpListener as StdTcpListener,
     path::{Component, Path, PathBuf},
@@ -7,11 +7,11 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    http::{header::HOST, request::Parts, HeaderMap},
+    http::{header::AUTHORIZATION, header::HOST, request::Parts, HeaderMap},
     Router,
 };
 use rmcp::{
@@ -26,7 +26,8 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{async_runtime::JoinHandle, State};
+use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, State};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::{fs::collect_markdown_files, project::is_valid_wiki_project_path};
@@ -49,6 +50,8 @@ const NO_PROJECT_MESSAGE: &str =
 const INGEST_QUEUE_RELATIVE_PATH: &str = ".llm-wiki/ingest-queue.json";
 const INGEST_STATUS_HINT: &str =
     "Ingest runs asynchronously inside the desktop app and can take a while for large or complex sources. A task in processing is usually still working, not stuck. Ask the user to check again later instead of polling aggressively.";
+const MCP_RETRIEVAL_REQUEST_EVENT: &str = "llm-wiki-mcp-retrieval-request";
+const MCP_RETRIEVAL_TIMEOUT_SECONDS: u64 = 20;
 static INGEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +97,7 @@ struct McpRuntimeCore {
     known_projects: Vec<String>,
     last_error: Option<String>,
     server: Option<EmbeddedMcpServerHandle>,
+    retrieval_bridge: RendererRetrievalBridge,
 }
 
 struct EmbeddedMcpServerHandle {
@@ -104,21 +108,69 @@ struct EmbeddedMcpServerHandle {
     task: JoinHandle<()>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchMode {
-    Keyword,
-    Semantic,
-    Hybrid,
+type PendingRetrievalSender = oneshot::Sender<Result<McpRendererRetrievalResponse, String>>;
+
+#[derive(Clone, Default)]
+struct RendererRetrievalBridge {
+    app_handle: Arc<Mutex<Option<AppHandle>>>,
+    pending: Arc<Mutex<HashMap<String, PendingRetrievalSender>>>,
 }
 
-impl SearchMode {
-    fn as_str(&self) -> &'static str {
-        match self {
-            SearchMode::Keyword => "keyword",
-            SearchMode::Semantic => "semantic",
-            SearchMode::Hybrid => "hybrid",
+impl RendererRetrievalBridge {
+    fn attach_app_handle(&self, app_handle: AppHandle) {
+        *lock_or_recover(&self.app_handle) = Some(app_handle);
+    }
+
+    async fn request(
+        &self,
+        request: McpRendererRetrievalRequest,
+    ) -> Result<McpRendererRetrievalResponse, String> {
+        let app_handle = lock_or_recover(&self.app_handle)
+            .clone()
+            .ok_or_else(|| "renderer retrieval bridge is not connected".to_string())?;
+        let request_id = request.request_id.clone();
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut pending = lock_or_recover(&self.pending);
+            pending.insert(request_id.clone(), tx);
         }
+
+        if let Err(err) = app_handle.emit(MCP_RETRIEVAL_REQUEST_EVENT, request) {
+            lock_or_recover(&self.pending).remove(&request_id);
+            return Err(format!(
+                "failed to dispatch renderer retrieval request: {}",
+                err
+            ));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(MCP_RETRIEVAL_TIMEOUT_SECONDS), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("renderer retrieval response channel closed".to_string()),
+            Err(_) => {
+                lock_or_recover(&self.pending).remove(&request_id);
+                Err("renderer retrieval timed out".to_string())
+            }
+        }
+    }
+
+    fn complete(&self, completion: McpRendererRetrievalCompletion) -> Result<(), String> {
+        let sender = lock_or_recover(&self.pending)
+            .remove(&completion.request_id)
+            .ok_or_else(|| format!("unknown MCP retrieval request '{}'", completion.request_id))?;
+        let result = if completion.ok {
+            completion
+                .response
+                .ok_or_else(|| "renderer retrieval completed without a response".to_string())
+        } else {
+            Err(completion
+                .error
+                .unwrap_or_else(|| "renderer retrieval failed".to_string()))
+        };
+
+        sender
+            .send(result)
+            .map_err(|_| "MCP retrieval waiter dropped before completion".to_string())
     }
 }
 
@@ -147,8 +199,8 @@ impl McpToolError {
         }
     }
 
-    fn invalid_project(project_path: &str, known_projects: &[String]) -> Self {
-        let mut message = format!("Invalid project_id: {}", project_path);
+    fn invalid_project(project_id: &str, known_projects: &[String]) -> Self {
+        let mut message = format!("Invalid project_id: {}", project_id);
         if !known_projects.is_empty() {
             message.push_str(". Available projects:\n");
             for project in known_projects {
@@ -213,7 +265,6 @@ pub struct McpSearchHit {
 pub struct McpSearchResponse {
     pub project_id: String,
     pub query: String,
-    pub mode: SearchMode,
     pub warning: Option<String>,
     pub results: Vec<McpSearchHit>,
 }
@@ -238,7 +289,6 @@ pub struct McpReadPageResponse {
 #[serde(rename_all = "camelCase")]
 pub struct McpContextResponse {
     pub project_id: String,
-    pub mode: SearchMode,
     pub warning: Option<String>,
     pub purpose: String,
     pub schema: String,
@@ -246,11 +296,53 @@ pub struct McpContextResponse {
     pub pages: Vec<McpPage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum McpRendererRetrievalKind {
+    Search,
+    Context,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct McpRendererRetrievalRequest {
+    request_id: String,
+    kind: McpRendererRetrievalKind,
+    project_id: String,
+    project_path: String,
+    query: String,
+    limit: Option<usize>,
+    max_pages: Option<usize>,
+    page_char_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpRendererRetrievalResponse {
+    pub project_id: String,
+    pub query: String,
+    pub warning: Option<String>,
+    pub results: Vec<McpSearchHit>,
+    pub purpose: String,
+    pub schema: String,
+    pub index: String,
+    pub pages: Vec<McpPage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpRendererRetrievalCompletion {
+    pub request_id: String,
+    pub ok: bool,
+    pub response: Option<McpRendererRetrievalResponse>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct McpIngestTask {
     pub id: String,
-    pub source_path: String,
+    pub source_name: String,
     pub folder_context: String,
     pub status: String,
     pub added_at: u64,
@@ -340,6 +432,7 @@ pub struct EmbeddedMcpTools;
 struct EmbeddedMcpServer {
     runtime: Arc<Mutex<McpRuntimeCore>>,
     file_receiver: FileReceiverRuntimeManager,
+    retrieval_bridge: RendererRetrievalBridge,
     tool_router: ToolRouter<Self>,
 }
 
@@ -354,16 +447,13 @@ struct ResolvedUploadEndpoint {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchRequest {
     query: String,
-    #[serde(alias = "project_path")]
     project_id: Option<String>,
     limit: Option<usize>,
-    mode: Option<SearchMode>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadPageRequest {
     path_or_id: String,
-    #[serde(alias = "project_path")]
     project_id: Option<String>,
     max_chars: Option<usize>,
 }
@@ -371,23 +461,19 @@ struct ReadPageRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetContextRequest {
     query: String,
-    #[serde(alias = "project_path")]
     project_id: Option<String>,
     max_pages: Option<usize>,
     page_char_limit: Option<usize>,
-    mode: Option<SearchMode>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetIngestTaskRequest {
     task_id: String,
-    #[serde(alias = "project_path")]
     project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetIngestQueueRequest {
-    #[serde(alias = "project_path")]
     project_id: Option<String>,
     limit: Option<usize>,
 }
@@ -435,15 +521,18 @@ impl Default for McpRuntimeCore {
             known_projects: Vec::new(),
             last_error: None,
             server: None,
+            retrieval_bridge: RendererRetrievalBridge::default(),
         }
     }
 }
 
 impl EmbeddedMcpServer {
     fn new(runtime: Arc<Mutex<McpRuntimeCore>>, file_receiver: FileReceiverRuntimeManager) -> Self {
+        let retrieval_bridge = lock_or_recover(&runtime).retrieval_bridge.clone();
         Self {
             runtime,
             file_receiver,
+            retrieval_bridge,
             tool_router: Self::tool_router(),
         }
     }
@@ -454,6 +543,89 @@ impl EmbeddedMcpServer {
 
     fn file_receiver_snapshot(&self) -> FileReceiverRuntimeState {
         self.file_receiver.snapshot()
+    }
+
+    async fn llm_wiki_search(
+        &self,
+        state: &McpRuntimeState,
+        query: &str,
+        project_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<McpSearchResponse, McpToolError> {
+        let (resolved_project_id, project_path) = resolve_retrieval_project(state, project_id)?;
+        let search_limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
+        let request = McpRendererRetrievalRequest {
+            request_id: new_retrieval_request_id(),
+            kind: McpRendererRetrievalKind::Search,
+            project_id: resolved_project_id.clone(),
+            project_path,
+            query: query.to_string(),
+            limit: Some(search_limit),
+            max_pages: None,
+            page_char_limit: None,
+        };
+
+        match self.retrieval_bridge.request(request).await {
+            Ok(renderer) => Ok(McpSearchResponse {
+                project_id: resolved_project_id,
+                query: query.to_string(),
+                warning: renderer.warning,
+                results: renderer.results.into_iter().take(search_limit).collect(),
+            }),
+            Err(_) => {
+                let mut fallback =
+                    EmbeddedMcpTools.llm_wiki_search(state, query, project_id, limit)?;
+                fallback.warning = Some(renderer_fallback_warning());
+                Ok(fallback)
+            }
+        }
+    }
+
+    async fn llm_wiki_get_context(
+        &self,
+        state: &McpRuntimeState,
+        query: &str,
+        project_id: Option<&str>,
+        max_pages: Option<usize>,
+        page_char_limit: Option<usize>,
+    ) -> Result<McpContextResponse, McpToolError> {
+        let (resolved_project_id, project_path) = resolve_retrieval_project(state, project_id)?;
+        let page_limit = max_pages.unwrap_or(DEFAULT_CONTEXT_PAGE_LIMIT).clamp(1, 10);
+        let chars_limit = page_char_limit
+            .unwrap_or(DEFAULT_PAGE_CHAR_LIMIT)
+            .clamp(200, 20_000);
+        let request = McpRendererRetrievalRequest {
+            request_id: new_retrieval_request_id(),
+            kind: McpRendererRetrievalKind::Context,
+            project_id: resolved_project_id.clone(),
+            project_path,
+            query: query.to_string(),
+            limit: Some(DEFAULT_SEARCH_LIMIT),
+            max_pages: Some(page_limit),
+            page_char_limit: Some(chars_limit),
+        };
+
+        match self.retrieval_bridge.request(request).await {
+            Ok(renderer) => Ok(McpContextResponse {
+                project_id: resolved_project_id,
+                warning: renderer.warning,
+                purpose: renderer.purpose,
+                schema: renderer.schema,
+                index: renderer.index,
+                pages: renderer.pages.into_iter().take(page_limit).collect(),
+            }),
+            Err(_) => {
+                let mut fallback = EmbeddedMcpTools.llm_wiki_get_context(
+                    state,
+                    query,
+                    project_id,
+                    max_pages,
+                    page_char_limit,
+                )?;
+                fallback.warning = Some(renderer_fallback_warning());
+                Ok(fallback)
+            }
+        }
     }
 }
 
@@ -470,7 +642,7 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_search",
-        description = "Search the active LLM Wiki project by keyword relevance. Semantic and hybrid requests fall back to keyword mode in the embedded runtime."
+        description = "Search the active LLM Wiki project using the same retrieval path as the in-app chat."
     )]
     async fn search(
         &self,
@@ -478,12 +650,11 @@ impl EmbeddedMcpServer {
             query,
             project_id,
             limit,
-            mode,
         }): Parameters<SearchRequest>,
     ) -> Result<Json<McpSearchResponse>, CallToolResult> {
         let state = self.runtime_snapshot();
-        EmbeddedMcpTools
-            .llm_wiki_search(&state, &query, project_id.as_deref(), limit, mode)
+        self.llm_wiki_search(&state, &query, project_id.as_deref(), limit)
+            .await
             .map(Json)
             .map_err(tool_error_result)
     }
@@ -509,7 +680,7 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_get_context",
-        description = "Return a compact answering bundle: purpose.md, schema.md, wiki/index.md, and the most relevant wiki pages for a query."
+        description = "Return a compact answering bundle using the same retrieval path as the in-app chat."
     )]
     async fn get_context(
         &self,
@@ -518,21 +689,19 @@ impl EmbeddedMcpServer {
             project_id,
             max_pages,
             page_char_limit,
-            mode,
         }): Parameters<GetContextRequest>,
     ) -> Result<Json<McpContextResponse>, CallToolResult> {
         let state = self.runtime_snapshot();
-        EmbeddedMcpTools
-            .llm_wiki_get_context(
-                &state,
-                &query,
-                project_id.as_deref(),
-                max_pages,
-                page_char_limit,
-                mode,
-            )
-            .map(Json)
-            .map_err(tool_error_result)
+        self.llm_wiki_get_context(
+            &state,
+            &query,
+            project_id.as_deref(),
+            max_pages,
+            page_char_limit,
+        )
+        .await
+        .map(Json)
+        .map_err(tool_error_result)
     }
 
     #[tool(
@@ -600,11 +769,7 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl McpRuntimeCore {
     fn sync_file_receiver_runtime(&self, file_receiver: &FileReceiverRuntimeManager) {
-        let status = if file_receiver
-            .config()
-            .enabled
-            && file_receiver.config().auto_start
-        {
+        let status = if file_receiver.config().enabled && file_receiver.config().auto_start {
             if self.server.is_some() {
                 FileReceiverStatus::Running
             } else {
@@ -655,7 +820,8 @@ impl McpRuntimeCore {
         respect_auto_start: bool,
     ) -> Result<(), String> {
         let upload_config = file_receiver.config();
-        let uploads_enabled = upload_config.enabled && (!respect_auto_start || upload_config.auto_start);
+        let uploads_enabled =
+            upload_config.enabled && (!respect_auto_start || upload_config.auto_start);
         let mcp_requested = self.config.enabled && (!respect_auto_start || self.config.auto_start);
 
         if !mcp_requested && !uploads_enabled {
@@ -926,6 +1092,18 @@ impl McpRuntimeManager {
         lock_or_recover(&self.inner).update_config(shared, self.file_receiver.clone(), config)
     }
 
+    pub(crate) fn attach_app_handle(&self, app_handle: AppHandle) {
+        lock_or_recover(&self.inner)
+            .retrieval_bridge
+            .attach_app_handle(app_handle);
+    }
+
+    fn complete_retrieval(&self, completion: McpRendererRetrievalCompletion) -> Result<(), String> {
+        lock_or_recover(&self.inner)
+            .retrieval_bridge
+            .complete(completion)
+    }
+
     pub(crate) fn refresh_external_service(&self) -> Result<(), String> {
         let shared = self.shared();
         lock_or_recover(&self.inner).start_server(shared, self.file_receiver.clone(), true)
@@ -1164,17 +1342,30 @@ fn resolve_upload_endpoint(
 }
 
 fn upload_forward_headers(request_parts: Option<&Parts>) -> Vec<McpHttpHeader> {
-    request_parts
-        .and_then(|parts| {
-            parts
-                .headers
-                .get(UPLOAD_TOKEN_HEADER_NAME)
-                .and_then(|value| value.to_str().ok())
-        })
+    let Some(parts) = request_parts else {
+        return Vec::new();
+    };
+
+    if let Some(value) = parts
+        .headers
+        .get(UPLOAD_TOKEN_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
+    {
+        return vec![McpHttpHeader {
+            name: UPLOAD_TOKEN_HEADER_DISPLAY_NAME.to_string(),
+            value: value.to_string(),
+        }];
+    }
+
+    parts
+        .headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.trim().starts_with("Bearer "))
         .map(|value| {
             vec![McpHttpHeader {
-                name: UPLOAD_TOKEN_HEADER_DISPLAY_NAME.to_string(),
+                name: "Authorization".to_string(),
                 value: value.to_string(),
             }]
         })
@@ -1225,6 +1416,24 @@ pub fn resolve_project(
     Err(McpToolError::no_project())
 }
 
+fn resolve_retrieval_project(
+    state: &McpRuntimeState,
+    project_id: Option<&str>,
+) -> Result<(String, String), McpToolError> {
+    let project_path = resolve_project(state, project_id)?;
+    ensure_valid_wiki_project(&project_path)?;
+    let project_id = project_public_id(&project_path);
+    Ok((project_id, project_path))
+}
+
+fn new_retrieval_request_id() -> String {
+    format!("mcp-retrieval-{}", uuid::Uuid::new_v4())
+}
+
+fn renderer_fallback_warning() -> String {
+    "Renderer retrieval is unavailable; fell back to embedded keyword retrieval.".to_string()
+}
+
 impl EmbeddedMcpTools {
     pub fn llm_wiki_list_projects(&self, state: &McpRuntimeState) -> McpListProjectsResponse {
         let projects = known_project_paths(state)
@@ -1251,22 +1460,18 @@ impl EmbeddedMcpTools {
         query: &str,
         project_id: Option<&str>,
         limit: Option<usize>,
-        mode: Option<SearchMode>,
     ) -> Result<McpSearchResponse, McpToolError> {
         let project_path = resolve_project(state, project_id)?;
         ensure_valid_wiki_project(&project_path)?;
         let project_id = project_public_id(&project_path);
 
-        let requested_mode = mode.unwrap_or(SearchMode::Hybrid);
-        let (effective_mode, warning) = effective_mode_with_warning(requested_mode);
         let search_limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
         let results = keyword_search(&project_path, query, search_limit)?;
 
         Ok(McpSearchResponse {
             project_id,
             query: query.to_string(),
-            mode: effective_mode,
-            warning,
+            warning: None,
             results,
         })
     }
@@ -1295,14 +1500,11 @@ impl EmbeddedMcpTools {
         project_id: Option<&str>,
         max_pages: Option<usize>,
         page_char_limit: Option<usize>,
-        mode: Option<SearchMode>,
     ) -> Result<McpContextResponse, McpToolError> {
         let project_path = resolve_project(state, project_id)?;
         ensure_valid_wiki_project(&project_path)?;
         let project_id = project_public_id(&project_path);
 
-        let requested_mode = mode.unwrap_or(SearchMode::Hybrid);
-        let (effective_mode, warning) = effective_mode_with_warning(requested_mode);
         let page_limit = max_pages.unwrap_or(DEFAULT_CONTEXT_PAGE_LIMIT).clamp(1, 10);
         let chars_limit = page_char_limit
             .unwrap_or(DEFAULT_PAGE_CHAR_LIMIT)
@@ -1325,8 +1527,7 @@ impl EmbeddedMcpTools {
 
         Ok(McpContextResponse {
             project_id,
-            mode: effective_mode,
-            warning,
+            warning: None,
             purpose,
             schema,
             index,
@@ -1453,20 +1654,6 @@ fn tool_error_result(error: McpToolError) -> CallToolResult {
     CallToolResult::structured_error(json!(error))
 }
 
-fn effective_mode_with_warning(mode: SearchMode) -> (SearchMode, Option<String>) {
-    if matches!(mode, SearchMode::Keyword) {
-        return (SearchMode::Keyword, None);
-    }
-
-    (
-        SearchMode::Keyword,
-        Some(format!(
-            "{} retrieval fell back to keyword mode because semantic search is unavailable in the embedded runtime.",
-            mode.as_str()
-        )),
-    )
-}
-
 fn ensure_valid_wiki_project(project_path: &str) -> Result<(), McpToolError> {
     let normalized = normalize_project_path(project_path);
     if is_valid_wiki_project_path(Path::new(&normalized)) {
@@ -1526,6 +1713,7 @@ fn normalize_ingest_task(project_path: &str, raw: &Value) -> Option<McpIngestTas
     if source_path.is_empty() {
         return None;
     }
+    let source_name = public_path_basename(&source_path);
 
     let status = raw
         .get("status")
@@ -1547,7 +1735,11 @@ fn normalize_ingest_task(project_path: &str, raw: &Value) -> Option<McpIngestTas
         .to_string();
 
     let error = match raw.get("error") {
-        Some(Value::String(message)) => Some(redact_project_path_text(message, project_path)),
+        Some(Value::String(message)) => Some(redact_ingest_task_error(
+            message,
+            project_path,
+            &source_path,
+        )),
         _ => None,
     };
 
@@ -1557,12 +1749,17 @@ fn normalize_ingest_task(project_path: &str, raw: &Value) -> Option<McpIngestTas
             .iter()
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()?;
-        Some(items.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>())
+        Some(
+            items
+                .into_iter()
+                .map(|item| sanitize_public_task_path(project_path, item))
+                .collect::<Vec<_>>(),
+        )
     });
 
     Some(McpIngestTask {
         id,
-        source_path,
+        source_name,
         folder_context,
         status,
         added_at: raw
@@ -1587,6 +1784,70 @@ fn normalize_ingest_task(project_path: &str, raw: &Value) -> Option<McpIngestTas
         review_item_count: raw.get("reviewItemCount").and_then(Value::as_u64),
         cache_hit: raw.get("cacheHit").and_then(Value::as_bool),
     })
+}
+
+fn redact_ingest_task_error(message: &str, project_path: &str, source_path: &str) -> String {
+    let mut redacted = redact_project_path_text(message, project_path);
+    let normalized_source = source_path.trim().replace('\\', "/");
+    if is_absolute_like_path(&normalized_source) {
+        redacted = redacted.replace(&normalized_source, "<source>");
+    }
+    redacted
+}
+
+fn sanitize_public_task_path(project_path: &str, value: &str) -> String {
+    let normalized = value.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if let Some(relative) = strip_project_path_prefix(project_path, &normalized) {
+        return relative;
+    }
+    if is_absolute_like_path(&normalized) {
+        return public_path_basename(&normalized);
+    }
+    normalized
+}
+
+fn strip_project_path_prefix(project_path: &str, value: &str) -> Option<String> {
+    let candidates = [
+        normalize_project_path(project_path),
+        project_path.trim().replace('\\', "/"),
+    ];
+    for candidate in candidates {
+        let root = candidate.trim_end_matches('/');
+        if root.is_empty() {
+            continue;
+        }
+        if value == root {
+            return Some(String::new());
+        }
+        if let Some(relative) = value.strip_prefix(&format!("{}/", root)) {
+            return Some(relative.to_string());
+        }
+    }
+    None
+}
+
+fn is_absolute_like_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'/')
+}
+
+fn public_path_basename(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("source")
+        .to_string()
 }
 
 fn normalize_ingest_status(status: &str) -> String {
@@ -2031,10 +2292,7 @@ fn project_public_id(path: &str) -> String {
     let normalized = fs::canonicalize(path)
         .map(|resolved| resolved.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| normalize_project_path(path));
-    format!(
-        "wiki-{:016x}",
-        stable_hash_hex(&normalized)
-    )
+    format!("wiki-{:016x}", stable_hash_hex(&normalized))
 }
 
 fn redact_project_path_text(message: &str, project_path: &str) -> String {
@@ -2135,6 +2393,14 @@ pub fn mcp_update_config(
     manager: State<'_, McpRuntimeManager>,
 ) -> Result<(), String> {
     manager.update_config(config)
+}
+
+#[tauri::command]
+pub fn mcp_complete_retrieval(
+    completion: McpRendererRetrievalCompletion,
+    manager: State<'_, McpRuntimeManager>,
+) -> Result<(), String> {
+    manager.complete_retrieval(completion)
 }
 
 #[cfg(test)]
@@ -2461,6 +2727,38 @@ OpenAI builds GPT models and AI systems.
     }
 
     #[test]
+    fn upload_guide_can_forward_bearer_authorization_header() {
+        let upload_state = FileReceiverRuntimeState {
+            status: FileReceiverStatus::Running,
+            host: "127.0.0.1".to_string(),
+            port: 39001,
+            ..FileReceiverRuntimeState::default()
+        };
+
+        let (mut parts, _) = axum::http::Request::new(()).into_parts();
+        parts.headers.insert(
+            AUTHORIZATION,
+            "Bearer secret-token"
+                .parse()
+                .expect("authorization header should parse"),
+        );
+
+        let state = state_with_current_project("/tmp/wiki-a");
+        let guide = EmbeddedMcpTools.llm_wiki_get_upload_guide(&state, &upload_state, Some(&parts));
+
+        assert_eq!(
+            guide.forward_headers,
+            vec![McpHttpHeader {
+                name: "Authorization".to_string(),
+                value: "Bearer secret-token".to_string(),
+            }]
+        );
+        assert!(guide
+            .curl_example
+            .contains("Authorization: Bearer secret-token"));
+    }
+
+    #[test]
     fn ingest_queue_and_task_queries_return_structured_shapes() {
         let project = TempWikiProject::new("ingest-queries");
         let project_path = project.path_string();
@@ -2530,11 +2828,10 @@ OpenAI builds GPT models and AI systems.
         assert_eq!(queue_response.recent_tasks.len(), 2);
         assert_eq!(queue_response.queue.len(), 2);
         assert_eq!(queue_response.recommended_poll_interval_seconds, 60);
-        assert!(queue_response
-            .status_hint
-            .contains("check again later"));
+        assert!(queue_response.status_hint.contains("check again later"));
         assert_eq!(queue_response.recent_tasks[0].id, "task-processing-1");
         assert_eq!(queue_response.recent_tasks[1].id, "task-done-1");
+        assert_eq!(queue_response.recent_tasks[1].source_name, "done.md");
         assert_eq!(
             queue_response
                 .current_task
@@ -2548,6 +2845,10 @@ OpenAI builds GPT models and AI systems.
             .iter()
             .find(|task| task.id == "task-done-1")
             .expect("done task should be present");
+        let done_task_value =
+            serde_json::to_value(done_task).expect("done task should serialize to json");
+        assert!(done_task_value.get("sourcePath").is_none());
+        assert_eq!(done_task_value["sourceName"], "done.md");
         assert_eq!(done_task.status, "done");
         assert_eq!(
             done_task.files_written,
@@ -2582,6 +2883,62 @@ OpenAI builds GPT models and AI systems.
     }
 
     #[test]
+    fn ingest_queue_task_responses_do_not_expose_local_paths() {
+        let project = TempWikiProject::new("ingest-queue-local-paths");
+        let project_path = project.path_string();
+        let state = state_with_current_project(&project_path);
+        let queue_path = Path::new(&project_path).join(INGEST_QUEUE_RELATIVE_PATH);
+        let external_source = "/Users/alice/Documents/private.docx";
+
+        fs::create_dir_all(
+            queue_path
+                .parent()
+                .expect("queue path should have parent directory"),
+        )
+        .expect("queue dir should be created");
+        fs::write(
+            &queue_path,
+            serde_json::to_string_pretty(&vec![json!({
+                "id": "task-private",
+                "sourcePath": external_source,
+                "folderContext": "",
+                "status": "failed",
+                "addedAt": 1000_u64,
+                "error": format!("Failed to read '{}': permission denied", external_source),
+                "retryCount": 1,
+                "origin": "upload_service",
+                "filesWritten": [
+                    format!("{}/wiki/entities/private.md", project_path),
+                    "/Users/alice/Documents/leaked.md",
+                    "wiki/entities/kept.md"
+                ]
+            })])
+            .expect("queue json should serialize"),
+        )
+        .expect("queue file should be written");
+
+        let response = EmbeddedMcpTools
+            .llm_wiki_get_ingest_task(&state, "task-private", None)
+            .expect("task query should succeed");
+        let task = response.task.expect("task should be returned");
+        let serialized = serde_json::to_string(&task).expect("task should serialize");
+
+        assert_eq!(task.source_name, "private.docx");
+        assert_eq!(
+            task.files_written,
+            Some(vec![
+                "wiki/entities/private.md".to_string(),
+                "leaked.md".to_string(),
+                "wiki/entities/kept.md".to_string(),
+            ])
+        );
+        assert!(task.error.as_deref().unwrap_or("").contains("<source>"));
+        assert!(!serialized.contains("sourcePath"));
+        assert!(!serialized.contains(&project_path));
+        assert!(!serialized.contains("/Users/alice"));
+    }
+
+    #[test]
     fn ingest_queue_errors_do_not_expose_project_path() {
         let project = TempWikiProject::new("ingest-queue-error");
         let project_path = project.path_string();
@@ -2611,11 +2968,13 @@ OpenAI builds GPT models and AI systems.
         let state = state_with_current_project(path);
 
         let err = EmbeddedMcpTools
-            .llm_wiki_search(&state, "OpenAI", None, None, None)
+            .llm_wiki_search(&state, "OpenAI", None, None)
             .expect_err("invalid current project should fail");
 
         assert_eq!(err.code, McpToolErrorCode::InvalidInput);
-        assert!(err.message.contains("Current project is not a valid LLM Wiki project."));
+        assert!(err
+            .message
+            .contains("Current project is not a valid LLM Wiki project."));
         assert!(!err.message.contains(path));
     }
 
@@ -2645,7 +3004,6 @@ title: 低空政务一体化
                 None,
                 Some(5),
                 Some(1_000),
-                None,
             )
             .expect("context query should succeed");
 
@@ -2779,6 +3137,15 @@ title: 低空政务一体化
             .collect::<Vec<_>>();
         assert!(tool_names.contains(&"llm_wiki_get_upload_guide"));
         assert!(!tool_names.contains(&"llm_wiki_ingest_source"));
+        let search_tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "llm_wiki_search")
+            .expect("search tool should be listed");
+        let search_schema =
+            serde_json::to_value(&search_tool.input_schema).expect("schema should serialize");
+        assert!(search_schema["properties"].get("mode").is_none());
+        assert!(search_schema["properties"].get("project_path").is_none());
+        assert!(search_schema["properties"].get("project_id").is_some());
 
         let guide_result = client
             .call_tool(CallToolRequestParams::new("llm_wiki_get_upload_guide"))
@@ -2807,8 +3174,7 @@ title: 低空政务一体化
         );
 
         let search_arguments = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
-            "query": "OpenAI",
-            "mode": "keyword"
+            "query": "OpenAI"
         }))
         .expect("search args should deserialize");
         let search_result = client
@@ -2823,6 +3189,7 @@ title: 低空政务一体化
             .structured_content
             .expect("search should include structured content");
         assert_eq!(structured["projectId"], project_public_id(&project_path));
+        assert!(structured.get("mode").is_none());
         assert_eq!(structured["results"][0]["title"], "OpenAI");
 
         let read_arguments = serde_json::from_value::<serde_json::Map<String, Value>>(json!({

@@ -41,6 +41,8 @@ pub fn run() {
             if let Ok(dir) = app.path().resource_dir() {
                 commands::fs::set_resource_dir_hint(dir);
             }
+            let mcp = app.state::<mcp_server::McpRuntimeManager>();
+            mcp.attach_app_handle(app.handle().clone());
             // Registry of running `claude` subprocesses, keyed by the
             // frontend-generated stream id. Populated by claude_cli_spawn,
             // drained on process exit or by claude_cli_kill.
@@ -85,11 +87,10 @@ pub fn run() {
             mcp_server::mcp_update_project,
             mcp_server::mcp_update_known_projects,
             mcp_server::mcp_update_config,
+            mcp_server::mcp_complete_retrieval,
             file_receiver_server::file_receiver_status,
             file_receiver_server::file_receiver_update_config,
             file_receiver_server::file_receiver_update_known_projects,
-            file_receiver_server::list_uploads,
-            file_receiver_server::get_upload,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

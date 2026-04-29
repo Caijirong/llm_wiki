@@ -441,18 +441,7 @@ curl -X POST http://127.0.0.1:18765/uploads \
   -F 'file=@/absolute/path/to/source.pdf'
 ```
 
-For semantic or hybrid retrieval, also set embedding config so the embedded service can embed the query and search the existing LanceDB index under `.llm-wiki/lancedb`:
-
-```bash
-LLM_WIKI_EMBEDDING_ENDPOINT=http://127.0.0.1:11434/v1/embeddings \
-LLM_WIKI_EMBEDDING_MODEL=text-embedding-3-small \
-LLM_WIKI_EMBEDDING_API_KEY=optional-key \
-  npm run tauri dev
-```
-
-`llm_wiki_search` and `llm_wiki_get_context` support `mode: "keyword" | "semantic" | "hybrid"`. `hybrid` is the recommended default. If embedding config is missing, hybrid falls back to keyword-only retrieval.
-
-This first version is read-only. It does not ingest or modify wiki content.
+`llm_wiki_search` and `llm_wiki_get_context` use the same retrieval path as in-app chat. If embeddings are enabled in Settings, MCP queries get the same vector/RRF behavior; if embeddings are disabled, they use the same token + graph retrieval as chat. The query tools are read-only; imports happen through `/uploads` and can be monitored with the ingest queue tools.
 
 ## Quick Start
 
