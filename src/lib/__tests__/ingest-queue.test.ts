@@ -234,6 +234,24 @@ describe("ingest queue restore and persistence compatibility", () => {
     expect(typeof persistedTask.finishedAt).toBe("number")
   })
 
+  it("passes Windows drive-letter source paths to autoIngest without project prefix", async () => {
+    ingestMocks.autoIngest.mockResolvedValue(["wiki/sources/windows-doc.md"])
+    fsMocks.readFile.mockRejectedValue(new Error("queue file not found"))
+
+    const { enqueueIngest, getQueueSummary } = await import("@/lib/ingest-queue")
+    await enqueueIngest(
+      "C:/wiki/tct-ai",
+      "C:/wiki/tct-ai/raw/sources/word模板/1-建设方案/望城区“智慧低空”政务场景应用服务项目建设方案-V1.docx",
+      "word模板",
+    )
+    await waitUntil(() => getQueueSummary().done === 1)
+
+    expect(ingestMocks.autoIngest).toHaveBeenCalledTimes(1)
+    expect(ingestMocks.autoIngest.mock.calls[0]?.[1]).toBe(
+      "C:/wiki/tct-ai/raw/sources/word模板/1-建设方案/望城区“智慧低空”政务场景应用服务项目建设方案-V1.docx",
+    )
+  })
+
   it("keeps active distinct from history while total also includes failed visibility", async () => {
     ingestMocks.autoIngest.mockImplementation(
       () => new Promise<string[]>((_resolve) => {}),

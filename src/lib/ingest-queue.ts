@@ -190,7 +190,9 @@ export async function cancelTask(projectPath: string, taskId: string): Promise<v
       const { deleteFile } = await import("@/commands/fs")
       for (const filePath of lastWrittenFiles) {
         try {
-          const fullPath = filePath.startsWith("/") ? filePath : `${normalizePath(projectPath)}/${filePath}`
+          const fullPath = isAbsolutePath(filePath)
+            ? normalizePath(filePath)
+            : `${normalizePath(projectPath)}/${normalizePath(filePath)}`
           await deleteFile(fullPath)
         } catch {
           // file may not exist
@@ -356,6 +358,20 @@ export async function syncQueueFromDisk(projectPath: string): Promise<void> {
 
 const MAX_RETRIES = 3
 
+function isAbsolutePath(path: string): boolean {
+  const normalized = normalizePath(path)
+  return normalized.startsWith("/")
+    || normalized.startsWith("//")
+    || /^[A-Za-z]:\//.test(normalized)
+}
+
+function resolveSourcePath(projectPath: string, sourcePath: string): string {
+  const normalizedSourcePath = normalizePath(sourcePath)
+  return isAbsolutePath(normalizedSourcePath)
+    ? normalizedSourcePath
+    : `${normalizePath(projectPath)}/${normalizedSourcePath}`
+}
+
 async function processNext(projectPath: string): Promise<void> {
   if (processing) return
 
@@ -381,9 +397,7 @@ async function processNext(projectPath: string): Promise<void> {
     return
   }
 
-  const fullSourcePath = next.sourcePath.startsWith("/")
-    ? next.sourcePath
-    : `${pp}/${next.sourcePath}`
+  const fullSourcePath = resolveSourcePath(pp, next.sourcePath)
 
   console.log(`[Ingest Queue] Processing: ${next.sourcePath} (${queue.filter((t) => t.status === "pending").length} remaining)`)
 
