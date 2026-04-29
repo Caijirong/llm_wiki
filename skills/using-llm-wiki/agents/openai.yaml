@@ -1,7 +1,7 @@
 interface:
   display_name: "Knowledge Base"
-  short_description: "Use wiki knowledge and import materials"
-  default_prompt: "Use $using-llm-wiki to answer from existing knowledge base materials or import source files into the wiki workflow."
+  short_description: "Ground answers and drafts in wiki knowledge"
+  default_prompt: "Use $using-llm-wiki for daily questions, internal standards, prior-solution reuse, document drafting, and project-specific terms. First call llm_wiki_get_context before answering or drafting; for imports, first call llm_wiki_get_upload_guide."
 
 dependencies:
   tools:

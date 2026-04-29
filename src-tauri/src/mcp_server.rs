@@ -1915,11 +1915,59 @@ fn build_snippet(content: &str, tokens: &[String]) -> String {
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
-    query
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_lowercase())
-        .collect()
+    let mut tokens = Vec::new();
+
+    for token in query.split(|ch: char| !ch.is_alphanumeric()) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        add_query_token(&mut tokens, &token.to_lowercase());
+    }
+
+    tokens
+}
+
+fn add_query_token(tokens: &mut Vec<String>, token: &str) {
+    if token.chars().any(is_cjk_char) {
+        add_cjk_query_tokens(tokens, token);
+    } else {
+        push_unique_token(tokens, token.to_string());
+    }
+}
+
+fn add_cjk_query_tokens(tokens: &mut Vec<String>, token: &str) {
+    let chars = token.chars().collect::<Vec<_>>();
+    if chars.len() <= 1 {
+        push_unique_token(tokens, token.to_string());
+        return;
+    }
+
+    let max_window = chars.len().min(8);
+    for window_size in (2..=max_window).rev() {
+        for window in chars.windows(window_size) {
+            push_unique_token(tokens, window.iter().collect());
+        }
+    }
+}
+
+fn push_unique_token(tokens: &mut Vec<String>, token: String) {
+    if !tokens.iter().any(|existing| existing == &token) {
+        tokens.push(token);
+    }
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2A700}'..='\u{2B73F}'
+            | '\u{2B740}'..='\u{2B81F}'
+            | '\u{2B820}'..='\u{2CEAF}'
+    )
 }
 
 fn normalize_relative_page_path(path_or_id: &str) -> String {
@@ -2569,6 +2617,45 @@ OpenAI builds GPT models and AI systems.
         assert_eq!(err.code, McpToolErrorCode::InvalidInput);
         assert!(err.message.contains("Current project is not a valid LLM Wiki project."));
         assert!(!err.message.contains(path));
+    }
+
+    #[test]
+    fn get_context_matches_chinese_topic_inside_natural_language_query() {
+        let project = TempWikiProject::new("chinese-query");
+        let concept_path = project.path.join("wiki/concepts");
+        fs::create_dir_all(&concept_path).expect("concept dir should be created");
+        fs::write(
+            concept_path.join("low-altitude-government.md"),
+            r#"---
+title: 低空政务一体化
+---
+
+# 低空政务一体化
+
+低空政务一体化通过统一平台协同低空审批、监管、巡检和应急等政务场景。
+"#,
+        )
+        .expect("concept page should be written");
+        let state = state_with_current_project(&project.path_string());
+
+        let response = EmbeddedMcpTools
+            .llm_wiki_get_context(
+                &state,
+                "基于之前的知识告诉我什么是低空政务一体化",
+                None,
+                Some(5),
+                Some(1_000),
+                None,
+            )
+            .expect("context query should succeed");
+
+        assert!(
+            response
+                .pages
+                .iter()
+                .any(|page| page.title == "低空政务一体化"),
+            "natural language Chinese query should return the page for the embedded topic"
+        );
     }
 
     #[test]
