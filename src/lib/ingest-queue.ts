@@ -130,9 +130,7 @@ export async function cleanupWrittenFiles(
 ): Promise<void> {
   const { cascadeDeleteWikiPage } = await import("@/lib/wiki-page-delete")
   for (const filePath of filePaths) {
-    const fullPath = isAbsolutePath(filePath)
-      ? normalizePath(filePath)
-      : `${projectPath}/${filePath}`
+    const fullPath = resolvePath(projectPath, filePath)
     try {
       await cascadeDeleteWikiPage(projectPath, fullPath)
     } catch {
@@ -530,6 +528,13 @@ export async function syncQueueFromDisk(
 
 const MAX_RETRIES = 3
 
+function resolvePath(projectPath: string, childPath: string): string {
+  const normalizedChildPath = normalizePath(childPath)
+  return isAbsolutePath(normalizedChildPath)
+    ? normalizedChildPath
+    : `${normalizePath(projectPath)}/${normalizedChildPath}`
+}
+
 async function onQueueDrained(projectId: string, projectPath: string): Promise<void> {
   if (!processedSinceDrain) return
   // Stale-context guard — if we switched projects mid-drain, the sweep
@@ -604,9 +609,7 @@ async function processNext(projectId: string): Promise<void> {
     return
   }
 
-  const fullSourcePath = isAbsolutePath(next.sourcePath)
-    ? normalizePath(next.sourcePath)
-    : `${pp}/${next.sourcePath}`
+  const fullSourcePath = resolvePath(pp, next.sourcePath)
 
   console.log(`[Ingest Queue] Processing: ${next.sourcePath} (${queue.filter((t) => t.projectId === projectId && t.status === "pending").length} remaining)`)
 

@@ -27,7 +27,9 @@ import {
   loadActivePresetId,
   loadFileReceiverConfig,
   loadMcpConfig,
+  saveFileReceiverConfig,
 } from "@/lib/project-store"
+import { normalizeFileReceiverConfigForMcp } from "@/lib/runtime-service-config"
 import { loadReviewItems, loadChatHistory } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
@@ -35,6 +37,7 @@ import { AppLayout } from "@/components/layout/app-layout"
 import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
 import type { WikiProject } from "@/types/wiki"
+import type { FileReceiverConfig } from "@/stores/wiki-store"
 
 function App() {
   const project = useWikiStore((s) => s.project)
@@ -305,8 +308,17 @@ function App() {
         }
         setMcpConfigLoaded(true)
         const savedFileReceiverConfig = await loadFileReceiverConfig()
-        if (savedFileReceiverConfig) {
-          useWikiStore.getState().setFileReceiverConfig(savedFileReceiverConfig)
+        const normalizedFileReceiverConfig = normalizeFileReceiverConfigForMcp(
+          useWikiStore.getState().mcpConfig,
+          savedFileReceiverConfig,
+        )
+        useWikiStore.getState().setFileReceiverConfig(normalizedFileReceiverConfig)
+        if (hasFileReceiverConfigChanged(savedFileReceiverConfig, normalizedFileReceiverConfig)) {
+          try {
+            await saveFileReceiverConfig(normalizedFileReceiverConfig)
+          } catch (err) {
+            console.error("Failed to persist normalized file receiver config:", err)
+          }
         }
         setFileReceiverConfigLoaded(true)
         const recentProjects = await getRecentProjects()
@@ -495,3 +507,18 @@ function App() {
 }
 
 export default App
+
+function hasFileReceiverConfigChanged(
+  savedConfig: FileReceiverConfig | null,
+  normalizedConfig: FileReceiverConfig,
+): boolean {
+  if (!savedConfig) return true
+
+  return (
+    savedConfig.enabled !== normalizedConfig.enabled ||
+    savedConfig.autoStart !== normalizedConfig.autoStart ||
+    savedConfig.staticToken !== normalizedConfig.staticToken ||
+    savedConfig.maxFileSizeBytes !== normalizedConfig.maxFileSizeBytes ||
+    savedConfig.uploadTtlHours !== normalizedConfig.uploadTtlHours
+  )
+}

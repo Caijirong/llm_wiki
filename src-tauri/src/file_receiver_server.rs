@@ -967,10 +967,11 @@ fn authorize(
     shared_state: &FileReceiverSharedState,
 ) -> Result<(), StatusCode> {
     let config = shared_state.config();
-    if !config.enabled || !config.auto_start {
+    let expected_token = config.static_token.trim();
+    if !config.enabled || expected_token.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let expected_bearer = format!("Bearer {}", config.static_token);
+    let expected_bearer = format!("Bearer {}", expected_token);
     let provided_bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -981,7 +982,7 @@ fn authorize(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
 
-    if provided_bearer == expected_bearer || provided_custom == config.static_token {
+    if provided_bearer == expected_bearer || provided_custom == expected_token {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -1496,7 +1497,7 @@ impl FileReceiverRuntimeCore {
         self.server_state
             .set_known_projects(self.known_projects.clone());
 
-        if !self.config.enabled || !self.config.auto_start {
+        if !self.config.enabled {
             self.status = FileReceiverStatus::Stopped;
             self.last_error = None;
             return;
@@ -1916,6 +1917,21 @@ mod tests {
         assert_eq!(queue[0]["status"], "pending");
         assert_eq!(queue[0]["origin"], "upload_service");
         assert_eq!(queue[0]["sourcePath"], "raw/sources/report.pdf");
+    }
+
+    #[tokio::test]
+    async fn upload_authorization_does_not_depend_on_legacy_auto_start() {
+        let project = TempWikiProject::new("upload-legacy-auto-start");
+        let mut config = test_file_receiver_config();
+        config.auto_start = false;
+
+        let response = post_test_upload(
+            test_app_with_config(config, vec![project.path_string()]),
+            valid_upload_body(&project.path_string(), "manual.pdf", b"hello"),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]

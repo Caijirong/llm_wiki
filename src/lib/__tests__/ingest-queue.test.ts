@@ -189,6 +189,10 @@ describe("ingest queue source path resolution", () => {
   it.each([
     ["/Users/me/source.docx", "/Users/me/source.docx"],
     ["C:/Users/me/source.docx", "C:/Users/me/source.docx"],
+    [
+      "C:/wiki/tct-ai/raw/sources/word模板/1-建设方案/望城区“智慧低空”政务场景应用服务项目建设方案-V1.docx",
+      "C:/wiki/tct-ai/raw/sources/word模板/1-建设方案/望城区“智慧低空”政务场景应用服务项目建设方案-V1.docx",
+    ],
     ["//server/share/source.docx", "//server/share/source.docx"],
     ["raw/sources/source.docx", `${TEST_PATH}/raw/sources/source.docx`],
   ])("passes %s to autoIngest as %s", async (sourcePath, expectedFullPath) => {
