@@ -113,7 +113,7 @@ describe("ingest queue MCP history compatibility", () => {
     })
   })
 
-  it("pulls externally appended MCP tasks from disk and records success metadata", async () => {
+  it("pulls externally appended upload service tasks from disk and records success metadata", async () => {
     let queueReadCount = 0
     fsMocks.readFile.mockImplementation(async (filePath: string) => {
       if (!String(filePath).includes(".llm-wiki/ingest-queue.json")) {
@@ -127,7 +127,7 @@ describe("ingest queue MCP history compatibility", () => {
           sourcePath: "raw/sources/external.pdf",
           folderContext: "Inbox",
           status: "pending",
-          origin: "mcp",
+          origin: "upload_service",
         }),
       ])
     })
@@ -159,9 +159,28 @@ describe("ingest queue MCP history compatibility", () => {
     expect(JSON.parse(String(lastWritePayload))[0]).toMatchObject({
       id: "task-external",
       status: "done",
-      origin: "mcp",
+      origin: "upload_service",
       filesWritten: ["wiki/entities/external.md"],
       reviewItemCount: 2,
+    })
+  })
+
+  it("keeps legacy MCP origin metadata when restoring queue history", async () => {
+    fsMocks.readFile.mockResolvedValue(JSON.stringify([
+      makeTask({
+        id: "task-legacy-mcp",
+        status: "done",
+        origin: "mcp",
+      }),
+    ]))
+
+    const { restoreQueue } = await import("@/lib/ingest-queue")
+    await restoreQueue(TEST_ID, TEST_PATH)
+
+    const lastWritePayload = fsMocks.writeFile.mock.calls[fsMocks.writeFile.mock.calls.length - 1]?.[1]
+    expect(JSON.parse(String(lastWritePayload))[0]).toMatchObject({
+      id: "task-legacy-mcp",
+      origin: "mcp",
     })
   })
 })

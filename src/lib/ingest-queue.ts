@@ -18,7 +18,7 @@ export interface IngestTask {
   addedAt: number
   error: string | null
   retryCount: number
-  origin?: "desktop" | "mcp"
+  origin?: "desktop" | "mcp" | "upload_service"
   mimeType?: string
   startedAt?: number
   finishedAt?: number
@@ -81,7 +81,9 @@ function normalizeTask(raw: unknown, projectId: string): IngestTask | null {
     addedAt: typeof task.addedAt === "number" ? task.addedAt : Date.now(),
     error: typeof task.error === "string" ? task.error : null,
     retryCount: typeof task.retryCount === "number" ? task.retryCount : 0,
-    origin: task.origin === "desktop" || task.origin === "mcp" ? task.origin : undefined,
+    origin: task.origin === "desktop" || task.origin === "mcp" || task.origin === "upload_service"
+      ? task.origin
+      : undefined,
     mimeType: typeof task.mimeType === "string" ? task.mimeType : undefined,
     startedAt: typeof task.startedAt === "number" ? task.startedAt : undefined,
     finishedAt: typeof task.finishedAt === "number" ? task.finishedAt : undefined,
