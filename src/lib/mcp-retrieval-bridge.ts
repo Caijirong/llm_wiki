@@ -35,6 +35,14 @@ interface McpRetrievalCompletion {
     purpose: string
     schema: string
     index: string
+    imageUsageInstructions: string
+    knowledgeImages: Array<{
+      id: number
+      title: string
+      alt: string
+      sourcePath: string
+      url: string
+    }>
     pages: Array<{
       exists: boolean
       title: string
@@ -142,6 +150,14 @@ async function buildRendererRetrievalResponse(request: McpRetrievalRequest): Pro
     purpose: context.purpose,
     schema: context.schema,
     index: context.index,
+    imageUsageInstructions: buildMcpImageUsageInstructions(),
+    knowledgeImages: context.knowledgeImages.map((image, index) => ({
+      id: index + 1,
+      title: extractKnowledgeImageTitle(image, index),
+      alt: image.alt,
+      sourcePath: image.sourcePath,
+      url: buildMcpKnowledgeImageUrl(request.projectId, image.url),
+    })),
     pages: context.pages.map((page) => ({
       exists: true,
       title: page.title,
@@ -153,6 +169,40 @@ async function buildRendererRetrievalResponse(request: McpRetrievalRequest): Pro
 
 async function completeRetrieval(completion: McpRetrievalCompletion): Promise<void> {
   await invoke("mcp_complete_retrieval", { completion })
+}
+
+function buildMcpImageUsageInstructions(): string {
+  return [
+    "Related images are available in knowledgeImages.",
+    "Use an image only when it materially helps answer the question.",
+    "If your client supports Markdown image rendering, you may inline it with ![title](url).",
+    "Do not invent image URLs.",
+    "Use each image at most once, in the single most relevant place.",
+    "If image rendering is not supported, cite the image title and URL in text instead.",
+  ].join(" ")
+}
+
+function buildMcpKnowledgeImageUrl(projectId: string, rawUrl: string): string {
+  const normalizedPath = rawUrl.replace(/^\.?\//, "")
+  const encodedSegments = normalizedPath
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/")
+  return `http://127.0.0.1:19827/wiki-media/${encodeURIComponent(projectId)}/${encodedSegments}`
+}
+
+function extractKnowledgeImageTitle(
+  image: { alt: string; sourceTitle: string },
+  index: number,
+): string {
+  const normalized = image.alt.replace(/[\r\n]+/g, " ").trim()
+  if (!normalized) return `Image ${index + 1} from ${image.sourceTitle}`
+  const sentenceEnd = normalized.search(/[。！？]|(?<!\d)[.!?](?!\d)/)
+  const title = sentenceEnd > 0
+    ? normalized.slice(0, sentenceEnd)
+    : normalized
+  return title.slice(0, 80).trim()
 }
 
 function isRetrievalRequest(value: unknown): value is McpRetrievalRequest {

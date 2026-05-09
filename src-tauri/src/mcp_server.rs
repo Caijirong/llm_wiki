@@ -293,7 +293,19 @@ pub struct McpContextResponse {
     pub purpose: String,
     pub schema: String,
     pub index: String,
+    pub image_usage_instructions: String,
+    pub knowledge_images: Vec<McpKnowledgeImage>,
     pub pages: Vec<McpPage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpKnowledgeImage {
+    pub id: usize,
+    pub title: String,
+    pub alt: String,
+    pub source_path: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -326,6 +338,8 @@ pub struct McpRendererRetrievalResponse {
     pub purpose: String,
     pub schema: String,
     pub index: String,
+    pub image_usage_instructions: String,
+    pub knowledge_images: Vec<McpKnowledgeImage>,
     pub pages: Vec<McpPage>,
 }
 
@@ -612,6 +626,8 @@ impl EmbeddedMcpServer {
                 purpose: renderer.purpose,
                 schema: renderer.schema,
                 index: renderer.index,
+                image_usage_instructions: renderer.image_usage_instructions,
+                knowledge_images: renderer.knowledge_images,
                 pages: renderer.pages.into_iter().take(page_limit).collect(),
             }),
             Err(_) => {
@@ -1525,6 +1541,8 @@ impl EmbeddedMcpTools {
             purpose,
             schema,
             index,
+            image_usage_instructions: mcp_image_usage_instructions(),
+            knowledge_images: collect_mcp_knowledge_images(&project_path, &pages, query),
             pages,
         })
     }
@@ -2167,6 +2185,171 @@ fn build_snippet(content: &str, tokens: &[String]) -> String {
         .find(|line| !line.is_empty())
         .map(|line| truncate_chars(line, 220))
         .unwrap_or_default()
+}
+
+fn mcp_image_usage_instructions() -> String {
+    [
+        "Related images are available in knowledgeImages.",
+        "Use an image only when it materially helps answer the question.",
+        "If your client supports Markdown image rendering, you may inline it with ![title](url).",
+        "Do not invent image URLs.",
+        "Use each image at most once, in the single most relevant place.",
+        "If image rendering is not supported, cite the image title and URL in text instead.",
+    ]
+    .join(" ")
+}
+
+fn collect_mcp_knowledge_images(
+    project_path: &str,
+    pages: &[McpPage],
+    query: &str,
+) -> Vec<McpKnowledgeImage> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ranked: Vec<(usize, McpKnowledgeImage)> = Vec::new();
+    let mut supporting: Vec<McpKnowledgeImage> = Vec::new();
+    let project_id = project_public_id(project_path);
+
+    for page in pages {
+        for (url, alt) in extract_markdown_images(&page.content) {
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            let image = McpKnowledgeImage {
+                id: 0,
+                title: extract_mcp_knowledge_image_title(&alt, &page.title, ranked.len() + supporting.len()),
+                alt: alt.clone(),
+                source_path: format!("wiki/{}", page.relative_path),
+                url: build_clip_server_image_url(&project_id, &url),
+            };
+            let score = mcp_image_query_score(&alt, query);
+            if score > 0 {
+                ranked.push((score, image));
+            } else {
+                supporting.push(image);
+            }
+        }
+    }
+
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    ranked
+        .into_iter()
+        .map(|(_, image)| image)
+        .chain(supporting)
+        .take(5)
+        .enumerate()
+        .map(|(index, mut image)| {
+            image.id = index + 1;
+            image
+        })
+        .collect()
+}
+
+fn extract_markdown_images(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("![") {
+        let after_bang = &rest[start + 2..];
+        let Some(alt_end) = after_bang.find(']') else {
+            break;
+        };
+        let alt = after_bang[..alt_end].trim().to_string();
+        let after_alt = &after_bang[alt_end + 1..];
+        if !after_alt.starts_with('(') {
+            rest = after_alt;
+            continue;
+        }
+        let Some(url_end) = after_alt[1..].find(')') else {
+            break;
+        };
+        let url = after_alt[1..1 + url_end].trim().to_string();
+        if !url.is_empty() {
+            out.push((url, alt));
+        }
+        rest = &after_alt[1 + url_end + 1..];
+    }
+    out
+}
+
+fn extract_mcp_knowledge_image_title(alt: &str, source_title: &str, index: usize) -> String {
+    let normalized = alt.replace(['\r', '\n'], " ").trim().to_string();
+    if normalized.is_empty() {
+        return format!("Image {} from {}", index + 1, source_title);
+    }
+    let sentence_end = normalized
+        .find(['。', '！', '？'])
+        .or_else(|| normalized.find(". "))
+        .or_else(|| normalized.find("! "))
+        .or_else(|| normalized.find("? "));
+    let title = sentence_end
+        .map(|end| normalized[..end].trim().to_string())
+        .unwrap_or(normalized);
+    title.chars().take(80).collect()
+}
+
+fn build_clip_server_image_url(project_id: &str, raw_url: &str) -> String {
+    let encoded_project_id = percent_encode_path_segment(project_id);
+    let encoded_path = raw_url
+        .trim_start_matches("./")
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "http://127.0.0.1:19827/wiki-media/{}/{}",
+        encoded_project_id, encoded_path
+    )
+}
+
+fn percent_encode_path_segment(segment: &str) -> String {
+    let mut out = String::new();
+    for byte in segment.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            out.push(ch);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", byte));
+        }
+    }
+    out
+}
+
+fn mcp_image_query_score(image_alt: &str, query: &str) -> usize {
+    let alt_lower = image_alt.to_lowercase();
+    let normalized_query = normalize_query_phrase(query);
+    if alt_lower.is_empty() || normalized_query.is_empty() {
+        return 0;
+    }
+
+    let mut score = if alt_lower.contains(&normalized_query) {
+        10_000 + normalized_query.len()
+    } else {
+        0
+    };
+
+    for token in tokenize_query(query) {
+        if alt_lower.contains(&token) {
+            score += if token.len() > 1 { token.len() * 2 } else { 1 };
+        }
+    }
+
+    score
+}
+
+fn normalize_query_phrase(query: &str) -> String {
+    query
+        .trim()
+        .to_lowercase()
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ',' | '，' | '。' | '！' | '？' | '、' | '；' | '：' | '"' | '\'' | '（'
+                        | '）' | '(' | ')' | '-' | '_' | '/' | '\\' | '·' | '~' | '～' | '…'
+                )
+        })
+        .to_string()
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
@@ -3068,6 +3251,49 @@ title: 低空政务一体化
                 .any(|page| page.title == "低空政务一体化"),
             "natural language Chinese query should return the page for the embedded topic"
         );
+    }
+
+    #[test]
+    fn get_context_includes_knowledge_images_with_clip_server_urls() {
+        let project = TempWikiProject::new("context-images");
+        let source_path = project.path.join("wiki/sources");
+        let media_path = project.path.join("wiki/media/project-plan");
+        fs::create_dir_all(&source_path).expect("source dir should be created");
+        fs::create_dir_all(&media_path).expect("media dir should be created");
+        fs::write(media_path.join("img-2.png"), b"png")
+            .expect("image file should be written");
+        fs::write(
+            source_path.join("project-plan.md"),
+            r#"---
+title: Project Plan
+---
+
+# Project Plan
+
+![图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。](media/project-plan/img-2.png)
+"#,
+        )
+        .expect("source page should be written");
+        let state = state_with_current_project(&project.path_string());
+
+        let response = EmbeddedMcpTools
+            .llm_wiki_get_context(&state, "无人机采集作业流程图", None, Some(5), Some(1_000))
+            .expect("context query should succeed");
+
+        assert_eq!(response.knowledge_images.len(), 1);
+        let image = &response.knowledge_images[0];
+        assert_eq!(image.id, 1);
+        assert_eq!(image.title, "图 3.2-5 无人机采集作业流程图");
+        assert_eq!(
+            image.url,
+            format!(
+                "http://127.0.0.1:19827/wiki-media/{}/media/project-plan/img-2.png",
+                project_public_id(&project.path_string())
+            )
+        );
+        assert!(response
+            .image_usage_instructions
+            .contains("If your client supports Markdown image rendering"));
     }
 
     #[test]

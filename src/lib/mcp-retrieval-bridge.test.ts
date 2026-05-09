@@ -122,6 +122,8 @@ describe("startMcpRetrievalBridge", () => {
               content: expect.stringContaining("IO-aware tiled attention"),
             }),
           ]),
+          imageUsageInstructions: expect.stringContaining("If your client supports Markdown image rendering"),
+          knowledgeImages: [],
         }),
       }),
     })
@@ -140,5 +142,60 @@ describe("startMcpRetrievalBridge", () => {
 
     stopSecond()
     expect(listeners.has(MCP_RETRIEVAL_REQUEST_EVENT)).toBe(false)
+  })
+
+  it("includes matching knowledge images with clip-server urls in MCP context responses", async () => {
+    const projectPath = await writeProject({
+      "purpose.md": "# Purpose\nAnswer from the wiki.",
+      "schema.md": "# Schema\n",
+      "wiki/index.md": "# Index\n- [[project-plan]]\n",
+      "wiki/sources/project-plan.md": [
+        "---",
+        "title: Project Plan",
+        "type: source",
+        "---",
+        "",
+        "# Project Plan",
+        "",
+        "![图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。](media/project-plan/img-2.png)",
+      ].join("\n"),
+    })
+
+    mockSearchByEmbedding.mockResolvedValueOnce([])
+
+    const stop = await startMcpRetrievalBridge()
+    const handler = listeners.get(MCP_RETRIEVAL_REQUEST_EVENT)
+
+    await handler?.({
+      payload: {
+        requestId: "req-images",
+        kind: "context",
+        projectId: "wiki-test",
+        projectPath,
+        query: "无人机采集作业流程图",
+        maxPages: 5,
+        pageCharLimit: 4_000,
+      },
+    })
+
+    expect(mockInvoke).toHaveBeenCalledWith("mcp_complete_retrieval", {
+      completion: expect.objectContaining({
+        requestId: "req-images",
+        ok: true,
+        response: expect.objectContaining({
+          knowledgeImages: [
+            expect.objectContaining({
+              id: 1,
+              title: "图 3.2-5 无人机采集作业流程图",
+              alt: "图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。",
+              sourcePath: "wiki/sources/project-plan.md",
+              url: "http://127.0.0.1:19827/wiki-media/wiki-test/media/project-plan/img-2.png",
+            }),
+          ],
+        }),
+      }),
+    })
+
+    stop()
   })
 })
