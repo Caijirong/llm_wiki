@@ -13,6 +13,10 @@ vi.mock("./embedding", () => ({
 }))
 
 import { buildChatRetrievalContext } from "./chat-retrieval"
+import {
+  appendKnowledgeImagesToAnswer,
+  formatKnowledgeImageMarkdown,
+} from "./chat-retrieval"
 import { clearGraphCache } from "./graph-relevance"
 import { useWikiStore } from "@/stores/wiki-store"
 
@@ -101,5 +105,123 @@ describe("buildChatRetrievalContext", () => {
       { title: "Alpha", path: "wiki/concepts/alpha.md" },
       { title: "Beta", path: "wiki/concepts/beta.md" },
     ])
+  })
+
+  it("surfaces matching images as renderable knowledge results", async () => {
+    const projectPath = await writeProject({
+      "purpose.md": "# Purpose\n",
+      "schema.md": "# Schema\n",
+      "wiki/index.md": "# Index\n",
+      "wiki/sources/project-plan.md": [
+        "---",
+        "title: Project Plan",
+        "type: source",
+        "---",
+        "",
+        "# Project Plan",
+        "",
+        "低空政务平台说明。",
+        "",
+        "![智慧低空政务场景总体架构图，包含感知、调度和服务应用三层。](media/project-plan/img-7.png)",
+      ].join("\n"),
+    })
+
+    mockSearchByEmbedding.mockResolvedValueOnce([])
+
+    const context = await buildChatRetrievalContext({
+      projectPath,
+      query: "智慧低空政务场景总体架构图",
+      maxContextSize: 40_000,
+    })
+
+    expect(context.knowledgeImages).toEqual([
+      {
+        url: "media/project-plan/img-7.png",
+        alt: "智慧低空政务场景总体架构图，包含感知、调度和服务应用三层。",
+        sourceTitle: "Project Plan",
+        sourcePath: "wiki/sources/project-plan.md",
+      },
+    ])
+    expect(formatKnowledgeImageMarkdown(context.knowledgeImages)).toContain(
+      "![智慧低空政务场景总体架构图，包含感知、调度和服务应用三层。](media/project-plan/img-7.png)",
+    )
+  })
+
+  it("keeps an exact image-alt source hit even when vector results rank concept pages first", async () => {
+    const projectPath = await writeProject({
+      "purpose.md": "# Purpose\n",
+      "schema.md": "# Schema\n",
+      "wiki/index.md": "# Index\n",
+      "wiki/sources/project-plan.md": [
+        "---",
+        "title: Project Plan",
+        "type: source",
+        "---",
+        "",
+        "# Project Plan",
+        "",
+        "![望城区智慧低空项目封面图，画面中有多架无人机在城市上空飞行。](media/project-plan/img-1.png)",
+        "",
+        "![图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。](media/project-plan/img-2.png)",
+      ].join("\n"),
+      "wiki/concepts/drone-ops.md": [
+        "---",
+        "title: 无人机作业",
+        "type: concept",
+        "---",
+        "",
+        "# 无人机作业",
+        "",
+        "无人机作业涉及采集、流程、数据处理和业务闭环。",
+      ].join("\n"),
+    })
+
+    mockSearchByEmbedding.mockResolvedValueOnce([
+      { id: "drone-ops", score: 0.98 },
+      { id: "project-plan", score: 0.2 },
+    ])
+
+    const context = await buildChatRetrievalContext({
+      projectPath,
+      query: "无人机采集作业流程图",
+      maxContextSize: 40_000,
+      searchLimit: 1,
+    })
+
+    expect(context.knowledgeImages[0]).toEqual({
+      url: "media/project-plan/img-2.png",
+      alt: "图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。",
+      sourceTitle: "Project Plan",
+      sourcePath: "wiki/sources/project-plan.md",
+    })
+    expect(context.knowledgeImages[1]?.url).toBe("media/project-plan/img-1.png")
+    expect(context.pages.map((page) => page.path)).toContain(
+      "wiki/sources/project-plan.md",
+    )
+    expect(context.pages.map((page) => page.path)).toEqual([
+      "wiki/sources/project-plan.md",
+      "wiki/concepts/drone-ops.md",
+    ])
+    expect(context.references.map((ref) => ref.path)).toEqual([
+      "wiki/sources/project-plan.md",
+      "wiki/concepts/drone-ops.md",
+    ])
+  })
+
+  it("appends matching image markdown to chat answers exactly once", () => {
+    const imageMarkdown = [
+      "### Image 1: Project Plan",
+      "![智慧低空政务场景总体架构图](media/project-plan/img-7.png)",
+      "Source: wiki/sources/project-plan.md",
+    ].join("\n")
+
+    const answer = appendKnowledgeImagesToAnswer(
+      "该图片描述的是智慧低空政务场景总体架构。",
+      imageMarkdown,
+    )
+
+    expect(answer).toContain("## Related Images")
+    expect(answer).toContain("![智慧低空政务场景总体架构图](media/project-plan/img-7.png)")
+    expect(appendKnowledgeImagesToAnswer(answer, imageMarkdown)).toBe(answer)
   })
 })

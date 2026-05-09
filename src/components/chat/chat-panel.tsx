@@ -11,7 +11,10 @@ import { listDirectory, deleteFile } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { getOutputLanguage, buildLanguageReminder } from "@/lib/output-language"
 import { isGreeting } from "@/lib/greeting-detector"
-import { buildChatRetrievalContext } from "@/lib/chat-retrieval"
+import {
+  appendKnowledgeImagesToAnswer,
+  buildChatRetrievalContext,
+} from "@/lib/chat-retrieval"
 
 // Store the page mapping from the last query so SourceFilesBar can show which pages were cited
 export let lastQueryPages: { title: string; path: string }[] = []
@@ -167,6 +170,7 @@ export function ChatPanel() {
       const systemMessages: LLMMessage[] = []
       let queryRefs: { title: string; path: string }[] = []
       let langReminder: string | undefined
+      let retrievalImageMarkdown = ""
       // Pure greetings ("hi", "你好", "嗨") don't warrant running the whole
       // retrieval pipeline — it's slow, costs context, and drags in random
       // wiki pages the user clearly didn't ask about. Short-circuit with a
@@ -207,6 +211,7 @@ export function ChatPanel() {
             "- If the provided pages don't contain enough information, say so honestly.",
             "- Use [[wikilink]] syntax to reference wiki pages.",
             "- When citing information, use the page number in brackets, e.g. [1], [2].",
+            "- Related Images are delivered by the app after your response; use their descriptions as evidence when relevant, but don't repeat the image markdown yourself.",
             "- At the VERY END of your response, add a hidden comment listing which page numbers you used:",
             "  <!-- cited: 1, 3, 5 -->",
             "",
@@ -216,6 +221,9 @@ export function ChatPanel() {
             retrieval.index ? `## Wiki Index\n${retrieval.index}` : "",
             retrieval.pages.length > 0 ? `## Page List\n${retrieval.pageList}` : "",
             `## Wiki Pages\n\n${retrieval.pagesContext}`,
+            retrieval.knowledgeImagesMarkdown
+              ? `## Related Images\n\n${retrieval.knowledgeImagesMarkdown}`
+              : "",
             "",
             "---",
             "",
@@ -232,6 +240,7 @@ export function ChatPanel() {
         // Reminder injected later, right before the user's current message
         // (after history so it's the last system instruction the LLM sees).
         langReminder = buildLanguageReminder(text)
+        retrievalImageMarkdown = retrieval.knowledgeImagesMarkdown
 
         lastQueryPages = retrieval.references.map((p) => ({ title: p.title, path: p.path }))
         queryRefs = [...lastQueryPages]
@@ -278,6 +287,10 @@ export function ChatPanel() {
             appendStreamToken(token)
           },
           onDone: () => {
+            accumulated = appendKnowledgeImagesToAnswer(
+              accumulated,
+              retrievalImageMarkdown,
+            )
             finalizeStream(accumulated, queryRefs)
             abortRef.current = null
             // save-worthy detection removed — user has direct "Save to Wiki" button on each message

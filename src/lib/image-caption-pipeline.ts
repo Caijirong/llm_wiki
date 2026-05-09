@@ -23,10 +23,11 @@
  *
  * Cache file lives at
  *   `<project>/.llm-wiki/image-caption-cache.json`
- * keyed `{ "<sha256>": { caption, mimeType, model, capturedAt } }`.
- * The model + capturedAt fields aren't read by anything yet but
- * shipping the metadata now means we can implement Phase 4's
- * "re-caption with new model" without a second cache version.
+ * keyed `{ "<sha256>": { caption, mimeType, model, outputLanguage,
+ * capturedAt } }`. `outputLanguage` is part of cache validity: if
+ * the user switches AI output language from English to Chinese, the
+ * same image must be captioned again instead of reusing stale prose
+ * in the wrong language.
  *
  * Why JSON-on-disk and not LanceDB / sqlite: the cache is small
  * (10s of KB on real corpora), human-readable for debugging
@@ -43,6 +44,7 @@ interface CaptionEntry {
   caption: string
   mimeType: string
   model: string
+  outputLanguage?: string
   capturedAt: string
 }
 
@@ -79,13 +81,28 @@ async function sha256OfBase64(b64: string): Promise<string> {
  */
 export async function loadCaptionCache(
   projectPath: string,
+  outputLanguage?: string,
 ): Promise<Map<string, string>> {
   const cache = await readCache(projectPath)
   const out = new Map<string, string>()
   for (const [hash, entry] of Object.entries(cache)) {
+    if (!captionCacheEntryMatchesLanguage(entry, outputLanguage)) continue
     out.set(hash, entry.caption)
   }
   return out
+}
+
+function normalizeCaptionLanguage(outputLanguage?: string): string {
+  return (outputLanguage ?? "auto").trim() || "auto"
+}
+
+function captionCacheEntryMatchesLanguage(
+  entry: CaptionEntry,
+  outputLanguage?: string,
+): boolean {
+  const requested = normalizeCaptionLanguage(outputLanguage)
+  if (requested === "auto") return true
+  return entry.outputLanguage === requested
 }
 
 async function readCache(projectPath: string): Promise<CaptionCache> {
@@ -267,6 +284,8 @@ export interface CaptionPipelineOptions {
    * captioning run looks like the pipeline is stuck.
    */
   onProgress?: (done: number, total: number) => void
+  /** Language for generated image descriptions. */
+  outputLanguage?: string
 }
 
 export interface CaptionPipelineResult {
@@ -370,11 +389,14 @@ export async function captionMarkdownImages(
     }
 
     const hash = await sha256OfBase64(bytes.base64)
+    const outputLanguage = normalizeCaptionLanguage(options?.outputLanguage)
     const hit = cache[hash]
     if (hit) {
-      captionByUrl.set(ref.url, hit.caption)
-      cachedCaptions++
-      return
+      if (captionCacheEntryMatchesLanguage(hit, outputLanguage)) {
+        captionByUrl.set(ref.url, hit.caption)
+        cachedCaptions++
+        return
+      }
     }
 
     // Slice surrounding text for context-aware captioning. We
@@ -389,12 +411,17 @@ export async function captionMarkdownImages(
         bytes.mimeType,
         llmConfig,
         options?.signal,
-        { contextBefore: before, contextAfter: after },
+        {
+          contextBefore: before,
+          contextAfter: after,
+          outputLanguage: options?.outputLanguage,
+        },
       )
       cache[hash] = {
         caption,
         mimeType: bytes.mimeType,
         model: llmConfig.model,
+        outputLanguage,
         capturedAt: new Date().toISOString(),
       }
       captionByUrl.set(ref.url, caption)

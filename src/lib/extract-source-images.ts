@@ -29,6 +29,10 @@ export interface SavedImage {
   /** Absolute filesystem path — used by `convertFileSrc` for preview. */
   absPath: string
   sha256: string
+  /** Text immediately before this image in the source document, when available. */
+  contextBefore?: string
+  /** Text immediately after this image in the source document, when available. */
+  contextAfter?: string
 }
 
 /** File extensions we currently extract images from. Excludes XLS/XLSX

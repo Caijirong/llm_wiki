@@ -44,7 +44,7 @@ function resolveCaptionConfig(
     maxContextSize: mainLlm.maxContextSize,
   }
 }
-import { buildLanguageDirective } from "@/lib/output-language"
+import { buildLanguageDirective, getOutputLanguage } from "@/lib/output-language"
 import { detectLanguage } from "@/lib/detect-language"
 
 // Legacy export kept for backward compatibility with existing diagnostic
@@ -267,11 +267,26 @@ async function captionSavedImagesForCache(
     signal?: AbortSignal
     concurrency: number
     onProgress?: (done: number, total: number) => void
+    outputLanguage?: string
   },
 ) {
   const pathByRel = new Map(savedImages.map((img) => [img.relPath, img.absPath]))
+  const contextByRel = new Map(
+    savedImages.map((img) => [
+      img.relPath,
+      {
+        before: img.contextBefore?.trim() ?? "",
+        after: img.contextAfter?.trim() ?? "",
+      },
+    ]),
+  )
   const markdown = savedImages
-    .map((img) => `![](${img.relPath})`)
+    .map((img) => {
+      const context = contextByRel.get(img.relPath)
+      const before = context?.before ? `${context.before}\n` : ""
+      const after = context?.after ? `\n${context.after}` : ""
+      return `${before}![](${img.relPath})${after}`
+    })
     .join("\n")
 
   return captionMarkdownImages(projectPath, markdown, llmConfig, {
@@ -280,6 +295,7 @@ async function captionSavedImagesForCache(
     urlToAbsPath: (url) => pathByRel.get(url) ?? null,
     concurrency: options.concurrency,
     onProgress: options.onProgress,
+    outputLanguage: options.outputLanguage ?? getOutputLanguage(markdown),
   })
 }
 
@@ -402,6 +418,7 @@ async function autoIngestImpl(
                   url.startsWith(`${pp}/wiki/media/${fileName.replace(/\.[^.]+$/, "")}/`),
                 urlToAbsPath: (url) => url,
                 concurrency: mmCfg.concurrency,
+                outputLanguage: getOutputLanguage(sourceContent),
                 onProgress: (done, total) =>
                   activity.updateItem(activityId, {
                     detail: `Captioning images... ${done}/${total}`,
@@ -411,6 +428,7 @@ async function autoIngestImpl(
                 await captionSavedImagesForCache(pp, savedImages, captionLlm, {
                   signal,
                   concurrency: mmCfg.concurrency,
+                  outputLanguage: getOutputLanguage(sourceContent),
                   onProgress: (done, total) =>
                     activity.updateItem(activityId, {
                       detail: `Captioning images... ${done}/${total}`,
@@ -424,7 +442,12 @@ async function autoIngestImpl(
               )
             }
           }
-          await injectImagesIntoSourceSummary(pp, fileName, savedImages)
+          await injectImagesIntoSourceSummary(
+            pp,
+            fileName,
+            savedImages,
+            getOutputLanguage(sourceContent),
+          )
           // Re-embed the source-summary page so caption text lands
           // in the search index. Without this step, search by image
           // content stays empty for files ingested before captioning
@@ -550,6 +573,7 @@ async function autoIngestImpl(
         shouldCaption: (url) => url.startsWith(ourMediaPrefix),
         urlToAbsPath: (url) => url, // already absolute in our extraction output
         concurrency: mmCfg.concurrency,
+        outputLanguage: getOutputLanguage(sourceContent),
         onProgress,
       })
       if (captionResultAttempted(result)) {
@@ -562,6 +586,7 @@ async function autoIngestImpl(
           {
             signal,
             concurrency: mmCfg.concurrency,
+            outputLanguage: getOutputLanguage(sourceContent),
             onProgress,
           },
         )
@@ -728,7 +753,12 @@ async function autoIngestImpl(
   // want the safety-net section to slip image refs into the wiki
   // through the back door.
   if (mmCfg.enabled && savedImages.length > 0 && !signal?.aborted) {
-    await injectImagesIntoSourceSummary(pp, fileName, savedImages)
+    await injectImagesIntoSourceSummary(
+      pp,
+      fileName,
+      savedImages,
+      getOutputLanguage(sourceContent),
+    )
   }
 
   if (writtenPaths.length > 0) {
@@ -1195,6 +1225,7 @@ async function injectImagesIntoSourceSummary(
   pp: string,
   fileName: string,
   savedImages: { relPath: string; page: number | null; sha256?: string }[],
+  outputLanguage?: string,
 ): Promise<void> {
   if (savedImages.length === 0) return
   const sourceBaseName = fileName.replace(/\.[^.]+$/, "")
@@ -1209,7 +1240,7 @@ async function injectImagesIntoSourceSummary(
     // indexes whatever's in the wiki page, so without this, search
     // by image content (e.g. "find the chart with revenue data")
     // never matches because alt text was empty.
-    const captionsBySha = await loadCaptionCache(pp)
+    const captionsBySha = await loadCaptionCache(pp, outputLanguage)
     const newSection = buildImageMarkdownSection(savedImages as never, captionsBySha)
     const marker = "<!-- llm-wiki:embedded-images -->"
     const wrapped = `\n\n${marker}\n${newSection.trim()}\n${marker}\n`
@@ -1524,7 +1555,13 @@ export async function executeIngestWrites(
       const savedImages = await extractAndSaveSourceImages(pp, ingestSource)
       if (savedImages.length > 0) {
         const fileName = getFileName(ingestSource)
-        await injectImagesIntoSourceSummary(pp, fileName, savedImages)
+        const sourceContent = await tryReadFile(ingestSource)
+        await injectImagesIntoSourceSummary(
+          pp,
+          fileName,
+          savedImages,
+          getOutputLanguage(sourceContent),
+        )
       }
     } catch (err) {
       console.warn(

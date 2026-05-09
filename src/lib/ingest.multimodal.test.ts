@@ -183,4 +183,115 @@ describe("autoIngest image captioning", () => {
     )
     expect(summary).not.toContain(`![](${IMAGE_REL_PATH})`)
   })
+
+  it("uses extracted DOCX image context when captioning saved-image fallbacks", async () => {
+    const imageHash = await sha256OfBase64("AAAA")
+    mockExtractImages.mockResolvedValue([
+      {
+        index: 7,
+        mimeType: "image/png",
+        page: null,
+        width: 1280,
+        height: 720,
+        relPath: IMAGE_REL_PATH,
+        absPath: IMAGE_ABS_PATH,
+        sha256: imageHash,
+        contextBefore: "本图前文说明这是智慧低空政务场景的总体架构。",
+        contextAfter: "图后文字说明平台包括感知、调度和服务应用三层。",
+      },
+    ])
+    mockCaption.mockResolvedValue("图片展示智慧低空政务场景的总体架构。")
+    pendingResponses.push(
+      "源文档分析。",
+      [
+        `---FILE: wiki/sources/${SOURCE_STEM}.md---`,
+        "---",
+        "type: source",
+        `title: "Source: ${SOURCE_NAME}"`,
+        "created: 2026-05-07",
+        "updated: 2026-05-07",
+        `sources: ["${SOURCE_NAME}"]`,
+        "tags: []",
+        "related: []",
+        "---",
+        "",
+        `# Source: ${SOURCE_NAME}`,
+        "",
+        "正文摘要。",
+        "---END FILE---",
+      ].join("\n"),
+    )
+
+    await autoIngest(PROJECT, SOURCE_PATH, llmConfig)
+
+    const opts = mockCaption.mock.calls[0][4] as {
+      contextBefore: string
+      contextAfter: string
+      outputLanguage: string
+    }
+    expect(opts.contextBefore).toContain("智慧低空政务场景")
+    expect(opts.contextAfter).toContain("感知、调度和服务应用三层")
+    expect(opts.outputLanguage).toBe("Chinese")
+  })
+
+  it("recaptions stale-language image cache entries before injecting source-summary images", async () => {
+    const imageHash = await sha256OfBase64("AAAA")
+    mockExtractImages.mockResolvedValue([
+      {
+        index: 7,
+        mimeType: "image/png",
+        page: null,
+        width: 1280,
+        height: 720,
+        relPath: IMAGE_REL_PATH,
+        absPath: IMAGE_ABS_PATH,
+        sha256: imageHash,
+        contextBefore: "本图前文说明这是智慧低空政务场景的总体架构。",
+        contextAfter: "图后文字说明平台包括感知、调度和服务应用三层。",
+      },
+    ])
+    files.set(
+      `${PROJECT}/.llm-wiki/image-caption-cache.json`,
+      JSON.stringify({
+        [imageHash]: {
+          caption: "English architecture diagram description",
+          mimeType: "image/png",
+          model: "vl-old",
+          outputLanguage: "English",
+          capturedAt: "2026-01-01T00:00:00Z",
+        },
+      }),
+    )
+    useWikiStore.setState({ outputLanguage: "Chinese" })
+    mockCaption.mockResolvedValue("图片展示智慧低空政务场景的总体架构。")
+    pendingResponses.push(
+      "源文档分析。",
+      [
+        `---FILE: wiki/sources/${SOURCE_STEM}.md---`,
+        "---",
+        "type: source",
+        `title: "Source: ${SOURCE_NAME}"`,
+        "created: 2026-05-07",
+        "updated: 2026-05-07",
+        `sources: ["${SOURCE_NAME}"]`,
+        "tags: []",
+        "related: []",
+        "---",
+        "",
+        `# Source: ${SOURCE_NAME}`,
+        "",
+        "正文摘要。",
+        "---END FILE---",
+      ].join("\n"),
+    )
+
+    await autoIngest(PROJECT, SOURCE_PATH, llmConfig)
+
+    expect(mockCaption).toHaveBeenCalledOnce()
+    const summary = files.get(`${PROJECT}/wiki/sources/${SOURCE_STEM}.md`) ?? ""
+    expect(summary).toContain(
+      `![图片展示智慧低空政务场景的总体架构。](${IMAGE_REL_PATH})`,
+    )
+    expect(summary).not.toContain("English architecture diagram description")
+  })
 })

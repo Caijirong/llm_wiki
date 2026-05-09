@@ -180,4 +180,24 @@ describe("captionImage", () => {
     // Empty side becomes `(none)` so the structure is uniform.
     expect(promptText).toMatch(/Text after image ---\s*\(none\)/)
   })
+
+  it("forces the configured caption language in the prompt", async () => {
+    mockStreamChat.mockImplementation(async (_c, _m, cb) => {
+      cb.onDone()
+    })
+
+    await captionImage(TINY_B64, "image/png", cfg, undefined, {
+      outputLanguage: "Chinese",
+      contextBefore: "Architecture overview",
+      contextAfter: "Service layer",
+    })
+
+    const messages = mockStreamChat.mock.calls[0][1] as Array<{
+      content: Array<{ type: string; text?: string }>
+    }>
+    const promptText = messages[0].content[0].text ?? ""
+    expect(promptText).toContain("MANDATORY CAPTION LANGUAGE: Chinese")
+    expect(promptText).toContain("Write the image description in Chinese only")
+    expect(promptText).toContain("Preserve visible text verbatim")
+  })
 })

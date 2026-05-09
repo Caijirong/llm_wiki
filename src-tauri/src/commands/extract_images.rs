@@ -15,6 +15,7 @@
 //! ordering, same `index` per image), so the dedup cache in Phase 3
 //! can key purely on the SHA-256 of `data_base64`.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -74,6 +75,15 @@ pub struct ExtractedImage {
     /// `data_base64` decodes to). Used by the Phase 3 caption cache
     /// to dedupe identical images across files.
     pub sha256: String,
+    /// Text immediately before the image anchor in the source, when
+    /// the document format exposes that anchor. Used by the vision
+    /// caption pipeline as disambiguating context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_before: Option<String>,
+    /// Text immediately after the image anchor in the source, when
+    /// available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_after: Option<String>,
 }
 
 // ── PDF (pdfium) ────────────────────────────────────────────────────────
@@ -111,14 +121,12 @@ pub fn extract_pdf_markdown(
 
     let _guard = crate::commands::fs::lock_pdfium();
     let pdfium = crate::commands::fs::pdfium()?;
-    let doc = pdfium
-        .load_pdf_from_file(path, None)
-        .map_err(|e| match e {
-            PdfiumError::PdfiumLibraryInternalError(
-                PdfiumInternalError::PasswordError,
-            ) => format!("PDF is password-protected and cannot be read: '{path}'"),
-            _ => format!("Failed to open PDF '{path}': {e}"),
-        })?;
+    let doc = pdfium.load_pdf_from_file(path, None).map_err(|e| match e {
+        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError) => {
+            format!("PDF is password-protected and cannot be read: '{path}'")
+        }
+        _ => format!("Failed to open PDF '{path}': {e}"),
+    })?;
 
     let mut out = String::new();
     let mut idx: u32 = 0;
@@ -144,9 +152,7 @@ pub fn extract_pdf_markdown(
 
         let page_text = page
             .text()
-            .map_err(|e| {
-                format!("Page {page_num} text extraction failed in '{path}': {e}")
-            })?;
+            .map_err(|e| format!("Page {page_num} text extraction failed in '{path}': {e}"))?;
         out.push_str(&page_text.all());
         // Single trailing newline so the next block starts on its own
         // line; the `\n\n` separator before the next `## Page` heading
@@ -170,9 +176,7 @@ pub fn extract_pdf_markdown(
             let dyn_img = match image.get_raw_image() {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!(
-                        "[extract_pdf_markdown] page {page_num} image read failed: {e}"
-                    );
+                    eprintln!("[extract_pdf_markdown] page {page_num} image read failed: {e}");
                     continue;
                 }
             };
@@ -186,9 +190,7 @@ pub fn extract_pdf_markdown(
                 &mut std::io::Cursor::new(&mut png_bytes),
                 image::ImageFormat::Png,
             ) {
-                eprintln!(
-                    "[extract_pdf_markdown] page {page_num} PNG encode failed: {e}"
-                );
+                eprintln!("[extract_pdf_markdown] page {page_num} PNG encode failed: {e}");
                 continue;
             }
             idx += 1;
@@ -198,9 +200,7 @@ pub fn extract_pdf_markdown(
             // pass dest_dir for both args so save_one_image's
             // strip_prefix is a no-op.
             if let Err(e) = save_one_image(&png_bytes, dest_dir, dest_dir, &file_name) {
-                eprintln!(
-                    "[extract_pdf_markdown] page {page_num} save failed: {e}"
-                );
+                eprintln!("[extract_pdf_markdown] page {page_num} save failed: {e}");
                 continue;
             }
             total_saved += 1;
@@ -230,9 +230,7 @@ pub fn extract_pdf_markdown(
     }
 
     if media_dest_dir.is_some() {
-        eprintln!(
-            "[extract_pdf_markdown] '{path}' DONE — pages={page_count}, saved={total_saved}"
-        );
+        eprintln!("[extract_pdf_markdown] '{path}' DONE — pages={page_count}, saved={total_saved}");
     }
 
     Ok(out)
@@ -320,6 +318,8 @@ pub fn extract_pdf_images(
                 height,
                 data_base64,
                 sha256,
+                context_before: None,
+                context_after: None,
             });
 
             if out.len() >= options.max_images {
@@ -365,7 +365,12 @@ pub fn extract_office_images(
     let media_to_slide = if is_pptx {
         build_pptx_media_slide_map(&mut archive)
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
+    };
+    let media_to_context = if is_pptx {
+        build_pptx_media_context_map(&mut archive)
+    } else {
+        build_docx_media_context_map(&mut archive)
     };
 
     // List media entries up front so we can iterate by_index in a
@@ -428,6 +433,7 @@ pub fn extract_office_images(
         let data_base64 = B64.encode(&bytes);
         let sha256 = sha256_hex(&bytes);
         let page = media_to_slide.get(&entry_name).copied().flatten();
+        let context = media_to_context.get(&entry_name);
 
         out.push(ExtractedImage {
             index: idx,
@@ -437,6 +443,8 @@ pub fn extract_office_images(
             height,
             data_base64,
             sha256,
+            context_before: context.map(|ctx| ctx.context_before.clone()),
+            context_after: context.map(|ctx| ctx.context_after.clone()),
         });
 
         if out.len() >= options.max_images {
@@ -500,10 +508,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// `media_path -> Some(slide_number)`. If a media file isn't
 /// referenced from any slide (rare; usually unused theme assets),
 /// it's absent from the map and gets `None` at the call site.
-fn build_pptx_media_slide_map(
-    archive: &mut zip::ZipArchive<File>,
-) -> std::collections::HashMap<String, Option<u32>> {
-    use std::collections::HashMap;
+fn build_pptx_media_slide_map(archive: &mut zip::ZipArchive<File>) -> HashMap<String, Option<u32>> {
     let mut out: HashMap<String, Option<u32>> = HashMap::new();
 
     // Collect rels paths first so we don't hold an active `archive`
@@ -560,6 +565,383 @@ fn build_pptx_media_slide_map(
     out
 }
 
+#[derive(Debug, Clone, Default)]
+struct ImageContext {
+    context_before: String,
+    context_after: String,
+}
+
+fn pptx_rel_target_to_media_path(target: &str) -> Option<String> {
+    let cleaned = target.replace('\\', "/");
+    let without_prefix = cleaned.strip_prefix("../").unwrap_or(&cleaned);
+    if without_prefix.starts_with("media/") {
+        Some(format!("ppt/{without_prefix}"))
+    } else if without_prefix.starts_with("ppt/media/") {
+        Some(without_prefix.to_string())
+    } else {
+        None
+    }
+}
+
+fn build_pptx_relationship_map(rels_xml: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut search_from = 0;
+    while let Some(pos) = rels_xml[search_from..].find("<Relationship") {
+        let start = search_from + pos;
+        let end = match rels_xml[start..].find('>') {
+            Some(end) => start + end + 1,
+            None => break,
+        };
+        let tag = &rels_xml[start..end];
+        search_from = end;
+        let Some(id) = xml_attr_value(tag, "Id") else {
+            continue;
+        };
+        let Some(target) = xml_attr_value(tag, "Target") else {
+            continue;
+        };
+        if let Some(media_path) = pptx_rel_target_to_media_path(&target) {
+            out.insert(id, media_path);
+        }
+    }
+    out
+}
+
+fn extract_pptx_text_runs(xml: &str) -> String {
+    let mut out = String::new();
+    let mut search_from = 0;
+    while let Some(pos) = xml[search_from..].find("<a:t") {
+        let tag_start = search_from + pos;
+        let tag_end = match xml[tag_start..].find('>') {
+            Some(end) => tag_start + end + 1,
+            None => break,
+        };
+        let close = match xml[tag_end..].find("</a:t>") {
+            Some(end) => tag_end + end,
+            None => break,
+        };
+        let text = decode_xml_entities(&xml[tag_end..close]);
+        if !text.trim().is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(text.trim());
+        }
+        search_from = close + "</a:t>".len();
+    }
+    out
+}
+
+fn find_next_pptx_event(xml: &str, search_from: usize) -> Option<(usize, usize, String)> {
+    let text_pos = xml[search_from..].find("<a:t").map(|p| search_from + p);
+    let embed_pos = xml[search_from..]
+        .find("r:embed=\"")
+        .map(|p| search_from + p);
+    match (text_pos, embed_pos) {
+        (Some(t), Some(e)) if t < e => {
+            let close = xml[t..].find("</a:t>")? + t + "</a:t>".len();
+            Some((t, close, "text".to_string()))
+        }
+        (Some(t), None) => {
+            let close = xml[t..].find("</a:t>")? + t + "</a:t>".len();
+            Some((t, close, "text".to_string()))
+        }
+        (_, Some(e)) => {
+            let start = e + "r:embed=\"".len();
+            let end = xml[start..].find('"')? + start + 1;
+            Some((e, end, "image".to_string()))
+        }
+        (None, None) => None,
+    }
+}
+
+fn build_pptx_media_context_map_from_xml(
+    slides: &[(u32, &str)],
+    rels: &[(u32, &str)],
+) -> HashMap<String, ImageContext> {
+    let rel_by_slide: HashMap<u32, HashMap<String, String>> = rels
+        .iter()
+        .map(|(slide_num, xml)| (*slide_num, build_pptx_relationship_map(xml)))
+        .collect();
+    let mut out = HashMap::new();
+
+    for (slide_num, slide_xml) in slides {
+        let Some(rel_to_media) = rel_by_slide.get(slide_num) else {
+            continue;
+        };
+        if rel_to_media.is_empty() {
+            continue;
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        let mut image_positions: Vec<(usize, String)> = Vec::new();
+        let mut search_from = 0;
+        while let Some((start, end, kind)) = find_next_pptx_event(slide_xml, search_from) {
+            if kind == "text" {
+                let text = extract_pptx_text_runs(&slide_xml[start..end])
+                    .trim()
+                    .to_string();
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            } else {
+                let rel_id_start = start + "r:embed=\"".len();
+                let Some(rel_id_end) = slide_xml[rel_id_start..]
+                    .find('"')
+                    .map(|p| rel_id_start + p)
+                else {
+                    search_from = end;
+                    continue;
+                };
+                let rel_id = &slide_xml[rel_id_start..rel_id_end];
+                if let Some(media_path) = rel_to_media.get(rel_id) {
+                    let idx = parts.len();
+                    parts.push(format!("[image:{media_path}]"));
+                    image_positions.push((idx, media_path.clone()));
+                }
+            }
+            search_from = end;
+        }
+
+        for (idx, media_path) in image_positions {
+            out.insert(
+                media_path,
+                ImageContext {
+                    context_before: context_window(&parts, idx, true),
+                    context_after: context_window(&parts, idx, false),
+                },
+            );
+        }
+    }
+
+    out
+}
+
+fn build_pptx_media_context_map(
+    archive: &mut zip::ZipArchive<File>,
+) -> HashMap<String, ImageContext> {
+    let mut slide_names: Vec<(u32, String)> = archive
+        .file_names()
+        .filter_map(|n| {
+            if !(n.starts_with("ppt/slides/slide") && n.ends_with(".xml")) {
+                return None;
+            }
+            let slide_num = n
+                .strip_prefix("ppt/slides/slide")?
+                .strip_suffix(".xml")?
+                .parse()
+                .ok()?;
+            Some((slide_num, n.to_string()))
+        })
+        .collect();
+    slide_names.sort_by_key(|(num, _)| *num);
+
+    let mut rel_names: Vec<(u32, String)> = archive
+        .file_names()
+        .filter_map(|n| {
+            if !(n.starts_with("ppt/slides/_rels/slide") && n.ends_with(".xml.rels")) {
+                return None;
+            }
+            let slide_num = n
+                .strip_prefix("ppt/slides/_rels/slide")?
+                .strip_suffix(".xml.rels")?
+                .parse()
+                .ok()?;
+            Some((slide_num, n.to_string()))
+        })
+        .collect();
+    rel_names.sort_by_key(|(num, _)| *num);
+
+    let slides_owned: Vec<(u32, String)> = slide_names
+        .iter()
+        .filter_map(|(num, name)| read_zip_text(archive, name).map(|xml| (*num, xml)))
+        .collect();
+    let rels_owned: Vec<(u32, String)> = rel_names
+        .iter()
+        .filter_map(|(num, name)| read_zip_text(archive, name).map(|xml| (*num, xml)))
+        .collect();
+
+    let slides: Vec<(u32, &str)> = slides_owned
+        .iter()
+        .map(|(num, xml)| (*num, xml.as_str()))
+        .collect();
+    let rels: Vec<(u32, &str)> = rels_owned
+        .iter()
+        .map(|(num, xml)| (*num, xml.as_str()))
+        .collect();
+    build_pptx_media_context_map_from_xml(&slides, &rels)
+}
+
+fn read_zip_text(archive: &mut zip::ZipArchive<File>, name: &str) -> Option<String> {
+    let mut file = archive.by_name(name).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+fn decode_xml_entities(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#10;", "\n")
+        .replace("&#13;", "")
+}
+
+fn xml_attr_value(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+fn extract_text_runs(xml: &str) -> String {
+    let mut out = String::new();
+    let mut search_from = 0;
+    while let Some(pos) = xml[search_from..].find("<w:t") {
+        let tag_start = search_from + pos;
+        let tag_end = match xml[tag_start..].find('>') {
+            Some(end) => tag_start + end + 1,
+            None => break,
+        };
+        let close = match xml[tag_end..].find("</w:t>") {
+            Some(end) => tag_end + end,
+            None => break,
+        };
+        out.push_str(&decode_xml_entities(&xml[tag_end..close]));
+        search_from = close + "</w:t>".len();
+    }
+    out
+}
+
+fn docx_rel_target_to_media_path(target: &str) -> Option<String> {
+    let cleaned = target.replace('\\', "/");
+    let without_prefix = cleaned.strip_prefix("../").unwrap_or(&cleaned);
+    if without_prefix.starts_with("media/") {
+        Some(format!("word/{without_prefix}"))
+    } else if without_prefix.starts_with("word/media/") {
+        Some(without_prefix.to_string())
+    } else {
+        None
+    }
+}
+
+fn build_docx_relationship_map(rels_xml: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut search_from = 0;
+    while let Some(pos) = rels_xml[search_from..].find("<Relationship") {
+        let start = search_from + pos;
+        let end = match rels_xml[start..].find('>') {
+            Some(end) => start + end + 1,
+            None => break,
+        };
+        let tag = &rels_xml[start..end];
+        search_from = end;
+        let Some(id) = xml_attr_value(tag, "Id") else {
+            continue;
+        };
+        let Some(target) = xml_attr_value(tag, "Target") else {
+            continue;
+        };
+        if let Some(media_path) = docx_rel_target_to_media_path(&target) {
+            out.insert(id, media_path);
+        }
+    }
+    out
+}
+
+fn find_embed_ids(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while let Some(pos) = xml[search_from..].find("r:embed=\"") {
+        let start = search_from + pos + "r:embed=\"".len();
+        let end = match xml[start..].find('"') {
+            Some(end) => start + end,
+            None => break,
+        };
+        out.push(xml[start..end].to_string());
+        search_from = end + 1;
+    }
+    out
+}
+
+fn context_window(parts: &[String], image_idx: usize, before: bool) -> String {
+    const MAX_CONTEXT_PARTS: usize = 3;
+    if before {
+        let start = image_idx.saturating_sub(MAX_CONTEXT_PARTS);
+        parts[start..image_idx].join("\n")
+    } else {
+        let end = usize::min(parts.len(), image_idx + 1 + MAX_CONTEXT_PARTS);
+        parts[image_idx + 1..end].join("\n")
+    }
+}
+
+fn build_docx_media_context_map_from_xml(
+    document_xml: &str,
+    rels_xml: &str,
+) -> HashMap<String, ImageContext> {
+    let rel_to_media = build_docx_relationship_map(rels_xml);
+    if rel_to_media.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut image_positions: Vec<(usize, String)> = Vec::new();
+    let mut search_from = 0;
+
+    while let Some(pos) = document_xml[search_from..].find("<w:p") {
+        let start = search_from + pos;
+        let open_end = match document_xml[start..].find('>') {
+            Some(end) => start + end + 1,
+            None => break,
+        };
+        let close = match document_xml[open_end..].find("</w:p>") {
+            Some(end) => open_end + end,
+            None => break,
+        };
+        let paragraph = &document_xml[open_end..close];
+        search_from = close + "</w:p>".len();
+
+        let text = extract_text_runs(paragraph).trim().to_string();
+        if !text.is_empty() {
+            parts.push(text);
+        }
+
+        for rel_id in find_embed_ids(paragraph) {
+            if let Some(media_path) = rel_to_media.get(&rel_id) {
+                let idx = parts.len();
+                parts.push(format!("[image:{media_path}]"));
+                image_positions.push((idx, media_path.clone()));
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (idx, media_path) in image_positions {
+        out.insert(
+            media_path,
+            ImageContext {
+                context_before: context_window(&parts, idx, true),
+                context_after: context_window(&parts, idx, false),
+            },
+        );
+    }
+    out
+}
+
+fn build_docx_media_context_map(
+    archive: &mut zip::ZipArchive<File>,
+) -> HashMap<String, ImageContext> {
+    let Some(document_xml) = read_zip_text(archive, "word/document.xml") else {
+        return HashMap::new();
+    };
+    let Some(rels_xml) = read_zip_text(archive, "word/_rels/document.xml.rels") else {
+        return HashMap::new();
+    };
+    build_docx_media_context_map_from_xml(&document_xml, &rels_xml)
+}
+
 // ── Extract-and-save: write to disk, skip the base64 round-trip ────────
 //
 // The base64-returning commands above are useful for future
@@ -599,6 +981,15 @@ pub struct SavedImage {
     /// (via `convertFileSrc`) to actually load the image.
     pub abs_path: String,
     pub sha256: String,
+    /// Text immediately before the image anchor in the source, when
+    /// available. DOCX provides paragraph-level context; PDF relies
+    /// on inline markdown refs instead, so this remains absent there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_before: Option<String>,
+    /// Text immediately after the image anchor in the source, when
+    /// available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_after: Option<String>,
 }
 
 fn save_one_image(
@@ -695,7 +1086,11 @@ pub fn extract_and_save_pdf_images(
                 filtered_too_small += 1;
                 eprintln!(
                     "[extract_and_save_pdf_images] page {} image {}x{} < min ({}x{}) — skipped",
-                    page_idx + 1, width, height, options.min_width, options.min_height
+                    page_idx + 1,
+                    width,
+                    height,
+                    options.min_width,
+                    options.min_height
                 );
                 continue;
             }
@@ -727,6 +1122,8 @@ pub fn extract_and_save_pdf_images(
                 rel_path,
                 abs_path,
                 sha256,
+                context_before: None,
+                context_after: None,
             });
 
             if out.len() >= options.max_images {
@@ -767,7 +1164,12 @@ pub fn extract_and_save_office_images(
     let media_to_slide = if is_pptx {
         build_pptx_media_slide_map(&mut archive)
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
+    };
+    let media_to_context = if is_pptx {
+        build_pptx_media_context_map(&mut archive)
+    } else {
+        build_docx_media_context_map(&mut archive)
     };
 
     let media_indices: Vec<usize> = (0..archive.len())
@@ -820,6 +1222,7 @@ pub fn extract_and_save_office_images(
         let (rel_path, abs_path) = save_one_image(&bytes, dest_dir, rel_to, &file_name)?;
         let sha256 = sha256_hex(&bytes);
         let page = media_to_slide.get(&entry_name).copied().flatten();
+        let context = media_to_context.get(&entry_name);
 
         out.push(SavedImage {
             index: idx,
@@ -830,6 +1233,8 @@ pub fn extract_and_save_office_images(
             rel_path,
             abs_path,
             sha256,
+            context_before: context.map(|ctx| ctx.context_before.clone()),
+            context_after: context.map(|ctx| ctx.context_after.clone()),
         });
 
         if out.len() >= options.max_images {
@@ -976,5 +1381,65 @@ mod tests {
         assert_eq!(o.min_width, 100);
         assert_eq!(o.min_height, 100);
         assert_eq!(o.max_images, 500);
+    }
+
+    #[test]
+    fn docx_image_context_uses_surrounding_paragraphs() {
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+            </Relationships>
+        "#;
+        let document = r#"
+            <w:document>
+              <w:body>
+                <w:p><w:r><w:t>本图前文说明这是智慧低空政务场景的总体架构。</w:t></w:r></w:p>
+                <w:p>
+                  <w:r>
+                    <w:drawing>
+                      <a:blip r:embed="rId7"/>
+                    </w:drawing>
+                  </w:r>
+                </w:p>
+                <w:p><w:r><w:t>图后文字说明平台包括感知、调度和服务应用三层。</w:t></w:r></w:p>
+              </w:body>
+            </w:document>
+        "#;
+
+        let contexts = build_docx_media_context_map_from_xml(document, rels);
+        let ctx = contexts
+            .get("word/media/image1.png")
+            .expect("image context should be keyed by canonical media path");
+
+        assert!(ctx.context_before.contains("智慧低空政务场景"));
+        assert!(ctx.context_after.contains("感知、调度和服务应用三层"));
+    }
+
+    #[test]
+    fn pptx_image_context_uses_same_slide_text() {
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+            </Relationships>
+        "#;
+        let slide = r#"
+            <p:sld>
+              <p:cSld>
+                <p:spTree>
+                  <p:sp><p:txBody><a:p><a:r><a:t>智慧低空政务场景总体架构</a:t></a:r></a:p></p:txBody></p:sp>
+                  <p:pic><p:blipFill><a:blip r:embed="rId4"/></p:blipFill></p:pic>
+                  <p:sp><p:txBody><a:p><a:r><a:t>平台包括感知、调度和服务应用三层</a:t></a:r></a:p></p:txBody></p:sp>
+                </p:spTree>
+              </p:cSld>
+            </p:sld>
+        "#;
+
+        let contexts = build_pptx_media_context_map_from_xml(&[(1, slide)], &[(1, rels)]);
+        let ctx = contexts
+            .get("ppt/media/image1.png")
+            .expect("image context should be keyed by canonical ppt media path");
+
+        assert!(ctx.context_before.contains("智慧低空政务场景总体架构"));
+        assert!(ctx.context_after.contains("感知、调度和服务应用三层"));
     }
 }

@@ -163,6 +163,44 @@ describe("captionMarkdownImages", () => {
     expect(mockWriteFile).not.toHaveBeenCalled()
   })
 
+  it("does not reuse a cached caption from a different configured language", async () => {
+    mockReadBase64.mockResolvedValue({ base64: "AAAA", mimeType: "image/png" })
+    mockCaption.mockResolvedValue("中文图片描述")
+
+    const knownHash = await __test.sha256OfBase64("AAAA")
+    mockFileExists.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue(JSON.stringify({
+      [knownHash]: {
+        caption: "English image description",
+        mimeType: "image/png",
+        model: "vl-old",
+        outputLanguage: "English",
+        capturedAt: "2026-01-01T00:00:00Z",
+      },
+    }))
+
+    const out = await captionMarkdownImages("/proj", "![](/abs/x.png)", cfg, {
+      outputLanguage: "Chinese",
+    })
+
+    expect(out.cachedCaptions).toBe(0)
+    expect(out.freshCaptions).toBe(1)
+    expect(mockCaption).toHaveBeenCalledWith(
+      "AAAA",
+      "image/png",
+      cfg,
+      undefined,
+      expect.objectContaining({ outputLanguage: "Chinese" }),
+    )
+    expect(out.enrichedMarkdown).toBe("![中文图片描述](/abs/x.png)")
+    const [, contents] = mockWriteFile.mock.calls[0] as [string, string]
+    const written = JSON.parse(contents)
+    expect(written[knownHash]).toMatchObject({
+      caption: "中文图片描述",
+      outputLanguage: "Chinese",
+    })
+  })
+
   it("sanitizes captions: strips newlines and replaces ] with )", async () => {
     mockReadBase64.mockResolvedValue({ base64: "AAAA", mimeType: "image/png" })
     mockCaption.mockResolvedValue("line1\nline2 with ] bracket")

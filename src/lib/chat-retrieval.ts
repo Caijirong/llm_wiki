@@ -17,6 +17,13 @@ export interface ChatRetrievalReference {
   path: string
 }
 
+export interface ChatKnowledgeImage {
+  url: string
+  alt: string
+  sourceTitle: string
+  sourcePath: string
+}
+
 export interface ChatRetrievalSearchResult extends SearchResult {
   relativePath: string
 }
@@ -31,6 +38,8 @@ export interface ChatRetrievalContext {
   pages: ChatRetrievalPage[]
   pageList: string
   pagesContext: string
+  knowledgeImages: ChatKnowledgeImage[]
+  knowledgeImagesMarkdown: string
   references: ChatRetrievalReference[]
 }
 
@@ -65,12 +74,19 @@ export async function buildChatRetrievalContext(
     readFile(`${pp}/schema.md`).catch(() => ""),
   ])
 
-  const searchResults = (await searchWiki(pp, options.query))
-    .slice(0, searchLimit)
+  const allSearchResults = (await searchWiki(pp, options.query))
     .map((result) => ({
       ...result,
       relativePath: getRelativePath(result.path, `${pp}/wiki`),
     }))
+  const imageSearchResults = prioritizeImageSearchResults(
+    allSearchResults,
+    options.query,
+  )
+  const searchResults = mergeSearchResults(
+    allSearchResults.slice(0, searchLimit),
+    imageSearchResults,
+  )
 
   const index = trimIndex(rawIndex, options.query, indexBudget)
   const graph = await buildRetrievalGraph(pp, dataVersion)
@@ -94,6 +110,7 @@ export async function buildChatRetrievalContext(
 
   let usedChars = 0
   const pages: ChatRetrievalPage[] = []
+  const pagePaths = new Set<string>()
   const maxPages = options.maxPages ?? Number.POSITIVE_INFINITY
 
   const tryAddPage = async (
@@ -102,6 +119,8 @@ export async function buildChatRetrievalContext(
     priority: number,
   ): Promise<boolean> => {
     if (pages.length >= maxPages || usedChars >= pageBudget) return false
+    const normalizedPath = normalizePath(filePath)
+    if (pagePaths.has(normalizedPath)) return false
     try {
       const raw = await readFile(filePath)
       const relativePath = getRelativePath(filePath, pp)
@@ -110,6 +129,7 @@ export async function buildChatRetrievalContext(
         : raw
       if (usedChars + truncated.length > pageBudget) return false
       usedChars += truncated.length
+      pagePaths.add(normalizedPath)
       pages.push({ title, path: relativePath, content: truncated, priority })
       return true
     } catch {
@@ -117,6 +137,9 @@ export async function buildChatRetrievalContext(
     }
   }
 
+  for (const result of imageSearchResults) {
+    await tryAddPage(result.title, result.path, -1)
+  }
   for (const result of searchResults.filter((result) => result.titleMatch)) {
     await tryAddPage(result.title, result.path, 0)
   }
@@ -138,6 +161,8 @@ export async function buildChatRetrievalContext(
         `### [${index + 1}] ${page.title}\nPath: ${page.path}\n\n${page.content}`
       ).join("\n\n---\n\n")
     : "(No wiki pages found)"
+  const knowledgeImages = collectKnowledgeImages(searchResults, options.query)
+  const knowledgeImagesMarkdown = formatKnowledgeImageMarkdown(knowledgeImages)
 
   return {
     projectPath: pp,
@@ -149,11 +174,138 @@ export async function buildChatRetrievalContext(
     pages,
     pageList,
     pagesContext,
+    knowledgeImages,
+    knowledgeImagesMarkdown,
     references: pages.map((page) => ({
       title: page.title,
       path: page.path,
     })),
   }
+}
+
+const TRIM_QUERY_PUNCT_RE =
+  /^[\s,，。！？、；：""''（）()\-_/\\·~～…]+|[\s,，。！？、；：""''（）()\-_/\\·~～…]+$/g
+
+function normalizeQueryPhrase(query: string): string {
+  return query.trim().toLowerCase().replace(TRIM_QUERY_PUNCT_RE, "")
+}
+
+function imageQueryScore(imageAlt: string, query: string): number {
+  const altLower = imageAlt.toLowerCase()
+  const normalizedQuery = normalizeQueryPhrase(query)
+  if (!altLower || !normalizedQuery) return 0
+
+  let score = altLower.includes(normalizedQuery)
+    ? 10_000 + normalizedQuery.length
+    : 0
+
+  for (const token of tokenizeQuery(query)) {
+    if (!altLower.includes(token)) continue
+    score += token.length > 1 ? token.length * 2 : 1
+  }
+
+  return score
+}
+
+function imageStronglyMatchesQuery(imageAlt: string, query: string): boolean {
+  const normalizedAlt = imageAlt.toLowerCase()
+  const normalizedQuery = normalizeQueryPhrase(query)
+  if (!normalizedAlt || !normalizedQuery) return false
+  if (normalizedAlt.includes(normalizedQuery)) return true
+  const tokens = tokenizeQuery(query)
+  if (tokens.length === 0) return false
+  const matched = tokens.filter((token) => normalizedAlt.includes(token)).length
+  return matched >= Math.max(2, Math.ceil(tokens.length * 0.6))
+}
+
+function prioritizeImageSearchResults(
+  results: ChatRetrievalSearchResult[],
+  query: string,
+): ChatRetrievalSearchResult[] {
+  return results.filter((result) =>
+    result.images.some((image) => imageStronglyMatchesQuery(image.alt, query)),
+  )
+}
+
+function mergeSearchResults(
+  primary: ChatRetrievalSearchResult[],
+  additional: ChatRetrievalSearchResult[],
+): ChatRetrievalSearchResult[] {
+  const seen = new Set<string>()
+  const merged: ChatRetrievalSearchResult[] = []
+  for (const result of [...primary, ...additional]) {
+    if (seen.has(result.path)) continue
+    seen.add(result.path)
+    merged.push(result)
+  }
+  return merged
+}
+
+function collectKnowledgeImages(
+  searchResults: ChatRetrievalSearchResult[],
+  query: string,
+): ChatKnowledgeImage[] {
+  const seen = new Set<string>()
+  const matches: Array<{ image: ChatKnowledgeImage; score: number; order: number }> = []
+  const supporting: ChatKnowledgeImage[] = []
+  let order = 0
+
+  for (const result of searchResults) {
+    for (const image of result.images) {
+      order += 1
+      if (seen.has(image.url)) continue
+      seen.add(image.url)
+      const item = {
+        url: image.url,
+        alt: image.alt,
+        sourceTitle: result.title,
+        sourcePath: result.relativePath.startsWith("wiki/")
+          ? result.relativePath
+          : `wiki/${result.relativePath}`,
+      }
+      const score = imageQueryScore(image.alt, query)
+      if (score > 0) {
+        matches.push({ image: item, score, order })
+      } else {
+        supporting.push(item)
+      }
+    }
+  }
+
+  matches.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score
+    return a.order - b.order
+  })
+
+  return [...matches.map((match) => match.image), ...supporting].slice(0, 5)
+}
+
+export function formatKnowledgeImageMarkdown(
+  images: ChatKnowledgeImage[],
+): string {
+  if (images.length === 0) return ""
+  return images
+    .map((image, index) => {
+      const alt = image.alt.trim() || `Image from ${image.sourceTitle}`
+      const safeAlt = alt.replace(/[\r\n]+/g, " ").replace(/]/g, ")").trim()
+      return [
+        `### Image ${index + 1}: ${image.sourceTitle}`,
+        `![${safeAlt}](${image.url})`,
+        `Source: ${image.sourcePath}`,
+      ].join("\n")
+    })
+    .join("\n\n")
+}
+
+export function appendKnowledgeImagesToAnswer(
+  answer: string,
+  imageMarkdown: string,
+): string {
+  const trimmedImages = imageMarkdown.trim()
+  if (!trimmedImages) return answer
+  if (answer.includes(trimmedImages)) return answer
+  const trimmedAnswer = answer.trimEnd()
+  return `${trimmedAnswer}\n\n## Related Images\n\n${trimmedImages}`
 }
 
 function trimIndex(index: string, query: string, budget: number): string {

@@ -69,6 +69,24 @@ import { streamChat, type ChatMessage } from "./llm-client"
 export const CAPTION_PROMPT =
   "Describe this image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. Do NOT speculate or editorialize. 2 to 4 sentences. Output plain text only — no markdown, no preamble."
 
+function captionLanguageDirective(outputLanguage?: string): string {
+  if (!outputLanguage || outputLanguage === "auto") return ""
+  return [
+    `MANDATORY CAPTION LANGUAGE: ${outputLanguage}`,
+    `Write the image description in ${outputLanguage} only.`,
+    "Preserve visible text verbatim when quoting text that appears inside the image.",
+    "Do not translate proper names, labels, codes, or UI text that must remain exact.",
+  ].join("\n")
+}
+
+function withCaptionLanguageDirective(
+  prompt: string,
+  outputLanguage?: string,
+): string {
+  const directive = captionLanguageDirective(outputLanguage)
+  return directive ? `${directive}\n\n${prompt}` : prompt
+}
+
 /**
  * Build the prompt that gets used WHEN the caller supplies
  * surrounding text. Wraps the no-context prompt with an explicit
@@ -134,6 +152,8 @@ export interface CaptionOptions {
    */
   contextBefore?: string
   contextAfter?: string
+  /** Force generated caption prose to match the user's output language setting. */
+  outputLanguage?: string
 }
 
 /**
@@ -170,12 +190,16 @@ export async function captionImage(
     before.length > 0 || after.length > 0
       ? buildCaptionPromptWithContext(before, after)
       : CAPTION_PROMPT
+  const localizedPrompt = withCaptionLanguageDirective(
+    promptText,
+    options?.outputLanguage,
+  )
 
   const messages: ChatMessage[] = [
     {
       role: "user",
       content: [
-        { type: "text", text: promptText },
+        { type: "text", text: localizedPrompt },
         { type: "image", mediaType, dataBase64: imageBase64 },
       ],
     },
