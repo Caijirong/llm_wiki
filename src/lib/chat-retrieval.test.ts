@@ -14,8 +14,9 @@ vi.mock("./embedding", () => ({
 
 import { buildChatRetrievalContext } from "./chat-retrieval"
 import {
-  appendKnowledgeImagesToAnswer,
   formatKnowledgeImageMarkdown,
+  formatKnowledgeImagePromptContext,
+  renderAnswerWithKnowledgeImages,
 } from "./chat-retrieval"
 import { clearGraphCache } from "./graph-relevance"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -208,21 +209,95 @@ describe("buildChatRetrievalContext", () => {
     ])
   })
 
-  it("appends matching image markdown to chat answers exactly once", () => {
-    const imageMarkdown = [
-      "### Image 1: 智慧低空政务场景总体架构图",
-      "![智慧低空政务场景总体架构图](media/project-plan/img-7.png)",
-      "Source: wiki/sources/project-plan.md",
-    ].join("\n")
+  it("formats knowledge images for the llm with stable image ids", () => {
+    const promptContext = formatKnowledgeImagePromptContext([
+      {
+        url: "media/project-plan/img-7.png",
+        alt: "智慧低空政务场景总体架构图，包含感知、调度和服务应用三层。",
+        sourceTitle: "Project Plan",
+        sourcePath: "wiki/sources/project-plan.md",
+      },
+    ])
 
-    const answer = appendKnowledgeImagesToAnswer(
-      "该图片描述的是智慧低空政务场景总体架构。",
-      imageMarkdown,
+    expect(promptContext).toContain("Image 1")
+    expect(promptContext).toContain("Use this image only by inserting [[image:1]]")
+    expect(promptContext).toContain("智慧低空政务场景总体架构图")
+    expect(promptContext).not.toContain("![")
+  })
+
+  it("renders referenced images inline at marker positions", () => {
+    const answer = renderAnswerWithKnowledgeImages(
+      [
+        "无人机采集通常分为准备、航线规划、现场采集和数据回传四个阶段。",
+        "",
+        "[[image:1]]",
+        "",
+        "现场采集阶段需要重点关注重叠率与异常补拍。",
+      ].join("\n"),
+      [
+        {
+          url: "media/project-plan/img-2.png",
+          alt: "图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。",
+          sourceTitle: "Project Plan",
+          sourcePath: "wiki/sources/project-plan.md",
+        },
+      ],
+    )
+
+    expect(answer).toContain("![图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。](media/project-plan/img-2.png)")
+    expect(answer).toContain("*图 3.2-5 无人机采集作业流程图*")
+    expect(answer).not.toContain("[[image:1]]")
+    expect(answer).not.toContain("## Related Images")
+  })
+
+  it("ignores duplicate image references and does not append unused images when one image is inserted inline", () => {
+    const answer = renderAnswerWithKnowledgeImages(
+      [
+        "第一段解释总体流程。",
+        "",
+        "[[image:1]]",
+        "",
+        "第二段继续解释同一张图。",
+        "",
+        "[[image:1]]",
+      ].join("\n"),
+      [
+        {
+          url: "media/project-plan/img-2.png",
+          alt: "图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。",
+          sourceTitle: "Project Plan",
+          sourcePath: "wiki/sources/project-plan.md",
+        },
+        {
+          url: "media/project-plan/img-3.png",
+          alt: "图 3.2-6 数据回传链路图。",
+          sourceTitle: "Project Plan",
+          sourcePath: "wiki/sources/project-plan.md",
+        },
+      ],
+    )
+
+    expect(answer.match(/media\/project-plan\/img-2\.png/g)).toHaveLength(1)
+    expect(answer).not.toContain("[[image:1]]")
+    expect(answer).not.toContain("## Related Images")
+    expect(answer).not.toContain("media/project-plan/img-3.png")
+  })
+
+  it("falls back to a related images section when the llm emits no valid image markers", () => {
+    const answer = renderAnswerWithKnowledgeImages(
+      "该流程图展示了无人机采集的完整步骤。",
+      [
+        {
+          url: "media/project-plan/img-2.png",
+          alt: "图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。",
+          sourceTitle: "Project Plan",
+          sourcePath: "wiki/sources/project-plan.md",
+        },
+      ],
     )
 
     expect(answer).toContain("## Related Images")
-    expect(answer).toContain("![智慧低空政务场景总体架构图](media/project-plan/img-7.png)")
-    expect(appendKnowledgeImagesToAnswer(answer, imageMarkdown)).toBe(answer)
+    expect(answer).toContain("media/project-plan/img-2.png")
   })
 
   it("uses the image description instead of the source page title as the image heading", () => {

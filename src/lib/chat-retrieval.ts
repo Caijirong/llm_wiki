@@ -40,6 +40,7 @@ export interface ChatRetrievalContext {
   pagesContext: string
   knowledgeImages: ChatKnowledgeImage[]
   knowledgeImagesMarkdown: string
+  knowledgeImagesPromptContext: string
   references: ChatRetrievalReference[]
 }
 
@@ -163,6 +164,7 @@ export async function buildChatRetrievalContext(
     : "(No wiki pages found)"
   const knowledgeImages = collectKnowledgeImages(searchResults, options.query)
   const knowledgeImagesMarkdown = formatKnowledgeImageMarkdown(knowledgeImages)
+  const knowledgeImagesPromptContext = formatKnowledgeImagePromptContext(knowledgeImages)
 
   return {
     projectPath: pp,
@@ -176,6 +178,7 @@ export async function buildChatRetrievalContext(
     pagesContext,
     knowledgeImages,
     knowledgeImagesMarkdown,
+    knowledgeImagesPromptContext,
     references: pages.map((page) => ({
       title: page.title,
       path: page.path,
@@ -297,6 +300,24 @@ export function formatKnowledgeImageMarkdown(
     .join("\n\n")
 }
 
+export function formatKnowledgeImagePromptContext(
+  images: ChatKnowledgeImage[],
+): string {
+  if (images.length === 0) return ""
+  return images
+    .map((image, index) => {
+      const imageId = index + 1
+      const alt = image.alt.trim() || `Image from ${image.sourceTitle}`
+      return [
+        `### Image ${imageId}: ${formatKnowledgeImageTitle(image, index)}`,
+        `Use this image only by inserting [[image:${imageId}]] exactly once at the single most relevant point in your answer.`,
+        `Description: ${alt.replace(/[\r\n]+/g, " ").trim()}`,
+        `Source: ${image.sourcePath}`,
+      ].join("\n")
+    })
+    .join("\n\n")
+}
+
 function formatKnowledgeImageTitle(
   image: ChatKnowledgeImage,
   index: number,
@@ -325,6 +346,43 @@ export function appendKnowledgeImagesToAnswer(
   if (answer.includes(trimmedImages)) return answer
   const trimmedAnswer = answer.trimEnd()
   return `${trimmedAnswer}\n\n## Related Images\n\n${trimmedImages}`
+}
+
+export function renderAnswerWithKnowledgeImages(
+  answer: string,
+  images: ChatKnowledgeImage[],
+): string {
+  if (images.length === 0) return answer
+
+  const used = new Set<number>()
+  let insertedCount = 0
+  const rendered = answer.replace(/\[\[image:(\d+)\]\]/gi, (_full, rawIndex) => {
+    const index = Number.parseInt(rawIndex, 10) - 1
+    if (!Number.isInteger(index) || index < 0 || index >= images.length) return ""
+    if (used.has(index)) return ""
+    used.add(index)
+    insertedCount += 1
+    return renderInlineKnowledgeImage(images[index], index)
+  })
+
+  const trimmed = rendered.trimEnd()
+  if (insertedCount > 0) return trimmed
+  return appendKnowledgeImagesToAnswer(trimmed, formatKnowledgeImageMarkdown(images))
+}
+
+function renderInlineKnowledgeImage(
+  image: ChatKnowledgeImage,
+  index: number,
+): string {
+  const alt = image.alt.trim() || `Image from ${image.sourceTitle}`
+  const safeAlt = alt.replace(/[\r\n]+/g, " ").replace(/]/g, ")").trim()
+  const title = formatKnowledgeImageTitle(image, index).replace(/[\r\n]+/g, " ").trim()
+  return [
+    "",
+    `![${safeAlt}](${image.url})`,
+    `*${title}*`,
+    "",
+  ].join("\n")
 }
 
 function trimIndex(index: string, query: string, budget: number): string {
