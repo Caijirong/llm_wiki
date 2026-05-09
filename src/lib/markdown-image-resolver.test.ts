@@ -55,6 +55,15 @@ describe("resolveMarkdownImageSrc", () => {
     ).toBe("tauri-asset:/Users/me/MyWiki/wiki/media/foo/img-2.png")
   })
 
+  it("decodes markdown-renderer escaped unicode paths before resolving", () => {
+    expect(
+      resolveMarkdownImageSrc(
+        "media/%E6%9C%9B%E5%9F%8E%E5%8C%BA%E2%80%9C%E6%99%BA%E6%85%A7%E4%BD%8E%E7%A9%BA%E2%80%9D/img-2.png",
+        PROJECT,
+      ),
+    ).toBe("tauri-asset:/Users/me/MyWiki/wiki/media/望城区“智慧低空”/img-2.png")
+  })
+
   it("resolves nested paths (e.g. user-organized subfolders) under wiki/ root", () => {
     expect(
       resolveMarkdownImageSrc("entities/transformer/diagram.png", PROJECT),

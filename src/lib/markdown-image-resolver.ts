@@ -45,16 +45,17 @@ export function resolveMarkdownImageSrc(
   if (!projectPath) return rawSrc
 
   const pp = normalizePath(projectPath)
+  const src = decodeMarkdownImageSrc(rawSrc)
   const isAbsolute =
-    rawSrc.startsWith("/") || /^[a-zA-Z]:/.test(rawSrc) || rawSrc.startsWith("\\\\")
+    src.startsWith("/") || /^[a-zA-Z]:/.test(src) || src.startsWith("\\\\")
 
   // Absolute paths get fed straight to convertFileSrc — the user (or
   // some plugin) explicitly chose that path; we don't second-guess.
-  if (isAbsolute) return convertFileSrc(rawSrc)
+  if (isAbsolute) return convertFileSrc(src)
 
   // Strip a leading `./` for cleanliness; treat `media/foo.png` and
   // `./media/foo.png` identically.
-  const cleaned = rawSrc.replace(/^\.\//, "")
+  const cleaned = src.replace(/^\.\//, "")
 
   // Resolve as wiki-root-relative. The markdown lives somewhere
   // under wiki/ but we ignore its location — image references in
@@ -62,4 +63,12 @@ export function resolveMarkdownImageSrc(
   // stable regardless of page depth.
   const absolute = `${pp}/wiki/${cleaned}`
   return convertFileSrc(absolute)
+}
+
+function decodeMarkdownImageSrc(src: string): string {
+  try {
+    return decodeURI(src)
+  } catch {
+    return src
+  }
 }

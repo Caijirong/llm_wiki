@@ -210,7 +210,7 @@ describe("buildChatRetrievalContext", () => {
 
   it("appends matching image markdown to chat answers exactly once", () => {
     const imageMarkdown = [
-      "### Image 1: Project Plan",
+      "### Image 1: 智慧低空政务场景总体架构图",
       "![智慧低空政务场景总体架构图](media/project-plan/img-7.png)",
       "Source: wiki/sources/project-plan.md",
     ].join("\n")
@@ -223,5 +223,21 @@ describe("buildChatRetrievalContext", () => {
     expect(answer).toContain("## Related Images")
     expect(answer).toContain("![智慧低空政务场景总体架构图](media/project-plan/img-7.png)")
     expect(appendKnowledgeImagesToAnswer(answer, imageMarkdown)).toBe(answer)
+  })
+
+  it("uses the image description instead of the source page title as the image heading", () => {
+    const imageMarkdown = formatKnowledgeImageMarkdown([
+      {
+        url: "media/project-plan/img-2.png",
+        alt: "图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。",
+        sourceTitle: "望城区“智慧低空”政务场景应用服务项目建设方案",
+        sourcePath: "wiki/sources/project-plan.md",
+      },
+    ])
+
+    expect(imageMarkdown).toContain("### Image 1: 图 3.2-5 无人机采集作业流程图")
+    expect(imageMarkdown).not.toContain(
+      "### Image 1: 望城区“智慧低空”政务场景应用服务项目建设方案",
+    )
   })
 })

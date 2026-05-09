@@ -289,12 +289,31 @@ export function formatKnowledgeImageMarkdown(
       const alt = image.alt.trim() || `Image from ${image.sourceTitle}`
       const safeAlt = alt.replace(/[\r\n]+/g, " ").replace(/]/g, ")").trim()
       return [
-        `### Image ${index + 1}: ${image.sourceTitle}`,
+        `### Image ${index + 1}: ${formatKnowledgeImageTitle(image, index)}`,
         `![${safeAlt}](${image.url})`,
         `Source: ${image.sourcePath}`,
       ].join("\n")
     })
     .join("\n\n")
+}
+
+function formatKnowledgeImageTitle(
+  image: ChatKnowledgeImage,
+  index: number,
+): string {
+  const altTitle = extractImageTitleFromAlt(image.alt)
+  if (altTitle) return altTitle
+  return `Image ${index + 1} from ${image.sourceTitle}`
+}
+
+function extractImageTitleFromAlt(alt: string): string {
+  const normalized = alt.replace(/[\r\n]+/g, " ").trim()
+  if (!normalized) return ""
+  const sentenceEnd = normalized.search(/[。！？]|(?<!\d)[.!?](?!\d)/)
+  const title = sentenceEnd > 0
+    ? normalized.slice(0, sentenceEnd)
+    : normalized
+  return title.slice(0, 80).trim()
 }
 
 export function appendKnowledgeImagesToAnswer(
