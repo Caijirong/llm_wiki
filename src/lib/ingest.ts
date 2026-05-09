@@ -11,6 +11,7 @@ import { withProjectLock } from "@/lib/project-mutex"
 import {
   extractAndSaveSourceImages,
   buildImageMarkdownSection,
+  type SavedImage,
 } from "@/lib/extract-source-images"
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
 import type { MultimodalConfig } from "@/stores/wiki-store"
@@ -258,6 +259,38 @@ export interface AutoIngestOptions {
   onQueueMetadata?: (taskId: string, patch: IngestQueueMetadataPatch) => void | Promise<void>
 }
 
+async function captionSavedImagesForCache(
+  projectPath: string,
+  savedImages: SavedImage[],
+  llmConfig: LlmConfig,
+  options: {
+    signal?: AbortSignal
+    concurrency: number
+    onProgress?: (done: number, total: number) => void
+  },
+) {
+  const pathByRel = new Map(savedImages.map((img) => [img.relPath, img.absPath]))
+  const markdown = savedImages
+    .map((img) => `![](${img.relPath})`)
+    .join("\n")
+
+  return captionMarkdownImages(projectPath, markdown, llmConfig, {
+    signal: options.signal,
+    shouldCaption: (url) => pathByRel.has(url),
+    urlToAbsPath: (url) => pathByRel.get(url) ?? null,
+    concurrency: options.concurrency,
+    onProgress: options.onProgress,
+  })
+}
+
+function captionResultAttempted(result: {
+  freshCaptions: number
+  cachedCaptions: number
+  failed: number
+}): boolean {
+  return result.freshCaptions + result.cachedCaptions + result.failed > 0
+}
+
 /**
  * Auto-ingest: reads source → LLM analyzes → LLM writes wiki pages, all in one go.
  * Used when importing new files.
@@ -363,7 +396,7 @@ async function autoIngestImpl(
           const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
           if (captionLlm) {
             try {
-              await captionMarkdownImages(pp, sourceContent, captionLlm, {
+              const inlineResult = await captionMarkdownImages(pp, sourceContent, captionLlm, {
                 signal,
                 shouldCaption: (url) =>
                   url.startsWith(`${pp}/wiki/media/${fileName.replace(/\.[^.]+$/, "")}/`),
@@ -374,6 +407,16 @@ async function autoIngestImpl(
                     detail: `Captioning images... ${done}/${total}`,
                   }),
               })
+              if (!captionResultAttempted(inlineResult)) {
+                await captionSavedImagesForCache(pp, savedImages, captionLlm, {
+                  signal,
+                  concurrency: mmCfg.concurrency,
+                  onProgress: (done, total) =>
+                    activity.updateItem(activityId, {
+                      detail: `Captioning images... ${done}/${total}`,
+                    }),
+                })
+              }
             } catch (err) {
               console.warn(
                 `[ingest:caption] cache-hit caption pass failed:`,
@@ -488,15 +531,15 @@ async function autoIngestImpl(
     console.log(
       `[ingest:caption] disabled — stripped image refs from sourceContent (${savedImages.length} image(s) won't appear in wiki pages)`,
     )
-  } else if (
-    captionLlm &&
-    savedImages.length > 0 &&
-    /!\[\]\(/.test(sourceContent)
-  ) {
+  } else if (captionLlm && savedImages.length > 0) {
     activity.updateItem(activityId, { detail: "Captioning images..." })
     const sourceSlug = fileName.replace(/\.[^.]+$/, "")
     const ourMediaPrefix = `${pp}/wiki/media/${sourceSlug}/`
     try {
+      const onProgress = (done: number, total: number) =>
+        activity.updateItem(activityId, {
+          detail: `Captioning images... ${done}/${total}`,
+        })
       const result = await captionMarkdownImages(pp, sourceContent, captionLlm, {
         signal,
         // Strict filter: only caption images we know we just
@@ -507,12 +550,25 @@ async function autoIngestImpl(
         shouldCaption: (url) => url.startsWith(ourMediaPrefix),
         urlToAbsPath: (url) => url, // already absolute in our extraction output
         concurrency: mmCfg.concurrency,
-        onProgress: (done, total) =>
-          activity.updateItem(activityId, {
-            detail: `Captioning images... ${done}/${total}`,
-          }),
+        onProgress,
       })
-      enrichedSourceContent = result.enrichedMarkdown
+      if (captionResultAttempted(result)) {
+        enrichedSourceContent = result.enrichedMarkdown
+      } else {
+        const savedImageResult = await captionSavedImagesForCache(
+          pp,
+          savedImages,
+          captionLlm,
+          {
+            signal,
+            concurrency: mmCfg.concurrency,
+            onProgress,
+          },
+        )
+        console.log(
+          `[ingest:caption] saved-image fallback images=${savedImages.length} fresh=${savedImageResult.freshCaptions} cached=${savedImageResult.cachedCaptions} failed=${savedImageResult.failed}`,
+        )
+      }
       console.log(
         `[ingest:caption] images=${savedImages.length} fresh=${result.freshCaptions} cached=${result.cachedCaptions} failed=${result.failed}`,
       )
