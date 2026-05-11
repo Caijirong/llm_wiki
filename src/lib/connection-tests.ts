@@ -1,5 +1,6 @@
 import type { EmbeddingConfig, LlmConfig, SearchApiConfig } from "@/stores/wiki-store"
 import { getProviderTestRequest } from "@/lib/llm-providers"
+import { getHttpFetch, isFetchNetworkError } from "@/lib/tauri-fetch"
 import { webSearch } from "@/lib/web-search"
 
 export interface ConnectionTestResult {
@@ -145,13 +146,17 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
   const timer = setTimeout(() => controller.abort(), CONNECTION_TIMEOUT_MS)
 
   try {
-    return await fetch(url, {
+    const httpFetch = await getHttpFetch()
+    return await httpFetch(url, {
       ...init,
       signal: controller.signal,
     })
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       throw new Error("Connection test timed out after 20 seconds")
+    }
+    if (isFetchNetworkError(err)) {
+      throw new Error(`Network error reaching ${url}. Check endpoint URL, API key, and connectivity.`)
     }
     throw err instanceof Error ? err : new Error(String(err))
   } finally {

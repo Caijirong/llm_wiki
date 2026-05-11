@@ -6,7 +6,17 @@ import {
   testSearchConnection,
 } from "@/lib/connection-tests"
 
-const fetchMock = vi.fn()
+const httpFetchMock = vi.hoisted(() => vi.fn())
+const getHttpFetchMock = vi.hoisted(() => vi.fn(async () => httpFetchMock))
+const isFetchNetworkErrorMock = vi.hoisted(() => vi.fn((err: unknown) => {
+  if (!(err instanceof Error)) return false
+  return err.message === "Load failed" || err.message === "Failed to fetch"
+}))
+
+vi.mock("@/lib/tauri-fetch", () => ({
+  getHttpFetch: getHttpFetchMock,
+  isFetchNetworkError: isFetchNetworkErrorMock,
+}))
 
 const baseLlmConfig: LlmConfig = {
   provider: "openai",
@@ -31,22 +41,24 @@ const baseEmbeddingConfig: EmbeddingConfig = {
 
 describe("connection tests", () => {
   beforeEach(() => {
-    fetchMock.mockReset()
-    vi.stubGlobal("fetch", fetchMock)
+    httpFetchMock.mockReset()
+    getHttpFetchMock.mockClear()
+    isFetchNetworkErrorMock.mockClear()
   })
 
   afterEach(() => {
-    vi.unstubAllGlobals()
+    vi.clearAllMocks()
   })
 
   it("tests an LLM provider with a short non-streaming request", async () => {
-    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }))
+    httpFetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }))
 
     await expect(testLlmConnection(baseLlmConfig)).resolves.toEqual({
       label: "OpenAI (gpt-4o-mini)",
     })
 
-    expect(fetchMock).toHaveBeenCalledWith(
+    expect(getHttpFetchMock).toHaveBeenCalledTimes(1)
+    expect(httpFetchMock).toHaveBeenCalledWith(
       "https://api.openai.com/v1/chat/completions",
       expect.objectContaining({
         method: "POST",
@@ -55,7 +67,7 @@ describe("connection tests", () => {
         }),
       })
     )
-    const [, init] = fetchMock.mock.calls[0]
+    const [, init] = httpFetchMock.mock.calls[0]
     expect(JSON.parse(String(init.body))).toMatchObject({
       model: "gpt-4o-mini",
       stream: false,
@@ -68,11 +80,11 @@ describe("connection tests", () => {
     await expect(
       testLlmConnection({ ...baseLlmConfig, model: "" })
     ).rejects.toThrow("Model is required")
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(httpFetchMock).not.toHaveBeenCalled()
   })
 
   it("tests Tavily search with one lightweight query", async () => {
-    fetchMock.mockResolvedValueOnce(
+    httpFetchMock.mockResolvedValueOnce(
       Response.json({
         results: [
           {
@@ -88,14 +100,15 @@ describe("connection tests", () => {
       label: "Tavily",
     })
 
-    expect(fetchMock).toHaveBeenCalledWith(
+    expect(getHttpFetchMock).toHaveBeenCalledTimes(1)
+    expect(httpFetchMock).toHaveBeenCalledWith(
       "https://api.tavily.com/search",
       expect.objectContaining({
         method: "POST",
         headers: { "Content-Type": "application/json" },
       })
     )
-    const [, init] = fetchMock.mock.calls[0]
+    const [, init] = httpFetchMock.mock.calls[0]
     expect(JSON.parse(String(init.body))).toMatchObject({
       api_key: "tvly-test",
       max_results: 1,
@@ -103,7 +116,7 @@ describe("connection tests", () => {
   })
 
   it("tests an embedding endpoint and validates the returned vector", async () => {
-    fetchMock.mockResolvedValueOnce(
+    httpFetchMock.mockResolvedValueOnce(
       Response.json({
         data: [{ embedding: [0.1, 0.2, 0.3] }],
       })
@@ -113,7 +126,8 @@ describe("connection tests", () => {
       label: "text-embedding-test (3 dimensions)",
     })
 
-    expect(fetchMock).toHaveBeenCalledWith(
+    expect(getHttpFetchMock).toHaveBeenCalledTimes(1)
+    expect(httpFetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:1234/v1/embeddings",
       expect.objectContaining({
         method: "POST",
@@ -123,7 +137,7 @@ describe("connection tests", () => {
         },
       })
     )
-    const [, init] = fetchMock.mock.calls[0]
+    const [, init] = httpFetchMock.mock.calls[0]
     expect(JSON.parse(String(init.body))).toMatchObject({
       model: "text-embedding-test",
       input: expect.any(String),
@@ -131,10 +145,25 @@ describe("connection tests", () => {
   })
 
   it("reports embedding responses without vectors as connection failures", async () => {
-    fetchMock.mockResolvedValueOnce(Response.json({ data: [] }))
+    httpFetchMock.mockResolvedValueOnce(Response.json({ data: [] }))
 
     await expect(testEmbeddingConnection(baseEmbeddingConfig)).rejects.toThrow(
       "Embedding endpoint responded without an embedding vector"
+    )
+  })
+
+  it("surfaces actionable custom endpoint network errors instead of raw Load failed", async () => {
+    httpFetchMock.mockRejectedValueOnce(new Error("Load failed"))
+
+    await expect(
+      testLlmConnection({
+        ...baseLlmConfig,
+        provider: "custom",
+        customEndpoint: "https://aiproxy.funny-tech.site",
+        model: "gpt-5.4",
+      })
+    ).rejects.toThrow(
+      "Network error reaching https://aiproxy.funny-tech.site/chat/completions. Check endpoint URL, API key, and connectivity."
     )
   })
 })
