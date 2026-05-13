@@ -7,7 +7,16 @@ import {
 import { useActivityStore, type ActivityItem } from "@/stores/activity-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, getFileName, isAbsolutePath } from "@/lib/path-utils"
-import { getQueue, getQueueSummary, retryTask, cancelTask, cancelAllTasks, syncQueueFromDisk, type IngestTask } from "@/lib/ingest-queue"
+import {
+  getQueue,
+  getQueueSummary,
+  retryTask,
+  cancelTask,
+  cancelAllTasks,
+  clearCompletedTasks,
+  syncQueueFromDisk,
+  type IngestTask,
+} from "@/lib/ingest-queue"
 
 const FILE_TYPE_ICONS: Record<string, typeof FileText> = {
   sources: BookOpen,
@@ -98,6 +107,13 @@ export function ActivityPanel() {
     )) return
     cancelAllTasks()
   }, [project, queueSummary.pending, queueSummary.processing])
+
+  const handleClearCompleted = useCallback(() => {
+    clearDone()
+    void clearCompletedTasks().then(() => {
+      setQueueTasks([...getQueue()])
+    })
+  }, [clearDone])
 
   // Auto-expand when a new task starts running
   useEffect(() => {
@@ -205,9 +221,9 @@ export function ActivityPanel() {
               />
             )
           })}
-          {items.some((i) => i.status !== "running") && (
+          {(items.some((i) => i.status !== "running") || queueSummary.history > 0) && (
             <button
-              onClick={clearDone}
+              onClick={handleClearCompleted}
               className="w-full px-3 py-1 text-center text-[10px] text-muted-foreground hover:underline"
             >
               Clear completed
