@@ -1,10 +1,15 @@
 import { describe, it, expect, beforeEach, vi } from "vitest"
 import { flushMicrotasks } from "@/test-helpers/deferred"
 
-// Mock autoIngest so tests control success/failure timing.
-vi.mock("./ingest", () => ({
-  autoIngest: vi.fn(),
-}))
+// Mock autoIngest so tests control success/failure timing, but keep
+// real exports like NonRetryableIngestError for instanceof checks.
+vi.mock("./ingest", async () => {
+  const actual = await vi.importActual<typeof import("./ingest")>("./ingest")
+  return {
+    ...actual,
+    autoIngest: vi.fn(),
+  }
+})
 
 // Mock fs so we don't hit the real filesystem.
 vi.mock("@/commands/fs", () => ({
@@ -64,6 +69,7 @@ import {
   restoreQueue,
 } from "./ingest-queue"
 import { autoIngest } from "./ingest"
+import { NonRetryableIngestError } from "./ingest"
 import { readFile, writeFile } from "@/commands/fs"
 import { sweepResolvedReviews } from "./sweep-reviews"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -163,6 +169,22 @@ describe("ingest-queue — retry & failure", () => {
     expect(queue[0].status).toBe("failed")
     expect(queue[0].error).toContain("LLM error")
     expect(queue[0].retryCount).toBe(3)
+  })
+
+  it("does not retry non-retryable ingest errors like unsupported file formats", async () => {
+    mockAutoIngest.mockRejectedValue(
+      new NonRetryableIngestError("Text extraction not supported for .doc format"),
+    )
+
+    await enqueueIngest(TEST_ID, "legacy.doc")
+    await flushMicrotasks(10)
+
+    expect(mockAutoIngest).toHaveBeenCalledTimes(1)
+    const queue = getQueue()
+    expect(queue).toHaveLength(1)
+    expect(queue[0].status).toBe("failed")
+    expect(queue[0].error).toContain("Text extraction not supported for .doc format")
+    expect(queue[0].retryCount).toBe(1)
   })
 
   it("succeeds on retry after transient failure", async () => {

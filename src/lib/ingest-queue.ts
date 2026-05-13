@@ -1,5 +1,9 @@
 import { readFile, writeFile } from "@/commands/fs"
-import { autoIngest, type IngestQueueMetadataPatch } from "./ingest"
+import {
+  autoIngest,
+  NonRetryableIngestError,
+  type IngestQueueMetadataPatch,
+} from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
 import { getProjectPathById } from "@/lib/project-identity"
@@ -658,12 +662,14 @@ async function processNext(projectId: string): Promise<void> {
     if (currentProjectId !== projectId) return
     currentAbortController = null
     const message = err instanceof Error ? err.message : String(err)
+    const retryable = !(err instanceof NonRetryableIngestError)
     next.retryCount++
     next.error = message
 
-    if (next.retryCount >= MAX_RETRIES) {
+    if (!retryable || next.retryCount >= MAX_RETRIES) {
       next.status = "failed"
-      console.log(`[Ingest Queue] Failed (${next.retryCount}x): ${next.sourcePath} — ${message}`)
+      const note = retryable ? `${next.retryCount}x` : "non-retryable"
+      console.log(`[Ingest Queue] Failed (${note}): ${next.sourcePath} — ${message}`)
     } else {
       next.status = "pending" // will retry
       console.log(`[Ingest Queue] Error (retry ${next.retryCount}/${MAX_RETRIES}): ${next.sourcePath} — ${message}`)

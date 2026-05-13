@@ -59,6 +59,13 @@ export interface ParsedFileBlock {
   content: string
 }
 
+export class NonRetryableIngestError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "NonRetryableIngestError"
+  }
+}
+
 /** What the parser produced, with any non-fatal issues surfaced. */
 export interface ParseFileBlocksResult {
   blocks: ParsedFileBlock[]
@@ -364,6 +371,12 @@ async function autoIngestImpl(
     tryReadFile(`${pp}/wiki/index.md`),
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
+
+  const unsupportedSourceError = getUnsupportedSourceError(sourceContent)
+  if (unsupportedSourceError) {
+    activity.updateItem(activityId, { status: "error", detail: unsupportedSourceError })
+    throw new NonRetryableIngestError(unsupportedSourceError)
+  }
 
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   //
@@ -1205,6 +1218,24 @@ async function tryReadFile(path: string): Promise<string> {
   } catch {
     return ""
   }
+}
+
+function getUnsupportedSourceError(sourceContent: string): string | null {
+  const trimmed = sourceContent.trim()
+  if (!trimmed) return null
+
+  const legacyDocMatch = trimmed.match(
+    /^\[Document:\s+.+\s+—\s+text extraction not supported for \.([a-z0-9]+) format\]$/i,
+  )
+  if (legacyDocMatch) {
+    return `Text extraction not supported for .${legacyDocMatch[1].toLowerCase()} format`
+  }
+
+  if (trimmed === "[Unsupported format]") {
+    return "Text extraction not supported for this file format"
+  }
+
+  return null
 }
 
 /**
