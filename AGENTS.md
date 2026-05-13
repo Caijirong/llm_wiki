@@ -14,3 +14,12 @@ Frontend tests use Vitest with Testing Library and `jsdom`. Add UI tests beside 
 
 ## Commit & Pull Request Guidelines
 Match the existing Conventional Commit pattern: `feat(settings): ...`, `fix(mcp): ...`, `refactor(graph): ...`, `style(rust): ...`. Keep scopes short and tied to the affected area. PRs should explain user-visible impact, note frontend vs. Tauri/MCP changes, list the commands you ran, and include screenshots for UI changes. If a change is platform-specific, call that out explicitly because CI builds on macOS, Ubuntu, and Windows.
+
+## Skill And MCP Boundaries
+When designing or extending agent integrations, keep the responsibility split explicit and treat `skill` and `MCP` as cooperating layers:
+
+- `skill` is responsible for agent-facing behavior: how tools are used, answer strategy, composition rules, presentation guidance, fallback policy, and any workflow or usage conventions the external agent should follow.
+- `MCP` is responsible for capability exposure and structured transport: tool surface, data retrieval, page reads, upload or ingest contracts, structured evidence, and protocol-level interoperability.
+- `skill` and `MCP` should be designed to work together. A complete integration usually needs both: the skill tells the agent how to use the capability, while MCP provides the capability and data shape.
+- Do not move responsibilities blindly between the two layers. When a request concerns agent behavior, answer composition, or presentation policy, check whether the skill should change. When a request concerns data availability, tool shape, transport, or interoperability, check whether MCP should change.
+- When modifying either side, explicitly consider whether the other side also needs to be updated so the integration stays coherent. A change in MCP output may require skill updates; a change in skill policy may require MCP support or schema adjustments.
