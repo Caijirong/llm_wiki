@@ -112,6 +112,17 @@ Activate this skill when the user intent matches any of these:
 - Do not invent internal standards, project history, page names, or source coverage.
 - For document drafts, reuse relevant wiki concepts and source titles instead of writing empty templates.
 
+## Image Usage Policy
+
+- Treat `knowledgeImages` returned by `llm_wiki_get_context` as optional supporting evidence, not as a requirement to always render images.
+- Use an image only when it materially improves the answer. Do not append every related image by default.
+- When an image is used, place it at the single most relevant point in the answer so the response reads as one coherent flow instead of text followed by an image dump.
+- Do not repeat the same image more than once in a single answer.
+- Prefer the most relevant matching image first. Additional images are allowed only when each one adds distinct value and is placed intentionally.
+- If the client supports Markdown image rendering, inline the image with the title and the exact `url` returned by `MCP`.
+- If the client does not support image rendering, cite the image title and URL in text instead.
+- Do not invent image URLs, rewrite them into guessed local paths, or claim an image was shown if it was only cited.
+
 ## Capability detection
 
 Use the best available access path in this order:

@@ -78,9 +78,9 @@ Prefer tools by intent, not by memorized assumptions.
 Recommended order for broad question answering:
 
 1. `llm_wiki_get_context` with the user query
-2. inspect returned pages and warning
+2. inspect returned pages, `knowledgeImages`, and warning
 3. if needed, `llm_wiki_read_page` for the strongest matching page
-4. synthesize the answer
+4. synthesize the answer following the skill's image-usage policy
 
 Recommended order for “知识库里有没有 X” style exploration:
 
@@ -94,6 +94,14 @@ If the tool returns a warning about fallback retrieval, say so only when it mate
 If the query returns zero relevant results, that still counts as a completed KB query. Report the empty/limited evidence directly.
 
 If the best matching pages explicitly say they are based only on filenames, document titles, or placeholder analysis, state that the KB evidence is limited and avoid presenting the result as if the full source text had been verified.
+
+When `llm_wiki_get_context` returns `knowledgeImages`, treat them as supporting evidence for answer composition:
+
+- choose images selectively rather than dumping all of them
+- place an image only at the most relevant point in the answer
+- use each image at most once
+- if rendering is unsupported, cite title + URL in text
+- use the exact URL from `MCP`
 
 ## 5. OpenClaw MCP over HTTP reference pattern
 
