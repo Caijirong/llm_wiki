@@ -113,29 +113,54 @@
 
 这保证第一版的行为稳定，同时不给用户暴露调参面。
 
+### Semantic grouping
+
+`small_visual` 的第一层组织方式不是按图片内容去重，而是按“文档相邻语义”建立 `semantic group`。
+
+这里的核心问题不是“这两张图是否像素一样”，而是“这几张图是否共同表达同一个概念组”。例如：
+
+- `状态1: 未连接`
+- `状态2: 连接中`
+- `状态3: 已连接`
+
+这三张图应属于同一个 `status_series` 组，而不是三个彼此独立的单图节点。
+
+第一版固定采用如下分组思路：
+
+1. 先按 `document.xml` 顺序构建视觉锚点序列
+2. 只对 `small_visual` 做组判断
+3. 按结构邻近与文本邻近建立组
+
+固定判定规则：
+
+- 同一标题区块下的小视觉元素优先视为同一候选语义域
+- 同一表格中的相邻行 / 相邻列小视觉元素优先归为一组
+- 同一列表中的连续小视觉元素优先归为一组
+- 同一标题下、连续短段落中的小视觉元素可归为一组
+- 被长段正文隔开的元素默认断组
+
+组的目标不是“合并相同图片”，而是显式表达“这些图片共同构成一组状态 / 一组按钮 / 一组模式”。
+
 ### Dedupe
 
-`small_visual` 不按“每次出现”入库，而按图像内容去重。
+去重发生在 `semantic group` 之后，只做组内去重，不承担分组职责。
 
 固定规则：
 
-- 以 `sha256` 作为分组主键
-- 同一张小视觉元素在一个文档中多次出现，只形成一个 group
-- group 记录：
-  - 代表图片
-  - 出现次数
-  - 出现位置上下文样本
+- 同组内以 `sha256 + 规范化标签文本` 作为去重键
+- 同组内完全重复的同一图标只保留一个 member，并累计出现次数
+- 不跨组去重
 
 这是实现逻辑，不做成配置。
 
-### Grouping
+### Group typing
 
-`small_visual` group 在 caption 后再进行固定分类，第一版使用内置类别：
+`semantic group` 建立后，再对组进行固定分类。第一版使用内置类别：
 
-- `button_action`
-- `status_indicator`
-- `mode_marker`
-- `other_visual`
+- `button_series`
+- `status_series`
+- `mode_series`
+- `other_visual_series`
 
 分类方式由代码决定，不开放用户配置类别。
 
@@ -143,15 +168,22 @@
 
 `regular_visual` 继续走现有 caption 链路。
 
-`small_visual` group 走单次 caption：
+`small_visual` 不再只做“代表图 caption”，而是区分组级与成员级语义：
 
-- 每个 group 只 caption 一次
-- caption 输入使用代表图片
-- 同时拼入该 group 聚合后的前后文样本
-- prompt 偏向识别：
-  - 这是按钮还是状态标记
-  - 它表示什么动作 / 状态 / 模式
-  - 图中可见文字需尽量原样保留
+- 组级：
+  - 生成 group title / group summary
+  - 识别这是状态组、按钮组还是模式组
+- 成员级：
+  - 为每个 member 生成短标签
+  - 优先使用该图片邻近的短文本
+  - 邻近文本不足时，再回退到单图 caption
+
+prompt 偏向识别：
+
+- 该组共同表达的主题是什么
+- 每个成员分别表示什么状态 / 动作 / 模式
+- 图中可见文字需尽量原样保留
+- 若相邻文本明确给出“状态1/状态2/状态3”之类标签，应优先采用该标签
 
 如果 caption 失败：
 
@@ -172,28 +204,27 @@
 ```md
 ## UI Visual Elements
 
-### Buttons
+### Device Status
 
-- Save button icon
-  Seen: 5 times
-  Context: “点击保存”, “保存当前配置”
+Group type: Status series
+Context: “设备连接状态说明”
 
-![Save button icon](media/.../img-12.png)
+- 状态1：未连接
+![状态1：未连接](media/.../img-12.png)
 
-### Status Indicators
+- 状态2：连接中
+![状态2：连接中](media/.../img-13.png)
 
-- Enabled status indicator
-  Seen: 8 times
-  Context: “当前已启用”, “设备在线”
-
-![Enabled status indicator](media/.../img-18.png)
+- 状态3：已连接
+![状态3：已连接](media/.../img-14.png)
 ```
 
 约束：
 
 - 该区块由代码生成，格式固定
-- 小视觉元素按 group 展示，不逐个重复输出
-- 每个 group 至少输出一个代表图片
+- 小视觉元素按 `semantic group` 展示
+- 组内按 member 展示，不丢掉不同状态 / 不同按钮成员
+- 组内重复成员只在去重后保留一次
 
 ## Search and Retrieval
 
@@ -201,17 +232,19 @@
 
 效果来源：
 
-- group caption
-- group 分类名
-- 代表性上下文
-- 出现次数与位置锚点
+- group title / group summary
+- group 类型名
+- member 标签文本
+- 组级上下文
+- 组内成员图片
 
 由于这些内容进入了 `wiki/sources/<slug>.md`，后续 embedding 与检索会自然覆盖，不需要另开索引系统。
 
 目标效果：
 
-- 搜“保存按钮 / enabled / 编辑模式 / 在线状态”时可召回
-- 搜具体手册动作词、状态词时也可召回
+- 搜“保存按钮 / 编辑模式 / 在线状态”时可召回对应组
+- 搜“状态2 / 连接中 / 已连接”时也能命中同一状态组
+- 搜中某个成员时，结果中仍能看到其同组的其他成员
 - wiki 页面中能看到分组后的视觉元素总结
 
 ## Technical Design
@@ -270,6 +303,7 @@ interface ProjectIdentity {
 对于 `document-manual + DOCX`：
 
 - Office 图片提取路径放宽小视觉元素的提取范围
+- Rust 不再只返回“平铺图片列表”，而是先构建文档顺序的视觉锚点
 - Rust 返回的图片元信息增加固定分类字段，避免在 TS 重复判断
 
 建议新增元信息：
@@ -280,6 +314,26 @@ visualClass: "regular_visual" | "small_visual"
 
 这不是用户可配置数据，只是提取结果的内部结构化标记。
 
+并新增一层内部锚点结构：
+
+```ts
+type DocxVisualAnchor = {
+  mediaPath: string
+  docOrder: number
+  sectionTitle: string | null
+  containerKind: "paragraph" | "list_item" | "table_cell"
+  tableId?: number
+  rowIndex?: number
+  colIndex?: number
+  localTextBefore: string
+  localTextAfter: string
+  contextBefore: string
+  contextAfter: string
+}
+```
+
+该结构用于建立 `semantic group`，不是对外配置。
+
 ### Ingest pipeline
 
 在 ingest 阶段：
@@ -289,8 +343,12 @@ visualClass: "regular_visual" | "small_visual"
 3. 若是 `document-manual + DOCX`
    - 提取图片
    - 将结果拆为 `regular_visual` 与 `small_visual`
-   - `small_visual` 按 `sha256` 聚合
-   - 对 group 做一次 caption + 分类
+   - 按 `document.xml` 顺序构建 `DocxVisualAnchor` 序列
+   - 基于结构邻近与文本邻近建立 `semantic group`
+   - 对每个 group 生成组级标题与摘要
+   - 对每个 member 生成标签文本
+   - 组内再做 `sha256 + label` 去重
+   - 对 group 做固定分类
    - 生成固定区块 `## UI Visual Elements`
    - 与现有 source-summary 写入逻辑合并
 
@@ -312,16 +370,18 @@ visualClass: "regular_visual" | "small_visual"
   - `document-manual` 模板能把 `projectKind` 落到项目元数据
 - `extract / ingest`
   - `document-manual + DOCX` 会保留小视觉元素
-  - 相同 `sha256` 的小视觉元素被正确去重
+  - 同一状态序列 / 按钮序列被正确建成 `semantic group`
+  - 组内相同 `sha256 + label` 的小视觉元素被正确去重
   - group caption 失败不影响整体 ingest
   - 输出 markdown 中生成固定的 `## UI Visual Elements` 区块
 - `search`
-  - 小视觉元素的 caption / 上下文文本可参与召回
+  - 小视觉元素的组标题、成员标签、上下文文本可参与召回
 
 ## Risks
 
 - DOCX 中某些小资源可能仍是纯装饰噪声
-- 单纯按 hash 去重，无法合并“视觉上相同但像素略不同”的近似图标
+- 仅依赖邻近结构，仍可能把不相关小图误并到一组
+- 仅依赖组内去重，无法合并“视觉上相同但像素略不同”的近似成员
 - 小视觉元素分类 prompt 若过弱，`button / status / mode` 可能混淆
 
 这些风险第一版接受。优先保证：
