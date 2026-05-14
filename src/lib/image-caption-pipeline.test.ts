@@ -258,6 +258,21 @@ describe("captionMarkdownImages", () => {
     expect(mockReadBase64).toHaveBeenCalledWith("/custom/anchor/media/foo/img-1.png")
   })
 
+  it("decodes encoded wiki-relative URLs before reading image bytes from disk", async () => {
+    mockReadBase64.mockResolvedValue({ base64: "AAAA", mimeType: "image/png" })
+    mockCaption.mockResolvedValue("space-safe")
+
+    const md = "![](media/source%20with%20spaces/img-1.png)"
+    const out = await captionMarkdownImages("/proj root", md, cfg)
+
+    expect(mockReadBase64).toHaveBeenCalledWith(
+      "/proj root/wiki/media/source with spaces/img-1.png",
+    )
+    expect(out.enrichedMarkdown).toBe(
+      "![space-safe](media/source%20with%20spaces/img-1.png)",
+    )
+  })
+
   it("forwards AbortSignal to captionImage", async () => {
     mockReadBase64.mockResolvedValue({ base64: "AAAA", mimeType: "image/png" })
     mockCaption.mockResolvedValue("c")

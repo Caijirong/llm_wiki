@@ -38,7 +38,8 @@
 import { writeFile, readFile, createDirectory, fileExists, readFileAsBase64 } from "@/commands/fs"
 import { captionImage } from "@/lib/vision-caption"
 import type { LlmConfig } from "@/stores/wiki-store"
-import { normalizePath } from "@/lib/path-utils"
+import { isAbsolutePath, normalizePath } from "@/lib/path-utils"
+import { decodeMarkdownImageUrl } from "@/lib/markdown-image-url"
 
 interface CaptionEntry {
   caption: string
@@ -366,11 +367,12 @@ export async function captionMarkdownImages(
    * captions are valid anyway.
    */
   async function processOne(ref: ImageRef): Promise<void> {
+    const decodedUrl = decodeMarkdownImageUrl(ref.url)
     const absPath = options?.urlToAbsPath
       ? options.urlToAbsPath(ref.url)
-      : ref.url.startsWith("/")
-        ? ref.url
-        : `${normalizePath(projectPath)}/wiki/${ref.url}`
+      : isAbsolutePath(decodedUrl)
+        ? decodedUrl
+        : `${normalizePath(projectPath)}/wiki/${decodedUrl}`
     if (!absPath) {
       failed++
       return

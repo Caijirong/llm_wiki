@@ -5,12 +5,14 @@ const {
   mockCaption,
   mockExtractImages,
   mockListDirectory,
+  mockReadBase64,
   pendingResponses,
 } = vi.hoisted(() => ({
   files: new Map<string, string>(),
   mockCaption: vi.fn(),
   mockExtractImages: vi.fn(),
   mockListDirectory: vi.fn(),
+  mockReadBase64: vi.fn(),
   pendingResponses: [] as string[],
 }))
 
@@ -26,10 +28,7 @@ vi.mock("@/commands/fs", () => ({
   createDirectory: vi.fn(async () => {}),
   fileExists: vi.fn(async (path: string) => files.has(path)),
   listDirectory: (...args: unknown[]) => mockListDirectory(...args),
-  readFileAsBase64: vi.fn(async (path: string) => {
-    if (!path.endsWith("/img-7.png")) throw new Error(`missing image: ${path}`)
-    return { base64: "AAAA", mimeType: "image/png" }
-  }),
+  readFileAsBase64: (...args: unknown[]) => mockReadBase64(...args),
 }))
 
 vi.mock("@/lib/vision-caption", () => ({
@@ -61,11 +60,12 @@ import { useReviewStore } from "@/stores/review-store"
 import { useWikiStore, type LlmConfig } from "@/stores/wiki-store"
 
 const PROJECT = "/project"
-const SOURCE_STEM = "望城区“智慧低空”政务场景应用服务项目建设方案-V1"
+const SOURCE_STEM = "望城区“智慧低空” 政务场景应用服务项目建设方案 V1"
 const SOURCE_NAME = `${SOURCE_STEM}.docx`
 const SOURCE_PATH = `${PROJECT}/raw/sources/${SOURCE_NAME}`
 const IMAGE_REL_PATH = `media/${SOURCE_STEM}/img-7.png`
 const IMAGE_ABS_PATH = `${PROJECT}/wiki/${IMAGE_REL_PATH}`
+const ENCODED_IMAGE_REL_PATH = `media/${encodeURIComponent(SOURCE_STEM)}/img-7.png`
 
 const llmConfig: LlmConfig = {
   provider: "openai",
@@ -92,7 +92,13 @@ beforeEach(() => {
   mockCaption.mockReset()
   mockExtractImages.mockReset()
   mockListDirectory.mockReset()
+  mockReadBase64.mockReset()
   mockListDirectory.mockResolvedValue([])
+  mockReadBase64.mockImplementation(async (path: string) => {
+    if (path.includes("%")) throw new Error(`path must be decoded before reading: ${path}`)
+    if (!path.endsWith("/img-7.png")) throw new Error(`missing image: ${path}`)
+    return { base64: "AAAA", mimeType: "image/png" }
+  })
 
   files.set(
     SOURCE_PATH,
@@ -179,9 +185,9 @@ describe("autoIngest image captioning", () => {
     const summary = files.get(`${PROJECT}/wiki/sources/${SOURCE_STEM}.md`) ?? ""
     expect(mockCaption).toHaveBeenCalledOnce()
     expect(summary).toContain(
-      `![图片展示望城区智慧低空政务场景应用服务项目的建设方案图示。](${IMAGE_REL_PATH})`,
+      `![图片展示望城区智慧低空政务场景应用服务项目的建设方案图示。](${ENCODED_IMAGE_REL_PATH})`,
     )
-    expect(summary).not.toContain(`![](${IMAGE_REL_PATH})`)
+    expect(summary).not.toContain(`![](${ENCODED_IMAGE_REL_PATH})`)
   })
 
   it("uses extracted DOCX image context when captioning saved-image fallbacks", async () => {
@@ -232,6 +238,68 @@ describe("autoIngest image captioning", () => {
     expect(opts.contextBefore).toContain("智慧低空政务场景")
     expect(opts.contextAfter).toContain("感知、调度和服务应用三层")
     expect(opts.outputLanguage).toBe("Chinese")
+  })
+
+  it("uses inline encoded absolute image refs in sourceContent before falling back to saved-image context", async () => {
+    const imageHash = await sha256OfBase64("AAAA")
+    const fallbackBefore = "fallback-before should not be used"
+    const fallbackAfter = "fallback-after should not be used"
+    mockExtractImages.mockResolvedValue([
+      {
+        index: 7,
+        mimeType: "image/png",
+        page: null,
+        width: 1280,
+        height: 720,
+        relPath: IMAGE_REL_PATH,
+        absPath: IMAGE_ABS_PATH,
+        sha256: imageHash,
+        contextBefore: fallbackBefore,
+        contextAfter: fallbackAfter,
+      },
+    ])
+    mockCaption.mockResolvedValue("图片展示望城区智慧低空政务场景应用服务项目的建设方案图示。")
+    files.set(
+      SOURCE_PATH,
+      [
+        "inline-before 这是正文里紧邻图片的上文。",
+        `![](${PROJECT}/wiki/${ENCODED_IMAGE_REL_PATH})`,
+        "inline-after 这是正文里紧邻图片的下文。",
+      ].join("\n"),
+    )
+    pendingResponses.push(
+      "源文档分析。",
+      [
+        `---FILE: wiki/sources/${SOURCE_STEM}.md---`,
+        "---",
+        "type: source",
+        `title: "Source: ${SOURCE_NAME}"`,
+        "created: 2026-05-07",
+        "updated: 2026-05-07",
+        `sources: ["${SOURCE_NAME}"]`,
+        "tags: []",
+        "related: []",
+        "---",
+        "",
+        `# Source: ${SOURCE_NAME}`,
+        "",
+        "正文摘要。",
+        "---END FILE---",
+      ].join("\n"),
+    )
+
+    await autoIngest(PROJECT, SOURCE_PATH, llmConfig)
+
+    expect(mockCaption).toHaveBeenCalledOnce()
+    expect(mockReadBase64).toHaveBeenCalledWith(IMAGE_ABS_PATH)
+    const opts = mockCaption.mock.calls[0][4] as {
+      contextBefore: string
+      contextAfter: string
+    }
+    expect(opts.contextBefore).toContain("inline-before")
+    expect(opts.contextAfter).toContain("inline-after")
+    expect(opts.contextBefore).not.toContain(fallbackBefore)
+    expect(opts.contextAfter).not.toContain(fallbackAfter)
   })
 
   it("recaptions stale-language image cache entries before injecting source-summary images", async () => {
@@ -290,7 +358,7 @@ describe("autoIngest image captioning", () => {
     expect(mockCaption).toHaveBeenCalledOnce()
     const summary = files.get(`${PROJECT}/wiki/sources/${SOURCE_STEM}.md`) ?? ""
     expect(summary).toContain(
-      `![图片展示智慧低空政务场景的总体架构。](${IMAGE_REL_PATH})`,
+      `![图片展示智慧低空政务场景的总体架构。](${ENCODED_IMAGE_REL_PATH})`,
     )
     expect(summary).not.toContain("English architecture diagram description")
   })

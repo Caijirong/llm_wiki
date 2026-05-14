@@ -14,6 +14,7 @@
  * image and the markdown line uses that instead.
  */
 import { invoke } from "@tauri-apps/api/core"
+import { encodeMarkdownImageUrl } from "@/lib/markdown-image-url"
 import { getFileName, normalizePath } from "@/lib/path-utils"
 
 /** Mirrors `commands::extract_images::SavedImage` on the Rust side. */
@@ -169,7 +170,7 @@ export function buildImageMarkdownSection(
       // page number anyway.
       const caption = captionsBySha?.get(img.sha256)
       const alt = caption ? sanitize(caption) : ""
-      lines.push(`![${alt}](${img.relPath})`)
+      lines.push(`![${alt}](${encodeMarkdownImageUrl(img.relPath)})`)
     }
     lines.push("")
   }

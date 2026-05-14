@@ -14,6 +14,7 @@ import {
   type SavedImage,
 } from "@/lib/extract-source-images"
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
+import { decodeMarkdownImageUrl, encodeMarkdownImageUrl } from "@/lib/markdown-image-url"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 
 /**
@@ -277,29 +278,36 @@ async function captionSavedImagesForCache(
     outputLanguage?: string
   },
 ) {
-  const pathByRel = new Map(savedImages.map((img) => [img.relPath, img.absPath]))
-  const contextByRel = new Map(
-    savedImages.map((img) => [
-      img.relPath,
-      {
-        before: img.contextBefore?.trim() ?? "",
-        after: img.contextAfter?.trim() ?? "",
-      },
-    ]),
-  )
+  const pathByUrl = new Map<string, string>()
+  const contextByUrl = new Map<string, { before: string; after: string }>()
+  for (const img of savedImages) {
+    const encodedUrl = encodeMarkdownImageUrl(img.relPath)
+    const context = {
+      before: img.contextBefore?.trim() ?? "",
+      after: img.contextAfter?.trim() ?? "",
+    }
+    pathByUrl.set(img.relPath, img.absPath)
+    pathByUrl.set(encodedUrl, img.absPath)
+    contextByUrl.set(img.relPath, context)
+    contextByUrl.set(encodedUrl, context)
+  }
   const markdown = savedImages
     .map((img) => {
-      const context = contextByRel.get(img.relPath)
+      const url = encodeMarkdownImageUrl(img.relPath)
+      const context = contextByUrl.get(url)
       const before = context?.before ? `${context.before}\n` : ""
       const after = context?.after ? `\n${context.after}` : ""
-      return `${before}![](${img.relPath})${after}`
+      return `${before}![](${url})${after}`
     })
     .join("\n")
 
   return captionMarkdownImages(projectPath, markdown, llmConfig, {
     signal: options.signal,
-    shouldCaption: (url) => pathByRel.has(url),
-    urlToAbsPath: (url) => pathByRel.get(url) ?? null,
+    shouldCaption: (url) => pathByUrl.has(url) || pathByUrl.has(decodeMarkdownImageUrl(url)),
+    urlToAbsPath: (url) =>
+      pathByUrl.get(url) ??
+      pathByUrl.get(decodeMarkdownImageUrl(url)) ??
+      null,
     concurrency: options.concurrency,
     onProgress: options.onProgress,
     outputLanguage: options.outputLanguage ?? getOutputLanguage(markdown),
@@ -312,6 +320,10 @@ function captionResultAttempted(result: {
   failed: number
 }): boolean {
   return result.freshCaptions + result.cachedCaptions + result.failed > 0
+}
+
+function isCurrentSourceMediaUrl(url: string, mediaPrefix: string): boolean {
+  return decodeMarkdownImageUrl(url).startsWith(mediaPrefix)
 }
 
 /**
@@ -425,11 +437,10 @@ async function autoIngestImpl(
           const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
           if (captionLlm) {
             try {
+              const mediaPrefix = `${pp}/wiki/media/${fileName.replace(/\.[^.]+$/, "")}/`
               const inlineResult = await captionMarkdownImages(pp, sourceContent, captionLlm, {
                 signal,
-                shouldCaption: (url) =>
-                  url.startsWith(`${pp}/wiki/media/${fileName.replace(/\.[^.]+$/, "")}/`),
-                urlToAbsPath: (url) => url,
+                shouldCaption: (url) => isCurrentSourceMediaUrl(url, mediaPrefix),
                 concurrency: mmCfg.concurrency,
                 outputLanguage: getOutputLanguage(sourceContent),
                 onProgress: (done, total) =>
@@ -583,8 +594,7 @@ async function autoIngestImpl(
         // pre-existing markdown image refs the user may have typed
         // into the source content (e.g. for hand-authored .md
         // sources).
-        shouldCaption: (url) => url.startsWith(ourMediaPrefix),
-        urlToAbsPath: (url) => url, // already absolute in our extraction output
+        shouldCaption: (url) => isCurrentSourceMediaUrl(url, ourMediaPrefix),
         concurrency: mmCfg.concurrency,
         outputLanguage: getOutputLanguage(sourceContent),
         onProgress,

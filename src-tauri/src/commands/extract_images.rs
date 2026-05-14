@@ -208,7 +208,8 @@ pub fn extract_pdf_markdown(
             // helper lands (Phase 3a) we have nothing meaningful to
             // put there, and a placeholder like "image" or the file
             // name only adds noise to the LLM and to screen readers.
-            page_image_md.push(format!("![]({prefix}/{file_name})"));
+            let image_url = encode_markdown_image_url(&format!("{prefix}/{file_name}"));
+            page_image_md.push(format!("![]({image_url})"));
             if total_saved as usize >= options.max_images {
                 eprintln!(
                     "[extract_pdf_markdown] reached max_images={} cap; skipped rest",
@@ -483,6 +484,67 @@ fn guess_mime_from_name(name: &str) -> Option<String> {
         // Vector formats explicitly skipped — we don't have a
         // rasterizer wired up in this phase.
         _ => None,
+    }
+}
+
+fn encode_uri_component_like(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(segment.len());
+    for &byte in segment.as_bytes() {
+        let ch = byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')') {
+            out.push(ch);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn encode_markdown_image_url(url: &str) -> String {
+    let normalized = url.replace('\\', "/");
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if normalized.contains("://") {
+        return normalized;
+    }
+
+    let (prefix, rest) = if normalized.len() >= 3
+        && normalized.as_bytes()[0].is_ascii_alphabetic()
+        && normalized.as_bytes()[1] == b':'
+        && normalized.as_bytes()[2] == b'/'
+    {
+        (&normalized[..3], &normalized[3..])
+    } else if let Some(stripped) = normalized.strip_prefix("//") {
+        ("//", stripped)
+    } else if let Some(stripped) = normalized.strip_prefix('/') {
+        ("/", stripped)
+    } else if let Some(stripped) = normalized.strip_prefix("./") {
+        ("./", stripped)
+    } else {
+        ("", normalized.as_str())
+    };
+
+    let trailing_slash = !rest.is_empty() && rest.ends_with('/');
+    let encoded = rest
+        .split('/')
+        .map(|segment| {
+            if segment.is_empty() {
+                String::new()
+            } else {
+                encode_uri_component_like(segment)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    if trailing_slash && !encoded.ends_with('/') {
+        format!("{prefix}{encoded}/")
+    } else {
+        format!("{prefix}{encoded}")
     }
 }
 
@@ -1358,6 +1420,22 @@ mod tests {
         // mislead the caption pipeline.
         assert_eq!(guess_mime_from_name("ppt/media/foo.svg"), None);
         assert_eq!(guess_mime_from_name("ppt/media/foo.emf"), None);
+    }
+
+    #[test]
+    fn encode_markdown_image_url_percent_encodes_path_segments() {
+        assert_eq!(
+            encode_markdown_image_url("/Users/me/My Wiki/wiki/media/foo bar/img-1.png"),
+            "/Users/me/My%20Wiki/wiki/media/foo%20bar/img-1.png"
+        );
+        assert_eq!(
+            encode_markdown_image_url("media/望城区“智慧低空” 政务场景/img-2.png"),
+            "media/%E6%9C%9B%E5%9F%8E%E5%8C%BA%E2%80%9C%E6%99%BA%E6%85%A7%E4%BD%8E%E7%A9%BA%E2%80%9D%20%E6%94%BF%E5%8A%A1%E5%9C%BA%E6%99%AF/img-2.png"
+        );
+        assert_eq!(
+            encode_markdown_image_url("C:/Users/me/My Files/img 3.png"),
+            "C:/Users/me/My%20Files/img%203.png"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
  * on macOS, `https://asset.localhost/` on Windows, etc.).
  */
 import { describe, it, expect, vi } from "vitest"
+import { fromMarkdown } from "mdast-util-from-markdown"
 
 // Hoisted mock — all calls to convertFileSrc return `tauri-asset:<path>`
 // so tests can assert the input path was assembled correctly without
@@ -17,8 +18,33 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { resolveMarkdownImageSrc } from "./markdown-image-resolver"
 
+function collectImageUrls(markdown: string): string[] {
+  const root = fromMarkdown(markdown) as unknown as {
+    children?: Array<Record<string, unknown>>
+  }
+  const out: string[] = []
+  const stack = [...(root.children ?? [])]
+  while (stack.length > 0) {
+    const node = stack.pop()
+    if (!node) continue
+    if (node.type === "image" && typeof node.url === "string") {
+      out.push(node.url)
+    }
+    const children = Array.isArray(node.children) ? node.children : []
+    stack.push(...children as Array<Record<string, unknown>>)
+  }
+  return out.reverse()
+}
+
 describe("resolveMarkdownImageSrc", () => {
   const PROJECT = "/Users/me/MyWiki"
+
+  it("shows why markdown image URLs must be encoded when a path segment contains spaces", () => {
+    expect(collectImageUrls("![](media/foo bar/img-1.png)")).toEqual([])
+    expect(collectImageUrls("![](media/foo%20bar/img-1.png)")).toEqual([
+      "media/foo%20bar/img-1.png",
+    ])
+  })
 
   it("passes http(s) URLs through unchanged", () => {
     expect(resolveMarkdownImageSrc("https://example.com/img.png", PROJECT)).toBe(
@@ -64,6 +90,15 @@ describe("resolveMarkdownImageSrc", () => {
     ).toBe("tauri-asset:/Users/me/MyWiki/wiki/media/望城区“智慧低空”/img-2.png")
   })
 
+  it("decodes encoded spaces before resolving to a filesystem path", () => {
+    expect(
+      resolveMarkdownImageSrc(
+        "media/source%20with%20spaces/img-2.png",
+        "/Users/me/My Wiki",
+      ),
+    ).toBe("tauri-asset:/Users/me/My Wiki/wiki/media/source with spaces/img-2.png")
+  })
+
   it("resolves nested paths (e.g. user-organized subfolders) under wiki/ root", () => {
     expect(
       resolveMarkdownImageSrc("entities/transformer/diagram.png", PROJECT),
@@ -88,7 +123,7 @@ describe("resolveMarkdownImageSrc", () => {
   it("treats a UNC path as absolute", () => {
     expect(
       resolveMarkdownImageSrc("\\\\share\\folder\\img.png", PROJECT),
-    ).toBe("tauri-asset:\\\\share\\folder\\img.png")
+    ).toBe("tauri-asset://share/folder/img.png")
   })
 
   it("returns the raw src unchanged when no project is loaded", () => {

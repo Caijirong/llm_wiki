@@ -24,6 +24,8 @@
  *     the wiki summary). Callers fall back gracefully.
  */
 import { listDirectory } from "@/commands/fs"
+import { decodeMarkdownImageUrl, encodeMarkdownImageUrl } from "@/lib/markdown-image-url"
+import { isAbsolutePath, normalizePath } from "@/lib/path-utils"
 import type { FileNode } from "@/types/wiki"
 
 export async function findRawSourceForImage(
@@ -34,7 +36,8 @@ export async function findRawSourceForImage(
   //   1. ABSOLUTE: `/Users/.../wiki/media/<slug>/img-N.png`
   //   2. WIKI-RELATIVE: `media/<slug>/img-N.png`
   // Match `media/<slug>/` either at the URL start or after any `/`.
-  const m = imageUrl.replace(/\\/g, "/").match(/(?:^|\/)media\/([^/]+)\//)
+  const decodedUrl = decodeMarkdownImageUrl(imageUrl)
+  const m = decodedUrl.replace(/\\/g, "/").match(/(?:^|\/)media\/([^/]+)\//)
   if (!m) return null
   const slug = m[1]
 
@@ -77,11 +80,10 @@ export function imageUrlToAbsolute(
   imageUrl: string,
   projectPath: string,
 ): string {
-  const isAbsolute =
-    imageUrl.startsWith("/") ||
-    /^[a-zA-Z]:/.test(imageUrl) ||
-    imageUrl.startsWith("\\\\")
-  if (isAbsolute) return imageUrl
-  const cleaned = imageUrl.replace(/^\.\//, "")
-  return `${projectPath.replace(/\/+$/, "")}/wiki/${cleaned}`
+  const normalized = normalizePath(imageUrl)
+  if (isAbsolutePath(normalized)) {
+    return encodeMarkdownImageUrl(normalized)
+  }
+  const cleaned = normalized.replace(/^\.\//, "")
+  return encodeMarkdownImageUrl(`${normalizePath(projectPath).replace(/\/+$/, "")}/wiki/${cleaned}`)
 }

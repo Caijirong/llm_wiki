@@ -26,7 +26,8 @@
  * verbatim.
  */
 import { convertFileSrc } from "@tauri-apps/api/core"
-import { normalizePath } from "@/lib/path-utils"
+import { decodeMarkdownImageUrl } from "@/lib/markdown-image-url"
+import { isAbsolutePath, normalizePath } from "@/lib/path-utils"
 
 const PASSTHROUGH_RE = /^(https?:|data:|blob:|file:|tauri:)/i
 
@@ -45,13 +46,11 @@ export function resolveMarkdownImageSrc(
   if (!projectPath) return rawSrc
 
   const pp = normalizePath(projectPath)
-  const src = decodeMarkdownImageSrc(rawSrc)
-  const isAbsolute =
-    src.startsWith("/") || /^[a-zA-Z]:/.test(src) || src.startsWith("\\\\")
+  const src = decodeMarkdownImageUrl(rawSrc)
 
   // Absolute paths get fed straight to convertFileSrc — the user (or
   // some plugin) explicitly chose that path; we don't second-guess.
-  if (isAbsolute) return convertFileSrc(src)
+  if (isAbsolutePath(src)) return convertFileSrc(src)
 
   // Strip a leading `./` for cleanliness; treat `media/foo.png` and
   // `./media/foo.png` identically.
@@ -63,12 +62,4 @@ export function resolveMarkdownImageSrc(
   // stable regardless of page depth.
   const absolute = `${pp}/wiki/${cleaned}`
   return convertFileSrc(absolute)
-}
-
-function decodeMarkdownImageSrc(src: string): string {
-  try {
-    return decodeURI(src)
-  } catch {
-    return src
-  }
 }
