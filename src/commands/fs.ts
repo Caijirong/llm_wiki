@@ -32,6 +32,10 @@ export async function preprocessFile(path: string): Promise<string> {
   return invoke<string>("preprocess_file", { path })
 }
 
+export async function deletePreprocessedCache(path: string): Promise<void> {
+  return invoke("delete_preprocessed_cache", { path })
+}
+
 export async function deleteFile(path: string): Promise<void> {
   return invoke("delete_file", { path })
 }

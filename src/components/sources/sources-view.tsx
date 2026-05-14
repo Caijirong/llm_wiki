@@ -5,7 +5,7 @@ import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, Chev
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
-import { copyFile, listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages, preprocessFile } from "@/commands/fs"
+import { copyFile, listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages, preprocessFile, deletePreprocessedCache } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { enqueueIngest, enqueueBatch } from "@/lib/ingest-queue"
 import { useTranslation } from "react-i18next"
@@ -326,7 +326,7 @@ export function SourcesView() {
 
     // Step 3: Delete preprocessed cache
     try {
-      await deleteFile(`${pp}/raw/sources/.cache/${fileName}.txt`)
+      await deletePreprocessedCache(node.path)
     } catch {
       // cache file may not exist
     }

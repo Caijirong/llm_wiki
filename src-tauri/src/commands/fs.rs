@@ -17,6 +17,7 @@ const MEDIA_EXTS: &[&str] = &[
     "mp3", "wav", "ogg", "flac", "aac", "m4a", "wma",
 ];
 const LEGACY_DOC_EXTS: &[&str] = &["doc", "xls", "ppt", "pages", "numbers", "key", "epub"];
+const PREPROCESS_CACHE_VERSION: &str = "v2";
 
 #[tauri::command]
 pub async fn read_file(path: String) -> Result<String, String> {
@@ -107,14 +108,48 @@ pub async fn preprocess_file(path: String) -> Result<String, String> {
     .map_err(|e| format!("preprocess_file blocking task join error: {e}"))?
 }
 
-fn cache_path_for(original: &Path) -> std::path::PathBuf {
+fn preprocess_cache_dir_for(original: &Path) -> std::path::PathBuf {
     let parent = original.parent().unwrap_or(Path::new("."));
-    let cache_dir = parent.join(".cache");
+    parent.join(".cache")
+}
+
+fn legacy_cache_path_for(original: &Path) -> std::path::PathBuf {
+    let cache_dir = preprocess_cache_dir_for(original);
     let file_name = original
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
     cache_dir.join(format!("{}.txt", file_name))
+}
+
+fn cache_path_for(original: &Path) -> std::path::PathBuf {
+    let cache_dir = preprocess_cache_dir_for(original);
+    let file_name = original
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    cache_dir.join(format!("{}-{}.txt", PREPROCESS_CACHE_VERSION, file_name))
+}
+
+fn preprocess_cache_paths_for_cleanup(original: &Path) -> Vec<std::path::PathBuf> {
+    vec![cache_path_for(original), legacy_cache_path_for(original)]
+}
+
+fn delete_preprocessed_cache_files(original: &Path) -> Result<(), String> {
+    for cache_path in preprocess_cache_paths_for_cleanup(original) {
+        match fs::remove_file(&cache_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "Failed to delete preprocessed cache '{}': {}",
+                    cache_path.display(),
+                    err
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_cache(original: &Path) -> Option<String> {
@@ -135,6 +170,17 @@ fn write_cache(original: &Path, text: &str) -> Result<(), String> {
     }
     fs::write(&cache_path, text)
         .map_err(|e| format!("Failed to write cache: {}", e))
+}
+
+#[tauri::command]
+pub async fn delete_preprocessed_cache(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("delete_preprocessed_cache", || {
+            delete_preprocessed_cache_files(Path::new(&path))
+        })
+    })
+    .await
+    .map_err(|e| format!("delete_preprocessed_cache blocking task join error: {e}"))?
 }
 
 /// Global PDFium instance — the library prefers a single binding shared
@@ -1705,6 +1751,41 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn preprocess_cache_path_is_versioned() {
+        let source = Path::new("/tmp/raw/sources/demo.pdf");
+        assert_eq!(
+            cache_path_for(source),
+            Path::new("/tmp/raw/sources/.cache/v2-demo.pdf.txt")
+        );
+        assert_ne!(
+            cache_path_for(source),
+            Path::new("/tmp/raw/sources/.cache/demo.pdf.txt")
+        );
+    }
+
+    #[test]
+    fn delete_preprocessed_cache_files_removes_legacy_and_versioned_entries() {
+        let root = make_temp_dir("preprocess-cache");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("demo.pdf");
+        std::fs::write(&source, b"%PDF-fake").unwrap();
+
+        let legacy = legacy_cache_path_for(&source);
+        let versioned = cache_path_for(&source);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "legacy").unwrap();
+        std::fs::write(&versioned, "versioned").unwrap();
+
+        delete_preprocessed_cache_files(&source).unwrap();
+
+        assert!(!legacy.exists(), "legacy cache should be removed");
+        assert!(!versioned.exists(), "versioned cache should be removed");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Pull the inner sync `copy_recursive` body out from
