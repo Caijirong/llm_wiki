@@ -88,15 +88,16 @@
 
 当前系统已有 `multimodalConfig.enabled` 总开关。第一版明确：
 
-- `document-manual` 项目的“小视觉元素进入知识库”不受该总开关抑制
-- 该总开关只控制“是否调用视觉 LLM 进一步润色组标题 / 成员标签”
+- `multimodalConfig.enabled` 的优先级高于 `projectKind`
+- 该总开关仍然是“图片是否进入 wiki 知识”的硬门
+- `document-manual` 只在该总开关开启后，决定 DOCX 小视觉元素如何进入知识库
 - 当总开关关闭时：
-  - 仍然执行小视觉元素提取
-  - 仍然执行 `semantic group` 建立
-  - 仍然写入 `wiki/sources/<slug>.md`
-  - 只是成员标签与组标题退化为结构文本推断 / 无 LLM 版本
+  - 不执行小视觉元素知识注入
+  - 不写入 `wiki/sources/<slug>.md` 的视觉知识区块
+  - 不参与搜索与 embedding
+  - 图片文件仍可按现有逻辑落到 `wiki/media/` 供原始预览使用
 
-这保证 `projectKind` 仍然是本特性的唯一项目级输入，同时避免被现有全局 caption 开关意外压掉。
+这保证当前产品对全局开关的语义保持不变：全局 > 项目。
 
 ## Behavioral Design
 
