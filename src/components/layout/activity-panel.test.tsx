@@ -48,7 +48,7 @@ const {
       (task) => task.status === "pending" || task.status === "processing",
     )
   }),
-  syncQueueFromDisk: vi.fn(async () => {}),
+  syncQueueFromDisk: vi.fn(async (_projectId: string, _projectPath: string) => {}),
 }))
 
 vi.mock("@/lib/ingest-queue", () => ({
