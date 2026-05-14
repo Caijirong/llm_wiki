@@ -55,7 +55,8 @@
 
 - `projectKind` 一旦由模板创建，不在 UI 中提供修改入口
 - 老项目缺失该字段时，按 `general` 处理
-- 运行时逻辑只读取 `projectKind`
+- 运行时的项目分支只读取 `projectKind`
+- 但这不等于“忽略所有全局设置”：现有全局设置若与 `document-manual` 固定行为冲突，必须在实现中显式定义优先级
 
 ### 2. 模板只负责写入项目类型
 
@@ -82,6 +83,20 @@
 
 - 非 `document-manual` 项目保持当前行为
 - `document-manual` 项目的 `PDF / PPTX` 在第一版仍保持当前行为
+
+### 4. `document-manual` 对多模态总开关的优先级
+
+当前系统已有 `multimodalConfig.enabled` 总开关。第一版明确：
+
+- `document-manual` 项目的“小视觉元素进入知识库”不受该总开关抑制
+- 该总开关只控制“是否调用视觉 LLM 进一步润色组标题 / 成员标签”
+- 当总开关关闭时：
+  - 仍然执行小视觉元素提取
+  - 仍然执行 `semantic group` 建立
+  - 仍然写入 `wiki/sources/<slug>.md`
+  - 只是成员标签与组标题退化为结构文本推断 / 无 LLM 版本
+
+这保证 `projectKind` 仍然是本特性的唯一项目级输入，同时避免被现有全局 caption 开关意外压掉。
 
 ## Behavioral Design
 
@@ -127,7 +142,7 @@
 
 第一版固定采用如下分组思路：
 
-1. 先按 `document.xml` 顺序构建视觉锚点序列
+1. 先按 `document.xml` 顺序构建视觉锚点 occurrence 序列
 2. 只对 `small_visual` 做组判断
 3. 按结构邻近与文本邻近建立组
 
@@ -212,6 +227,7 @@ Context: “设备连接状态说明”
 - 小视觉元素按 `semantic group` 展示
 - 组内按 member 展示，不丢掉不同状态 / 不同按钮成员
 - 组内重复成员只在去重后保留一次
+- 该区块不是对现有 `## Embedded Images` 的轻量改写，而是新的 group-aware 写入契约
 
 ## Search and Retrieval
 
@@ -233,6 +249,16 @@ Context: “设备连接状态说明”
 - 搜中某个成员时，结果中仍能看到其同组的其他成员
 - wiki 页面中能看到分组后的视觉元素总结
 
+### Search UI contract
+
+第一版不仅要求“页面文本可被召回”，还要求搜索展示层保留 group 语义：
+
+- 当 query 命中某个 group title / group summary / member label 时
+- Search UI 需要展示整个 group，而不是继续把图片按 URL 扁平化
+- “命中一个成员时看到同组其他成员”是本特性的显式范围内要求
+
+这意味着搜索展示需要新的 group-aware 数据流，不能继续只消费扁平 `ImageRef[]`
+
 ## Technical Design
 
 ### Project metadata
@@ -244,6 +270,8 @@ Context: “设备连接状态说明”
 - `ensureProjectId()` 兼容读取老格式
 - 若无 `projectKind`，默认视为 `general`
 - 新增一个显式写入 `projectKind` 的 helper
+- 设置 `projectKind` 时不得因解析失败而重建 `id`
+- 设置 `projectKind` 必须走单一的 read-modify-write helper，保证不会破坏现有 `id`
 
 建议结构：
 
@@ -268,6 +296,8 @@ interface ProjectIdentity {
 - `business`
 - `document-manual`
 
+本特性依赖 `projectKind`，不依赖模板写入的 `schema.md / purpose.md` 文本内容来驱动运行时行为。
+
 ### Create-project flow
 
 [src/components/project/create-project-dialog.tsx](../../../src/components/project/create-project-dialog.tsx) 在创建项目后：
@@ -279,7 +309,7 @@ interface ProjectIdentity {
 
 ### Extraction boundary
 
-第一版不把“策略配置”下推为可调参数，而是下推为固定 profile 分支：
+第一版不把“策略配置”下推为可调参数，而是下推为固定代码分支：
 
 - default profile
 - document-manual profile
@@ -289,8 +319,9 @@ interface ProjectIdentity {
 对于 `document-manual + DOCX`：
 
 - Office 图片提取路径放宽小视觉元素的提取范围
-- Rust 不再只返回“平铺图片列表”，而是先构建文档顺序的视觉锚点
-- Rust 返回的图片元信息增加固定分类字段，避免在 TS 重复判断
+- Rust 不再只返回“平铺图片列表”，而是先构建文档顺序的视觉 occurrence
+- 默认 `SavedImage[]` 合同不足以表达本特性；第一版需要一个 `document-manual + DOCX` 专用返回合同
+- JS 侧不能仅靠现有 `extract_and_save_office_images_cmd(sourcePath, destDir, relTo)` 达成该能力
 
 建议新增元信息：
 
@@ -300,10 +331,10 @@ visualClass: "regular_visual" | "small_visual"
 
 这不是用户可配置数据，只是提取结果的内部结构化标记。
 
-并新增一层内部锚点结构：
+并新增一层内部 occurrence 结构：
 
 ```ts
-type DocxVisualAnchor = {
+type DocxVisualOccurrence = {
   mediaPath: string
   docOrder: number
   sectionTitle: string | null
@@ -320,29 +351,67 @@ type DocxVisualAnchor = {
 
 该结构用于建立 `semantic group`，不是对外配置。
 
+第一版实现约束：
+
+- occurrence 必须来自 `word/document.xml` 主文档锚点顺序
+- 不是所有 `word/media/*` 文件都能进入这条链路
+- 没有主文档锚点的 media 资源不参与 `semantic group`
+
+第一版显式排除：
+
+- `svg / emf / wmf` 等当前未栅格化的 Office 资源
+- 仅出现在 header/footer/theme/unused asset 中、未出现在 `word/document.xml` 主文档锚点序列中的资源
+
+这些排除项属于第一版已知边界，不视为 bug
+
+### Command/API insertion point
+
+第一版需要明确新的插入点，而不是隐含复用旧命令：
+
+- 非 `document-manual` 或非 `DOCX`：
+  - 继续走现有 `extract_and_save_office_images_cmd`
+- `document-manual + DOCX`：
+  - 走新的专用 Rust 命令
+  - 返回 occurrence-based 结果，而不是平铺 `SavedImage[]`
+
+是否命名为：
+
+- `extract_and_save_docx_manual_visuals_cmd`
+
+或等价名称，可在 implementation plan 再定；但“新增专用命令”本身在本 spec 中已明确。
+
 ### Ingest pipeline
 
-在 ingest 阶段：
+在 ingest 阶段，必须统一收敛到共享 helper，而不是分别在不同入口各写一套分支。
+
+第一版覆盖的入口至少包括：
+
+- `autoIngest()`
+- `startIngest() / executeIngestWrites()` 路径
+
+在共享 helper 中：
 
 1. 读取当前项目 `projectKind`
 2. 若不是 `document-manual`，沿用当前逻辑
 3. 若是 `document-manual + DOCX`
-   - 提取图片
+   - 调用 DOCX manual 专用提取命令
    - 将结果拆为 `regular_visual` 与 `small_visual`
-   - 按 `document.xml` 顺序构建 `DocxVisualAnchor` 序列
+   - 按 `document.xml` 顺序构建 `DocxVisualOccurrence` 序列
    - 基于结构邻近与文本邻近建立 `semantic group`
    - 对每个 group 生成组级标题与摘要
    - 对每个 member 生成标签文本
    - 组内再做 `sha256 + label` 去重
    - 生成固定区块 `## UI Visual Elements`
-   - 与现有 source-summary 写入逻辑合并
+   - 通过新的 group-aware writer 写入 source summary
+
+第一版不复用当前只能处理平铺 `SavedImage[]` 的 `injectImagesIntoSourceSummary()` 作为唯一 writer；需要新的 group-aware 写入契约。
 
 ## Error Handling
 
 - 小视觉元素链路失败不能中断整个 ingest
 - group caption 单项失败只影响该 group
 - 老项目缺失 `projectKind` 不报错，自动视为 `general`
-- 模板写入 `projectKind` 失败时，项目仍可创建，但应记录告警并回退为 `general`
+- 模板写入 `projectKind` 失败时，项目仍可创建，但不得破坏已有 `project id`
 
 ## Testing
 
@@ -361,12 +430,15 @@ type DocxVisualAnchor = {
   - 输出 markdown 中生成固定的 `## UI Visual Elements` 区块
 - `search`
   - 小视觉元素的组标题、成员标签、上下文文本可参与召回
+  - 命中单个成员时，Search UI 能展示同组其他成员
 
 ## Risks
 
 - DOCX 中某些小资源可能仍是纯装饰噪声
 - 仅依赖邻近结构，仍可能把不相关小图误并到一组
 - 仅依赖组内去重，无法合并“视觉上相同但像素略不同”的近似成员
+- 第一版不支持未栅格化的 Office 向量图标资源
+- Search UI 需要配套改造，否则只能做到“页面可召回”而不能做到“组可展示”
 
 这些风险第一版接受。优先保证：
 
