@@ -123,7 +123,7 @@
 - `状态2: 连接中`
 - `状态3: 已连接`
 
-这三张图应属于同一个 `status_series` 组，而不是三个彼此独立的单图节点。
+这三张图应属于同一个“设备状态”语义组，而不是三个彼此独立的单图节点。
 
 第一版固定采用如下分组思路：
 
@@ -153,17 +153,6 @@
 
 这是实现逻辑，不做成配置。
 
-### Group typing
-
-`semantic group` 建立后，再对组进行固定分类。第一版使用内置类别：
-
-- `button_series`
-- `status_series`
-- `mode_series`
-- `other_visual_series`
-
-分类方式由代码决定，不开放用户配置类别。
-
 ### Captioning
 
 `regular_visual` 继续走现有 caption 链路。
@@ -172,7 +161,6 @@
 
 - 组级：
   - 生成 group title / group summary
-  - 识别这是状态组、按钮组还是模式组
 - 成员级：
   - 为每个 member 生成短标签
   - 优先使用该图片邻近的短文本
@@ -206,7 +194,6 @@ prompt 偏向识别：
 
 ### Device Status
 
-Group type: Status series
 Context: “设备连接状态说明”
 
 - 状态1：未连接
@@ -233,7 +220,6 @@ Context: “设备连接状态说明”
 效果来源：
 
 - group title / group summary
-- group 类型名
 - member 标签文本
 - 组级上下文
 - 组内成员图片
@@ -348,7 +334,6 @@ type DocxVisualAnchor = {
    - 对每个 group 生成组级标题与摘要
    - 对每个 member 生成标签文本
    - 组内再做 `sha256 + label` 去重
-   - 对 group 做固定分类
    - 生成固定区块 `## UI Visual Elements`
    - 与现有 source-summary 写入逻辑合并
 
@@ -382,7 +367,6 @@ type DocxVisualAnchor = {
 - DOCX 中某些小资源可能仍是纯装饰噪声
 - 仅依赖邻近结构，仍可能把不相关小图误并到一组
 - 仅依赖组内去重，无法合并“视觉上相同但像素略不同”的近似成员
-- 小视觉元素分类 prompt 若过弱，`button / status / mode` 可能混淆
 
 这些风险第一版接受。优先保证：
 
