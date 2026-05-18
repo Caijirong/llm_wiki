@@ -15,6 +15,7 @@ import { normalizePath } from "@/lib/path-utils"
 import { OUTPUT_LANGUAGE_OPTIONS } from "@/lib/output-language-options"
 import { useWikiStore, type OutputLanguage } from "@/stores/wiki-store"
 import { saveOutputLanguage } from "@/lib/project-store"
+import { setProjectKind } from "@/lib/project-identity"
 
 interface CreateProjectDialogProps {
   open: boolean
@@ -67,6 +68,11 @@ export function CreateProjectDialog({ open: isOpen, onOpenChange, onCreated }: C
       await writeFile(`${pp}/purpose.md`, template.purpose)
       for (const dir of template.extraDirs) {
         await createDirectory(`${pp}/${dir}`)
+      }
+      try {
+        await setProjectKind(pp, template.projectKind)
+      } catch (err) {
+        console.warn("[create-project] failed to persist projectKind:", err)
       }
 
       // Persist the user's language choice. The store / disk

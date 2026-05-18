@@ -19,10 +19,22 @@ import { normalizePath } from "@/lib/path-utils"
 
 const STORE_NAME = "app-state.json"
 const REGISTRY_KEY = "projectRegistry"
+const DEFAULT_PROJECT_KIND = "general"
+const PROJECT_KINDS = [
+  "general",
+  "research",
+  "reading",
+  "personal",
+  "business",
+  "document-manual",
+] as const
+
+export type ProjectKind = (typeof PROJECT_KINDS)[number]
 
 export interface ProjectIdentity {
   id: string
   createdAt: number
+  projectKind?: ProjectKind
 }
 
 export interface ProjectRegistryEntry {
@@ -40,31 +52,126 @@ function identityPath(projectPath: string): string {
   return `${normalizePath(projectPath)}/.llm-wiki/project.json`
 }
 
+function isProjectKind(value: unknown): value is ProjectKind {
+  return typeof value === "string" &&
+    (PROJECT_KINDS as readonly string[]).includes(value)
+}
+
+function parseProjectIdentity(raw: string): ProjectIdentity | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (!parsed || typeof parsed !== "object") return null
+    if (typeof parsed.id !== "string" || typeof parsed.createdAt !== "number") {
+      return null
+    }
+    return {
+      id: parsed.id,
+      createdAt: parsed.createdAt,
+      projectKind: isProjectKind(parsed.projectKind)
+        ? parsed.projectKind
+        : undefined,
+    }
+  } catch {
+    return salvageProjectIdentity(raw)
+  }
+}
+
+function salvageProjectIdentity(raw: string): ProjectIdentity | null {
+  const idMatch = raw.match(/"id"\s*:\s*"([^"]+)"/)
+  const createdAtMatch = raw.match(/"createdAt"\s*:\s*(\d+)/)
+  if (!idMatch || !createdAtMatch) return null
+
+  const projectKindMatch = raw.match(/"projectKind"\s*:\s*"([^"]+)"/)
+  const projectKind = projectKindMatch && isProjectKind(projectKindMatch[1])
+    ? projectKindMatch[1]
+    : undefined
+
+  return {
+    id: idMatch[1],
+    createdAt: Number(createdAtMatch[1]),
+    projectKind,
+  }
+}
+
+function createProjectIdentity(projectKind?: ProjectKind): ProjectIdentity {
+  return {
+    id: crypto.randomUUID(),
+    createdAt: Date.now(),
+    projectKind,
+  }
+}
+
+async function loadProjectIdentity(projectPath: string): Promise<ProjectIdentity | null> {
+  try {
+    const raw = await readFile(identityPath(projectPath))
+    return parseProjectIdentity(raw)
+  } catch {
+    return null
+  }
+}
+
+async function writeProjectIdentity(
+  projectPath: string,
+  identity: ProjectIdentity,
+): Promise<void> {
+  await writeFile(
+    identityPath(projectPath),
+    JSON.stringify(identity, null, 2),
+  )
+}
+
 /**
  * Return the project's stable UUID. Generates + writes one on first call
  * for a project that doesn't have `.llm-wiki/project.json` yet.
  */
 export async function ensureProjectId(projectPath: string): Promise<string> {
-  const path = identityPath(projectPath)
-  try {
-    const raw = await readFile(path)
-    const parsed = JSON.parse(raw) as ProjectIdentity
-    if (parsed?.id && typeof parsed.id === "string") {
-      return parsed.id
-    }
-  } catch {
-    // missing or corrupt — fall through to create
+  const identity = await loadProjectIdentity(projectPath)
+  if (identity?.id) {
+    return identity.id
   }
-  const identity: ProjectIdentity = {
-    id: crypto.randomUUID(),
-    createdAt: Date.now(),
-  }
+  const created = createProjectIdentity()
   try {
-    await writeFile(path, JSON.stringify(identity, null, 2))
+    await writeProjectIdentity(projectPath, created)
   } catch (err) {
     console.warn("[project-identity] failed to write identity file:", err)
   }
-  return identity.id
+  return created.id
+}
+
+export async function getProjectKind(projectPath: string): Promise<ProjectKind> {
+  const identity = await loadProjectIdentity(projectPath)
+  return identity?.projectKind ?? DEFAULT_PROJECT_KIND
+}
+
+export async function setProjectKind(
+  projectPath: string,
+  projectKind: ProjectKind,
+): Promise<void> {
+  const path = identityPath(projectPath)
+  let existingRaw: string | null = null
+  try {
+    existingRaw = await readFile(path)
+  } catch {
+    existingRaw = null
+  }
+
+  if (existingRaw == null) {
+    await writeProjectIdentity(projectPath, createProjectIdentity(projectKind))
+    return
+  }
+
+  const identity = parseProjectIdentity(existingRaw)
+  if (!identity) {
+    throw new Error(
+      `Cannot safely write projectKind for "${path}" because the existing id/createdAt could not be preserved`,
+    )
+  }
+
+  await writeProjectIdentity(projectPath, {
+    id: identity.id,
+    createdAt: identity.createdAt,
+    projectKind,
+  })
 }
 
 // ── Global registry (Tauri plugin-store) ──────────────────────────────────

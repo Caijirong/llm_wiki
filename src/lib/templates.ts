@@ -1,8 +1,11 @@
+import type { ProjectKind } from "@/lib/project-identity"
+
 export interface WikiTemplate {
   id: string
   name: string
   description: string
   icon: string
+  projectKind: ProjectKind
   schema: string
   purpose: string
   extraDirs: string[]
@@ -71,6 +74,7 @@ const researchTemplate: WikiTemplate = {
   name: "Research",
   description: "Deep-dive research with hypothesis tracking and methodology notes",
   icon: "🔬",
+  projectKind: "research",
   extraDirs: ["wiki/methodology", "wiki/findings", "wiki/thesis"],
   schema: `# Wiki Schema — Research Deep-Dive
 
@@ -191,6 +195,7 @@ const readingTemplate: WikiTemplate = {
   name: "Reading",
   description: "Track a book's characters, themes, plot threads, and chapter notes",
   icon: "📚",
+  projectKind: "reading",
   extraDirs: ["wiki/characters", "wiki/themes", "wiki/plot-threads", "wiki/chapters"],
   schema: `# Wiki Schema — Reading a Book
 
@@ -308,6 +313,7 @@ const personalTemplate: WikiTemplate = {
   name: "Personal Growth",
   description: "Track goals, habits, reflections, and journal entries for self-improvement",
   icon: "🌱",
+  projectKind: "personal",
   extraDirs: ["wiki/goals", "wiki/habits", "wiki/reflections", "wiki/journal"],
   schema: `# Wiki Schema — Personal Growth
 
@@ -436,6 +442,7 @@ const businessTemplate: WikiTemplate = {
   name: "Business",
   description: "Manage meetings, decisions, projects, and stakeholder context for a team",
   icon: "💼",
+  projectKind: "business",
   extraDirs: ["wiki/meetings", "wiki/decisions", "wiki/projects", "wiki/stakeholders"],
   schema: `# Wiki Schema — Business / Team
 
@@ -569,11 +576,91 @@ ${BASE_CONTRADICTION}
 `,
 }
 
+const documentManualTemplate: WikiTemplate = {
+  id: "document-manual",
+  name: "Document / Manual",
+  description: "Structure product manuals and preserve UI icon semantics for wiki recall",
+  icon: "🧭",
+  projectKind: "document-manual",
+  extraDirs: [],
+  schema: `# Wiki Schema — Document / Manual
+
+## Page Types
+
+| Type | Directory | Purpose |
+|------|-----------|---------|
+${BASE_SCHEMA_TYPES}
+
+## Naming Conventions
+
+${BASE_NAMING}
+
+## Frontmatter
+
+${BASE_FRONTMATTER}
+
+## Index Format
+
+${BASE_INDEX_FORMAT}
+
+## Log Format
+
+${BASE_LOG_FORMAT}
+
+## Cross-referencing Rules
+
+${BASE_CROSSREF}
+
+## Manual-Specific Conventions
+
+- Source summaries should retain operation steps, state distinctions, and UI terminology
+- Keep labels close to the wording used in the original manual where possible
+- Prefer concrete control names over generic paraphrases when documenting procedures
+`,
+  purpose: `# Project Purpose — Document / Manual
+
+## Product / System
+
+<!-- What manual or operational document does this wiki support? -->
+
+## Primary Users
+
+<!-- Who will search this wiki: operators, support, onboarding, implementation teams, etc.? -->
+
+- 
+
+## Knowledge Goals
+
+<!-- What should the wiki help users re-find quickly? -->
+
+1.
+2.
+3.
+
+## In Scope
+
+- Procedures
+- UI states and terminology
+- Operational cautions and edge cases
+
+## Out of Scope
+
+- Product strategy
+- Unverified behavior not documented in the source
+
+## Success Criteria
+
+- Users can find the right manual page from UI labels, states, and nearby context
+- Source summaries retain the distinctions that matter for operation and troubleshooting
+`,
+}
+
 const generalTemplate: WikiTemplate = {
   id: "general",
   name: "General",
   description: "Minimal setup — a blank slate for any purpose",
   icon: "📄",
+  projectKind: "general",
   extraDirs: [],
   schema: `# Wiki Schema
 
@@ -642,6 +729,7 @@ export const templates: WikiTemplate[] = [
   readingTemplate,
   personalTemplate,
   businessTemplate,
+  documentManualTemplate,
   generalTemplate,
 ]
 
