@@ -7,6 +7,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }))
 
 import { createResolvedImageNodeView } from "./wiki-image-node-view"
+import { VISUAL_GROUP_ICON_TITLE } from "@/lib/document-manual-visual-block"
 
 function imageNode(attrs: Record<string, unknown>): ProseMirrorNode {
   return { attrs } as ProseMirrorNode
@@ -78,6 +79,28 @@ describe("createResolvedImageNodeView", () => {
     )
 
     expect(view.dom.querySelector("img")).not.toBeNull()
+    expect(view.dom.querySelector("figcaption")).toBeNull()
+  })
+
+  it("renders visual-group icons without caption and with a fixed width class", () => {
+    const view = createResolvedImageNodeView(projectPath)(
+      imageNode({
+        src: "media/manual/img-12.png",
+        alt: "",
+        title: VISUAL_GROUP_ICON_TITLE,
+      }),
+      null as never,
+      null as never,
+      [],
+      null as never,
+    )
+
+    const img = view.dom.querySelector("img")
+
+    expect(img?.dataset.mdsrc).toBe("media/manual/img-12.png")
+    expect(img?.dataset.visualGroupIcon).toBe("true")
+    expect(img?.className).toContain("w-40")
+    expect(img?.hasAttribute("title")).toBe(false)
     expect(view.dom.querySelector("figcaption")).toBeNull()
   })
 })

@@ -1,4 +1,5 @@
 import { readFile, listDirectory } from "@/commands/fs"
+import { parseVisualGroupBlocks } from "@/lib/document-manual-visual-block"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath, getFileStem } from "@/lib/path-utils"
 
@@ -17,6 +18,18 @@ export interface ImageRef {
   alt: string
 }
 
+export interface VisualGroupMemberRef {
+  label: string
+  url: string
+}
+
+export interface VisualGroupRef {
+  title: string
+  summary: string
+  context: string
+  members: VisualGroupMemberRef[]
+}
+
 export interface SearchResult {
   path: string
   title: string
@@ -30,6 +43,7 @@ export interface SearchResult {
    * page" itself, so both views need the full set. May be empty.
    */
   images: ImageRef[]
+  visualGroups: VisualGroupRef[]
 }
 
 const MAX_RESULTS = 20
@@ -184,12 +198,123 @@ function extractTitle(content: string, fileName: string): string {
  *   - Reference-style `![alt][ref]` (we don't generate these either)
  */
 const IMAGE_REF_RE = /!\[([^\]]*)\]\(([^)\s]+)\)/g
+const VISUAL_GROUP_META_RE = /<!--\s*llm-wiki:visual-group\s*([\s\S]*?)-->/g
 
-function extractImageRefs(content: string): ImageRef[] {
+function extractVisualGroupsFromStructuredBlock(content: string): VisualGroupRef[] {
+  return parseVisualGroupBlocks(content)
+    .filter((group) => group.items.length > 0)
+    .map((group) => ({
+      title: group.title,
+      summary: group.summary,
+      context: group.tableContext,
+      members: group.items.map((item) => ({
+        label: item.description,
+        url: item.image,
+      })),
+    }))
+}
+
+function extractVisualGroupsFromMetadata(content: string): VisualGroupRef[] {
+  const groups: VisualGroupRef[] = []
+  for (const match of content.matchAll(VISUAL_GROUP_META_RE)) {
+    const raw = match[1]?.trim()
+    if (!raw) continue
+    try {
+      const parsed = JSON.parse(raw) as {
+        title?: string
+        summary?: string
+        context?: string
+        members?: Array<{ label?: string, url?: string }>
+      }
+      const members = (parsed.members ?? [])
+        .filter((member) => typeof member.label === "string" && typeof member.url === "string")
+        .map((member) => ({
+          label: member.label as string,
+          url: member.url as string,
+        }))
+      if (!parsed.title || members.length === 0) continue
+      groups.push({
+        title: parsed.title,
+        summary: parsed.summary ?? "",
+        context: parsed.context ?? "",
+        members,
+      })
+    } catch {
+      // Ignore malformed metadata and fall back to legacy parser.
+    }
+  }
+  return groups
+}
+
+function extractVisualGroups(content: string): VisualGroupRef[] {
+  const fromStructuredBlock = extractVisualGroupsFromStructuredBlock(content)
+  if (fromStructuredBlock.length > 0) return fromStructuredBlock
+
+  const fromMetadata = extractVisualGroupsFromMetadata(content)
+  if (fromMetadata.length > 0) return fromMetadata
+
+  const lines = content.replace(/\r\n/g, "\n").split("\n")
+  const groups: VisualGroupRef[] = []
+  let inSection = false
+  let current: VisualGroupRef | null = null
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index].trim()
+    if (!inSection) {
+      if (line === "## UI Visual Elements") {
+        inSection = true
+      }
+      continue
+    }
+
+    if (line.startsWith("## ") && line !== "## UI Visual Elements") {
+      break
+    }
+    if (line.startsWith("### ")) {
+      if (current) groups.push(current)
+      current = {
+        title: line.slice(4).trim(),
+        summary: "",
+        context: "",
+        members: [],
+      }
+      continue
+    }
+    if (!current) continue
+
+    if (line.startsWith("Summary: ")) {
+      current.summary = line.slice("Summary: ".length).trim()
+      continue
+    }
+    if (line.startsWith("Context: ")) {
+      current.context = line.slice("Context: ".length).trim()
+      continue
+    }
+    if (!line.startsWith("- ")) continue
+
+    const label = line.slice(2).trim()
+    let imageUrl = ""
+    for (let lookahead = index + 1; lookahead < lines.length; lookahead++) {
+      const candidate = lines[lookahead].trim()
+      if (!candidate) continue
+      const match = candidate.match(/^!\[[^\]]*\]\(([^)\s]+)\)$/)
+      if (match) imageUrl = match[1]
+      break
+    }
+    if (!imageUrl) continue
+    current.members.push({ label, url: imageUrl })
+  }
+
+  if (current) groups.push(current)
+  return groups.filter((group) => group.members.length > 0)
+}
+
+function extractImageRefs(content: string, skipUrls: ReadonlySet<string> = new Set()): ImageRef[] {
   const seen = new Set<string>()
   const out: ImageRef[] = []
   for (const m of content.matchAll(IMAGE_REF_RE)) {
     const url = m[2]
+    if (skipUrls.has(url)) continue
     // De-dupe within a single page: the same image may be
     // referenced both inline (LLM-preserved) AND in the safety-net
     // "## Embedded Images" section. Showing it twice in the
@@ -317,7 +442,15 @@ export async function searchWiki(
               snippet: buildSnippet(content, query),
               titleMatch: false,
               score: 0, // overwritten by RRF below
-              images: extractImageRefs(content),
+              images: extractImageRefs(
+                content,
+                new Set(
+                  extractVisualGroups(content).flatMap((group) =>
+                    group.members.map((member) => member.url)
+                  ),
+                ),
+              ),
+              visualGroups: extractVisualGroups(content),
             })
             knownIds.add(vr.id)
             added++
@@ -441,6 +574,10 @@ function scoreFile(
   query: string,
 ): SearchResult | null {
   const title = extractTitle(content, file.name)
+  const visualGroups = extractVisualGroups(content)
+  const groupedImageUrls = new Set(
+    visualGroups.flatMap((group) => group.members.map((member) => member.url).filter(Boolean)),
+  )
   const titleText = `${title} ${file.name}`
   const titleLower = titleText.toLowerCase()
   const contentLower = content.toLowerCase()
@@ -489,7 +626,7 @@ function scoreFile(
     snippet: buildSnippet(content, snippetAnchor),
     titleMatch: isTitleMatch,
     score,
-    images: extractImageRefs(content),
+    images: extractImageRefs(content, groupedImageUrls),
+    visualGroups,
   }
 }
-

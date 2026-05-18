@@ -11,6 +11,7 @@ import type { NodeViewConstructor } from "@milkdown/prose/view"
 import "@milkdown/theme-nord/style.css"
 import "katex/dist/katex.min.css"
 import { createResolvedImageNodeView } from "./wiki-image-node-view"
+import { createVisualGroupAwareCodeBlockNodeView } from "./wiki-visual-group-node-view"
 import { useWikiStore } from "@/stores/wiki-store"
 
 interface WikiEditorInnerProps {
@@ -38,9 +39,16 @@ function WikiEditorInner({ content, onSave, projectPath }: WikiEditorInnerProps)
             "image",
             createResolvedImageNodeView(projectPath),
           ]
+          const codeBlockNodeView: [string, NodeViewConstructor] = [
+            "code_block",
+            createVisualGroupAwareCodeBlockNodeView(projectPath),
+          ]
           ctx.update(nodeViewCtx, (views) => [
-            ...views.filter(([name]) => name !== "image"),
+            ...views.filter(([
+              name,
+            ]) => name !== "image" && name !== "code_block"),
             imageNodeView,
+            codeBlockNodeView,
           ])
           initialEmitConsumedRef.current = false
           ctx.get(listenerCtx).markdownUpdated((_ctx, markdown) => {

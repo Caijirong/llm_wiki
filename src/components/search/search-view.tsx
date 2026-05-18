@@ -2,7 +2,7 @@ import { useState, useCallback, useMemo, useEffect } from "react"
 import { Search, FileText, ImageIcon, X, ArrowUpRight } from "lucide-react"
 import { useWikiStore } from "@/stores/wiki-store"
 import { readFile } from "@/commands/fs"
-import { searchWiki, tokenizeQuery, type SearchResult, type ImageRef } from "@/lib/search"
+import { searchWiki, tokenizeQuery, type SearchResult, type ImageRef, type VisualGroupRef } from "@/lib/search"
 import { useTranslation } from "react-i18next"
 import { normalizePath } from "@/lib/path-utils"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
@@ -22,6 +22,12 @@ interface ImageHit extends ImageRef {
   sourcePath: string
   sourceTitle: string
   altMatchesQuery: boolean
+}
+
+interface VisualGroupHit extends VisualGroupRef {
+  sourcePath: string
+  sourceTitle: string
+  matchesQuery: boolean
 }
 
 export function SearchView() {
@@ -113,6 +119,35 @@ export function SearchView() {
   const matchingImages = imageHits.filter((h) => h.altMatchesQuery)
   const supportingImages = imageHits.filter((h) => !h.altMatchesQuery)
   const visibleImages = showSupportingImages ? imageHits : matchingImages
+  const visualGroupHits = useMemo(() => {
+    if (!query.trim()) return [] as VisualGroupHit[]
+    const tokens = tokenizeQuery(query)
+    const fallback = query.trim().toLowerCase()
+    const out: VisualGroupHit[] = []
+
+    for (const result of results) {
+      for (const group of result.visualGroups ?? []) {
+        const searchable = [
+          group.title,
+          group.summary,
+          group.context,
+          ...group.members.map((member) => member.label),
+        ].join(" ").toLowerCase()
+        const matchesQuery = tokens.length > 0
+          ? tokens.some((token) => searchable.includes(token))
+          : searchable.includes(fallback)
+        if (!matchesQuery) continue
+        out.push({
+          ...group,
+          sourcePath: result.path,
+          sourceTitle: result.title,
+          matchesQuery,
+        })
+      }
+    }
+
+    return out
+  }, [query, results])
 
   async function handleOpen(path: string) {
     try {
@@ -225,6 +260,7 @@ export function SearchView() {
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="shrink-0 px-3 pt-3 pb-1 text-xs text-muted-foreground">
             {results.length} page{results.length !== 1 ? "s" : ""}
+            {visualGroupHits.length > 0 && ` · ${visualGroupHits.length} visual group${visualGroupHits.length !== 1 ? "s" : ""}`}
             {imageHits.length > 0 && (
               <>
                 {" · "}
@@ -233,6 +269,38 @@ export function SearchView() {
               </>
             )}
           </div>
+
+          {visualGroupHits.length > 0 && (
+            <>
+              <div className="shrink-0 px-3 pt-1">
+                <SectionHeader
+                  icon={<ImageIcon className="h-3.5 w-3.5" />}
+                  label="Visual Groups"
+                  count={visualGroupHits.length}
+                />
+              </div>
+              <div className="max-h-[26rem] shrink-0 overflow-y-auto px-3 pt-2 pb-3">
+                <div className="flex flex-col gap-2">
+                  {visualGroupHits.map((group) => (
+                    <VisualGroupCard
+                      key={`${group.sourcePath}:${group.title}`}
+                      group={group}
+                      onImageClick={(member) => {
+                        if (!member.url) return
+                        setLightbox({
+                          url: member.url,
+                          alt: member.label,
+                          sourcePath: group.sourcePath,
+                          sourceTitle: group.sourceTitle,
+                          altMatchesQuery: true,
+                        })
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
 
           {/* ── Images: fixed-height thumbnails, 2 rows visible, scrolls inside ── */}
           {visibleImages.length > 0 && (
@@ -430,6 +498,67 @@ function SectionHeader({
         <span className="text-muted-foreground/60">({count})</span>
       </div>
       {trailing}
+    </div>
+  )
+}
+
+function VisualGroupCard({
+  group,
+  onImageClick,
+}: {
+  group: VisualGroupHit
+  onImageClick: (member: VisualGroupHit["members"][number]) => void
+}) {
+  const project = useWikiStore((s) => s.project)
+  const projectPath = project?.path ?? null
+
+  return (
+    <div className="rounded-lg border bg-background p-3">
+      <div className="text-sm font-medium">{group.title}</div>
+      {group.summary && (
+        <p className="mt-1 text-xs text-muted-foreground">{group.summary}</p>
+      )}
+      {group.context && (
+        <p className="mt-1 text-xs text-muted-foreground">{group.context}</p>
+      )}
+      <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+        {group.members.map((member, index) => {
+          const key = `${group.title}:${member.url || member.label}:${index}`
+          if (!member.url) {
+            return (
+              <div
+                key={key}
+                className="flex flex-col overflow-hidden rounded-md border bg-background text-left"
+              >
+                <div className="h-24 w-full bg-muted/30" />
+                <div className="p-2 text-[11px] leading-snug">{member.label}</div>
+              </div>
+            )
+          }
+
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => onImageClick(member)}
+              className="group flex flex-col overflow-hidden rounded-md border bg-background text-left hover:bg-accent"
+            >
+              <div className="h-24 w-full overflow-hidden bg-muted">
+                <img
+                  src={resolveMarkdownImageSrc(member.url, projectPath)}
+                  alt={member.label}
+                  loading="lazy"
+                  className="h-full w-full object-cover transition-transform group-hover:scale-105"
+                  onError={(e) => {
+                    ;(e.currentTarget as HTMLImageElement).style.opacity = "0"
+                  }}
+                />
+              </div>
+              <div className="p-2 text-[11px] leading-snug">{member.label}</div>
+            </button>
+          )
+        })}
+      </div>
     </div>
   )
 }

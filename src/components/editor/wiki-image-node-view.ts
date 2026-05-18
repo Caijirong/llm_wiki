@@ -1,4 +1,5 @@
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
+import { VISUAL_GROUP_ICON_TITLE } from "@/lib/document-manual-visual-block"
 import type { Node as ProseMirrorNode } from "@milkdown/prose/model"
 import type { NodeView, NodeViewConstructor } from "@milkdown/prose/view"
 
@@ -14,19 +15,25 @@ function applyImageAttrs(
   const rawSrc = readString(node.attrs.src)
   const alt = readString(node.attrs.alt)
   const title = readString(node.attrs.title)
+  const isVisualGroupIcon = title === VISUAL_GROUP_ICON_TITLE
 
   img.src = resolveMarkdownImageSrc(rawSrc, projectPath)
   img.dataset.mdsrc = rawSrc
   img.alt = alt
-  if (title) img.title = title
+  img.dataset.visualGroupIcon = isVisualGroupIcon ? "true" : "false"
+  img.className = isVisualGroupIcon
+    ? "w-40 max-w-none rounded border border-border/40"
+    : "max-w-full rounded border border-border/40"
+  if (title && !isVisualGroupIcon) img.title = title
   else img.removeAttribute("title")
 }
 
 function syncCaption(figure: HTMLElement, node: ProseMirrorNode) {
+  const title = readString(node.attrs.title)
   const alt = readString(node.attrs.alt).trim()
   let caption = figure.querySelector("figcaption")
 
-  if (!alt) {
+  if (!alt || title === VISUAL_GROUP_ICON_TITLE) {
     caption?.remove()
     return
   }
@@ -46,7 +53,6 @@ export function createResolvedImageNodeView(
     const dom = document.createElement("figure")
     dom.className = "my-3 inline-block max-w-full"
     const img = document.createElement("img")
-    img.className = "max-w-full rounded border border-border/40"
     img.loading = "lazy"
     dom.appendChild(img)
     applyImageAttrs(img, node, projectPath)
