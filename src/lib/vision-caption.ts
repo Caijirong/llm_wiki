@@ -154,6 +154,8 @@ export interface CaptionOptions {
   contextAfter?: string
   /** Force generated caption prose to match the user's output language setting. */
   outputLanguage?: string
+  /** Fully override the default prompt when a caller needs a specialized vision task. */
+  promptOverride?: string
 }
 
 /**
@@ -186,8 +188,9 @@ export async function captionImage(
   // wastes tokens.
   const before = options?.contextBefore?.trim() ?? ""
   const after = options?.contextAfter?.trim() ?? ""
-  const promptText =
-    before.length > 0 || after.length > 0
+  const promptText = options?.promptOverride
+    ? options.promptOverride
+    : before.length > 0 || after.length > 0
       ? buildCaptionPromptWithContext(before, after)
       : CAPTION_PROMPT
   const localizedPrompt = withCaptionLanguageDirective(

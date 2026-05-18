@@ -1,4 +1,4 @@
-import { readFile, writeFile, listDirectory } from "@/commands/fs"
+import { readFile, writeFile, listDirectory, readFileAsBase64 } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -10,12 +10,27 @@ import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { withProjectLock } from "@/lib/project-mutex"
 import {
   extractAndSaveSourceImages,
+  extractAndSaveDocumentManualDocxVisuals,
   buildImageMarkdownSection,
   type SavedImage,
 } from "@/lib/extract-source-images"
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
 import { decodeMarkdownImageUrl, encodeMarkdownImageUrl } from "@/lib/markdown-image-url"
 import type { MultimodalConfig } from "@/stores/wiki-store"
+import {
+  buildDocumentManualVisualGroups,
+  buildUiVisualElementsMarkdown,
+  type DocumentManualVisualOccurrence,
+} from "@/lib/document-manual-visuals"
+import { classifyDocumentManualVisualSemanticRole } from "@/lib/document-manual-visual-classifier"
+import {
+  buildGroupSummaryPrompt,
+  buildIconDescriptionPrompt,
+  parseGroupSummaryResult,
+  parseIconDescriptionResult,
+} from "@/lib/document-manual-visual-prompts"
+import { getProjectKind } from "@/lib/project-identity"
+import { captionImage } from "@/lib/vision-caption"
 
 /**
  * Resolve the LLM config that the caption pipeline should use.
@@ -326,6 +341,58 @@ function isCurrentSourceMediaUrl(url: string, mediaPrefix: string): boolean {
   return decodeMarkdownImageUrl(url).startsWith(mediaPrefix)
 }
 
+function isDocxSource(sourcePath: string): boolean {
+  return getFileName(sourcePath).toLowerCase().endsWith(".docx")
+}
+
+function shouldUseDocumentManualDocxVisuals(
+  projectKind: string,
+  sourcePath: string,
+  multimodalEnabled: boolean,
+): boolean {
+  return (
+    multimodalEnabled &&
+    projectKind === "document-manual" &&
+    isDocxSource(sourcePath)
+  )
+}
+
+function partitionManualDocxVisualOccurrences(
+  occurrences: DocumentManualVisualOccurrence[],
+): {
+  regularImages: SavedImage[]
+  smallVisualOccurrences: DocumentManualVisualOccurrence[]
+} {
+  const regularByPath = new Map<string, SavedImage>()
+  const smallVisualOccurrences: DocumentManualVisualOccurrence[] = []
+
+  for (const occurrence of occurrences) {
+    const semanticRole = classifyDocumentManualVisualSemanticRole(occurrence)
+    if (semanticRole !== "regular_image") {
+      smallVisualOccurrences.push(occurrence)
+      continue
+    }
+    if (regularByPath.has(occurrence.relPath)) continue
+    regularByPath.set(occurrence.relPath, {
+      index: occurrence.occurrenceIndex,
+      mimeType: occurrence.mimeType,
+      page: null,
+      width: occurrence.width,
+      height: occurrence.height,
+      relPath: occurrence.relPath,
+      absPath: occurrence.absPath,
+      sha256: occurrence.sha256,
+      contextBefore: occurrence.contextBefore,
+      contextAfter: occurrence.contextAfter,
+    })
+  }
+
+  return {
+    regularImages: [...regularByPath.values()],
+    smallVisualOccurrences,
+  }
+}
+
 /**
  * Auto-ingest: reads source → LLM analyzes → LLM writes wiki pages, all in one go.
  * Used when importing new files.
@@ -361,6 +428,13 @@ async function autoIngestImpl(
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
+  const mmCfg = useWikiStore.getState().multimodalConfig
+  const projectKind = await getProjectKind(pp)
+  const useManualDocxVisuals = shouldUseDocumentManualDocxVisuals(
+    projectKind,
+    sp,
+    mmCfg.enabled,
+  )
   const updateQueueMetadata = async (patch: IngestQueueMetadataPatch): Promise<void> => {
     if (!options?.queueTaskId || !options.onQueueMetadata) return
     await options.onQueueMetadata(options.queueTaskId, patch)
@@ -409,9 +483,21 @@ async function autoIngestImpl(
     })
     try {
       console.log(`[ingest:diag] cache-hit branch: starting image extraction for ${sp}`)
-      const savedImages = await extractAndSaveSourceImages(pp, sp)
-      console.log(`[ingest:diag] cache-hit branch: got ${savedImages.length} image(s)`)
-      if (savedImages.length > 0) {
+      let savedImages: SavedImage[] = []
+      let smallVisualOccurrences: DocumentManualVisualOccurrence[] = []
+      if (useManualDocxVisuals) {
+        const manualOccurrences = await extractAndSaveDocumentManualDocxVisuals(pp, sp)
+        const partitioned = partitionManualDocxVisualOccurrences(manualOccurrences)
+        savedImages = partitioned.regularImages
+        smallVisualOccurrences = partitioned.smallVisualOccurrences
+      } else {
+        savedImages = await extractAndSaveSourceImages(pp, sp)
+      }
+      console.log(
+        `[ingest:diag] cache-hit branch: got ${savedImages.length} regular image(s)` +
+          `${useManualDocxVisuals ? ` and ${smallVisualOccurrences.length} small visual(s)` : ""}`,
+      )
+      if (savedImages.length > 0 || smallVisualOccurrences.length > 0) {
         // Caption first (populates the cache), THEN inject — the
         // safety-net section uses the cache to populate alt text.
         // Doing them in this order means cache-hit re-runs (e.g.
@@ -431,11 +517,12 @@ async function autoIngestImpl(
         const mmCfg = useWikiStore.getState().multimodalConfig
         if (!mmCfg.enabled) {
           console.log(
-            `[ingest:caption] cache-hit + disabled — skipping caption + safety-net inject (${savedImages.length} image(s) untouched on disk)`,
+            `[ingest:caption] cache-hit + disabled — skipping caption + safety-net inject (` +
+              `${savedImages.length} regular image(s), ${smallVisualOccurrences.length} small visual(s) untouched on disk)`,
           )
         } else {
           const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
-          if (captionLlm) {
+          if (captionLlm && savedImages.length > 0) {
             try {
               const mediaPrefix = `${pp}/wiki/media/${fileName.replace(/\.[^.]+$/, "")}/`
               const inlineResult = await captionMarkdownImages(pp, sourceContent, captionLlm, {
@@ -466,12 +553,31 @@ async function autoIngestImpl(
               )
             }
           }
-          await injectImagesIntoSourceSummary(
-            pp,
-            fileName,
-            savedImages,
-            getOutputLanguage(sourceContent),
-          )
+          if (savedImages.length > 0) {
+            await injectImagesIntoSourceSummary(
+              pp,
+              fileName,
+              savedImages,
+              getOutputLanguage(sourceContent),
+            )
+          }
+          if (smallVisualOccurrences.length > 0) {
+            await injectDocumentManualVisualsIntoSourceSummary(
+              pp,
+              fileName,
+              sourceContent,
+              smallVisualOccurrences,
+              captionLlm,
+              llmConfig,
+              signal,
+              getOutputLanguage(sourceContent),
+              {
+                concurrency: mmCfg.concurrency,
+                onProgress: (detail) =>
+                  activity.updateItem(activityId, { detail }),
+              },
+            )
+          }
           // Re-embed the source-summary page so caption text lands
           // in the search index. Without this step, search by image
           // content stays empty for files ingested before captioning
@@ -481,7 +587,9 @@ async function autoIngestImpl(
           await reembedSourceSummary(pp, fileName)
         }
       } else {
-        console.log(`[ingest:diag] cache-hit branch: skipping injection (no images returned from extraction)`)
+        console.log(
+          `[ingest:diag] cache-hit branch: skipping injection (no images or small visuals returned from extraction)`,
+        )
       }
     } catch (err) {
       console.warn(
@@ -517,7 +625,16 @@ async function autoIngestImpl(
   // and returns [] on any error.
   activity.updateItem(activityId, { detail: "Extracting embedded images..." })
   console.log(`[ingest:diag] full-pipeline branch: starting image extraction for ${sp}`)
-  const savedImages = await extractAndSaveSourceImages(pp, sp)
+  const manualOccurrences = useManualDocxVisuals
+    ? await extractAndSaveDocumentManualDocxVisuals(pp, sp)
+    : []
+  const {
+    regularImages: manualRegularImages,
+    smallVisualOccurrences,
+  } = partitionManualDocxVisualOccurrences(manualOccurrences)
+  const savedImages = useManualDocxVisuals
+    ? manualRegularImages
+    : await extractAndSaveSourceImages(pp, sp)
   console.log(`[ingest:diag] full-pipeline branch: got ${savedImages.length} image(s)`)
   if (savedImages.length > 0) {
     console.log(
@@ -565,7 +682,6 @@ async function autoIngestImpl(
   // that surface is "the source document as-is", separate from
   // "the curated wiki knowledge".
   let enrichedSourceContent = sourceContent
-  const mmCfg = useWikiStore.getState().multimodalConfig
   const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
   if (!mmCfg.enabled && savedImages.length > 0) {
     // Strip `![alt](url)` references — match the same regex shape
@@ -781,6 +897,23 @@ async function autoIngestImpl(
       fileName,
       savedImages,
       getOutputLanguage(sourceContent),
+    )
+  }
+  if (mmCfg.enabled && smallVisualOccurrences.length > 0 && !signal?.aborted) {
+    await injectDocumentManualVisualsIntoSourceSummary(
+      pp,
+      fileName,
+      sourceContent,
+      smallVisualOccurrences,
+      captionLlm,
+      llmConfig,
+      signal,
+      getOutputLanguage(sourceContent),
+      {
+        concurrency: mmCfg.concurrency,
+        onProgress: (detail) =>
+          activity.updateItem(activityId, { detail }),
+      },
     )
   }
 
@@ -1328,6 +1461,149 @@ async function injectImagesIntoSourceSummary(
   }
 }
 
+async function injectDocumentManualVisualsIntoSourceSummary(
+  pp: string,
+  fileName: string,
+  sourceContent: string,
+  occurrences: DocumentManualVisualOccurrence[],
+  captionLlm: LlmConfig | null,
+  summaryLlm: LlmConfig,
+  signal?: AbortSignal,
+  outputLanguage?: string,
+  options?: {
+    concurrency?: number
+    onProgress?: (detail: string) => void
+  },
+): Promise<void> {
+  if (occurrences.length === 0) return
+  const groups = await buildDocumentManualVisualGroups({
+    source: fileName,
+    sourceContent,
+    occurrences,
+  }, {
+    resolveMemberDescription: captionLlm
+      ? async ({ occurrence, rowText, cellText, headerText }) => {
+          const { base64, mimeType } = await readFileAsBase64(occurrence.absPath)
+          const raw = await captionImage(base64, mimeType, captionLlm, signal, {
+            promptOverride: buildIconDescriptionPrompt(
+              occurrence,
+              {
+                rowText,
+                cellText,
+                headerText,
+              },
+              outputLanguage,
+            ),
+            outputLanguage,
+            maxTokens: 256,
+          })
+          return parseIconDescriptionResult(raw, {
+            occurrenceIndex: occurrence.occurrenceIndex,
+            rowText,
+            cellText,
+            headerText,
+            localTextBefore: occurrence.localTextBefore,
+            localTextAfter: occurrence.localTextAfter,
+          })
+        }
+      : undefined,
+    resolveGroupSummary: async (group) => {
+      const prompt = buildGroupSummaryPrompt(
+        {
+          headingPath: group.headingPath,
+          tableContext: group.tableContext,
+          precedingParagraph: group.precedingParagraph,
+          followingParagraph: group.followingParagraph,
+          memberDescriptions: group.memberDescriptions,
+        },
+        group.items,
+        group.memberDescriptions,
+        outputLanguage,
+      )
+      let response = ""
+      await streamChat(
+        summaryLlm,
+        [
+          { role: "system", content: prompt },
+          { role: "user", content: "Return JSON only." },
+        ],
+        {
+          onToken: (token) => { response += token },
+          onDone: () => {},
+          onError: () => {},
+        },
+        signal,
+        { temperature: 0, max_tokens: 256 },
+      )
+      return parseGroupSummaryResult(
+        response,
+        {
+          headingPath: group.headingPath,
+          tableContext: group.tableContext,
+          precedingParagraph: group.precedingParagraph,
+          followingParagraph: group.followingParagraph,
+        },
+        group.memberDescriptions,
+      )
+    },
+    concurrency: options?.concurrency ?? 1,
+    onProgress: (progress) => {
+      const phaseLabel = progress.phase === "member_descriptions"
+        ? "图标描述"
+        : "图标分组"
+      options?.onProgress?.(
+        `Processing UI visuals... ${phaseLabel} ${progress.completed}/${progress.total}`,
+      )
+    },
+  })
+  const newSection = buildUiVisualElementsMarkdown(groups)
+  if (!newSection) return
+
+  const sourceBaseName = fileName.replace(/\.[^.]+$/, "")
+  const sourceSummaryPath = `wiki/sources/${sourceBaseName}.md`
+  const sourceSummaryFullPath = `${pp}/${sourceSummaryPath}`
+  const wrapped = `\n\n${newSection.trim()}\n`
+  const legacyMarker = "<!-- llm-wiki:ui-visual-elements -->"
+
+  try {
+    const existing = await tryReadFile(sourceSummaryFullPath)
+    if (existing) {
+      const strippedLegacyMarkers = existing.replace(
+        new RegExp(`\\n*${legacyMarker}[\\s\\S]*?${legacyMarker}\\n*`, "g"),
+        "",
+      )
+      const stripped = strippedLegacyMarkers.replace(
+        /\n*## UI Visual Elements[\s\S]*?(?=\n## |\s*$)/,
+        "",
+      )
+      await writeFile(sourceSummaryFullPath, stripped.trimEnd() + wrapped)
+      return
+    }
+
+    const date = new Date().toISOString().slice(0, 10)
+    const stubFrontmatter = [
+      "---",
+      "type: source",
+      `title: "Source: ${fileName}"`,
+      `created: ${date}`,
+      `updated: ${date}`,
+      `sources: ["${fileName}"]`,
+      "tags: []",
+      "related: []",
+      "---",
+      "",
+      `# Source: ${fileName}`,
+      "",
+    ].join("\n")
+    await writeFile(sourceSummaryFullPath, stubFrontmatter + wrapped)
+  } catch (err) {
+    console.warn(
+      `[ingest:manual-docx] failed to append UI visual elements to ${sourceSummaryPath}:`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
 /**
  * Re-embed the source-summary page after we've rewritten its
  * `## Embedded Images` safety-net section with captions. The full
@@ -1387,7 +1663,15 @@ export async function startIngest(
   // Failure-tolerant — `extractAndSaveSourceImages` returns [] on
   // any error and logs internally; we never want image extraction
   // to break the ingest chat flow.
-  void extractAndSaveSourceImages(pp, sp).catch((err) => {
+  void (async () => {
+    const projectKind = await getProjectKind(pp)
+    const multimodalEnabled = useWikiStore.getState().multimodalConfig.enabled
+    if (shouldUseDocumentManualDocxVisuals(projectKind, sp, multimodalEnabled)) {
+      await extractAndSaveDocumentManualDocxVisuals(pp, sp)
+      return
+    }
+    await extractAndSaveSourceImages(pp, sp)
+  })().catch((err) => {
     console.warn(
       `[startIngest:images] eager extraction failed for "${getFileName(sp)}":`,
       err instanceof Error ? err.message : err,
@@ -1593,8 +1877,42 @@ export async function executeIngestWrites(
   const mmCfgWrites = useWikiStore.getState().multimodalConfig
   if (ingestSource && mmCfgWrites.enabled) {
     try {
-      const savedImages = await extractAndSaveSourceImages(pp, ingestSource)
-      if (savedImages.length > 0) {
+      const projectKind = await getProjectKind(pp)
+      if (shouldUseDocumentManualDocxVisuals(projectKind, ingestSource, mmCfgWrites.enabled)) {
+        const fileName = getFileName(ingestSource)
+        const manualOccurrences = await extractAndSaveDocumentManualDocxVisuals(pp, ingestSource)
+        const { regularImages, smallVisualOccurrences } =
+          partitionManualDocxVisualOccurrences(manualOccurrences)
+        const sourceContent = await tryReadFile(ingestSource)
+        if (regularImages.length > 0) {
+          await injectImagesIntoSourceSummary(
+            pp,
+            fileName,
+            regularImages,
+            getOutputLanguage(sourceContent),
+          )
+        }
+        if (smallVisualOccurrences.length > 0) {
+          const captionLlm = resolveCaptionConfig(mmCfgWrites, llmConfig)
+          await injectDocumentManualVisualsIntoSourceSummary(
+            pp,
+            fileName,
+            sourceContent,
+            smallVisualOccurrences,
+            captionLlm,
+            llmConfig,
+            signal,
+            getOutputLanguage(sourceContent),
+            {
+              concurrency: mmCfgWrites.concurrency,
+            },
+          )
+        }
+      } else {
+        const savedImages = await extractAndSaveSourceImages(pp, ingestSource)
+        if (savedImages.length === 0) {
+          return writtenPaths
+        }
         const fileName = getFileName(ingestSource)
         const sourceContent = await tryReadFile(ingestSource)
         await injectImagesIntoSourceSummary(

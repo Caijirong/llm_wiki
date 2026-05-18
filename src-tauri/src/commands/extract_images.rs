@@ -1004,6 +1004,674 @@ fn build_docx_media_context_map(
     build_docx_media_context_map_from_xml(&document_xml, &rels_xml)
 }
 
+#[derive(Debug, Clone)]
+struct DocxManualOccurrenceSeed {
+    media_path: String,
+    doc_order: u32,
+    section_title: Option<String>,
+    heading_path: Vec<String>,
+    container_kind: &'static str,
+    table_id: Option<u32>,
+    row_index: Option<u32>,
+    col_index: Option<u32>,
+    row_text: String,
+    cell_text: String,
+    row_header_text: String,
+    table_text_snapshot: String,
+    preceding_paragraph: String,
+    following_paragraph: String,
+    row_image_count: u32,
+    table_image_count: u32,
+    table_row_count: u32,
+    table_col_count: u32,
+    local_text_before: String,
+    local_text_after: String,
+    context_before: String,
+    context_after: String,
+}
+
+#[derive(Debug, Clone)]
+enum DocxBlockPart {
+    Text(String),
+    Image(String),
+}
+
+#[derive(Debug, Clone)]
+struct DocxParsedBlock {
+    section_title: Option<String>,
+    heading_path: Vec<String>,
+    container_kind: &'static str,
+    table_id: Option<u32>,
+    row_index: Option<u32>,
+    col_index: Option<u32>,
+    plain_text: String,
+    row_text: String,
+    cell_text: String,
+    row_header_text: String,
+    table_text_snapshot: String,
+    row_image_count: u32,
+    table_image_count: u32,
+    table_row_count: u32,
+    table_col_count: u32,
+    parts: Vec<DocxBlockPart>,
+}
+
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn paragraph_is_heading(paragraph_xml: &str) -> bool {
+    paragraph_xml.contains("w:pStyle") && paragraph_xml.contains("Heading")
+}
+
+fn paragraph_heading_level(paragraph_xml: &str) -> Option<usize> {
+    let heading_pos = paragraph_xml.find("Heading")?;
+    let digits = paragraph_xml[heading_pos + "Heading".len()..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        Some(1)
+    } else {
+        digits.parse::<usize>().ok()
+    }
+}
+
+fn paragraph_is_list_item(paragraph_xml: &str) -> bool {
+    paragraph_xml.contains("<w:numPr")
+}
+
+fn count_images(parts: &[DocxBlockPart]) -> u32 {
+    parts.iter()
+        .filter(|part| matches!(part, DocxBlockPart::Image(_)))
+        .count() as u32
+}
+
+fn find_docx_open_tag(xml: &str, search_from: usize, tag: &str) -> Option<usize> {
+    let exact = format!("<{tag}>");
+    let with_attrs = format!("<{tag} ");
+    let exact_pos = xml[search_from..].find(&exact).map(|pos| search_from + pos);
+    let attrs_pos = xml[search_from..]
+        .find(&with_attrs)
+        .map(|pos| search_from + pos);
+    match (exact_pos, attrs_pos) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn find_next_docx_event(xml: &str, search_from: usize) -> Option<(usize, usize, &'static str)> {
+    let text_pos = find_docx_open_tag(xml, search_from, "w:t");
+    let embed_pos = xml[search_from..]
+        .find("r:embed=\"")
+        .map(|p| search_from + p);
+
+    match (text_pos, embed_pos) {
+        (Some(t), Some(e)) if t < e => {
+            let close = xml[t..].find("</w:t>")? + t + "</w:t>".len();
+            Some((t, close, "text"))
+        }
+        (Some(t), None) => {
+            let close = xml[t..].find("</w:t>")? + t + "</w:t>".len();
+            Some((t, close, "text"))
+        }
+        (_, Some(e)) => {
+            let start = e + "r:embed=\"".len();
+            let end = xml[start..].find('"')? + start + 1;
+            Some((e, end, "image"))
+        }
+        (None, None) => None,
+    }
+}
+
+fn parse_docx_block_parts(
+    xml: &str,
+    rel_to_media: &HashMap<String, String>,
+) -> Vec<DocxBlockPart> {
+    let mut parts = Vec::new();
+    let mut search_from = 0;
+
+    while let Some((start, end, kind)) = find_next_docx_event(xml, search_from) {
+        if kind == "text" {
+            let text = normalize_text(&extract_text_runs(&xml[start..end]));
+            if !text.is_empty() {
+                parts.push(DocxBlockPart::Text(text));
+            }
+        } else {
+            let rel_id_start = start + "r:embed=\"".len();
+            let Some(rel_id_end) = xml[rel_id_start..].find('"').map(|p| rel_id_start + p) else {
+                search_from = end;
+                continue;
+            };
+            let rel_id = &xml[rel_id_start..rel_id_end];
+            if let Some(media_path) = rel_to_media.get(rel_id) {
+                parts.push(DocxBlockPart::Image(media_path.clone()));
+            }
+        }
+        search_from = end;
+    }
+
+    parts
+}
+
+fn block_plain_text(parts: &[DocxBlockPart]) -> String {
+    normalize_text(
+        &parts
+            .iter()
+            .filter_map(|part| match part {
+                DocxBlockPart::Text(text) => Some(text.as_str()),
+                DocxBlockPart::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn nearest_block_text(parts: &[DocxBlockPart], image_idx: usize, before: bool) -> String {
+    if before {
+        for idx in (0..image_idx).rev() {
+            if let DocxBlockPart::Text(text) = &parts[idx] {
+                let normalized = normalize_text(text);
+                if !normalized.is_empty() {
+                    return normalized;
+                }
+            }
+        }
+    } else {
+        for part in parts.iter().skip(image_idx + 1) {
+            if let DocxBlockPart::Text(text) = part {
+                let normalized = normalize_text(text);
+                if !normalized.is_empty() {
+                    return normalized;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn join_context(parts: Vec<String>) -> String {
+    normalize_text(
+        &parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn build_docx_manual_occurrence_seeds_from_xml(
+    document_xml: &str,
+    rels_xml: &str,
+) -> Vec<DocxManualOccurrenceSeed> {
+    let rel_to_media = build_docx_relationship_map(rels_xml);
+    if rel_to_media.is_empty() {
+        return Vec::new();
+    }
+
+    let body_xml = document_xml
+        .split("<w:body>")
+        .nth(1)
+        .and_then(|rest| rest.split("</w:body>").next())
+        .unwrap_or(document_xml);
+
+    let mut blocks: Vec<DocxParsedBlock> = Vec::new();
+    let mut search_from = 0;
+    let mut current_section_title: Option<String> = None;
+    let mut current_heading_path: Vec<String> = Vec::new();
+    let mut next_table_id: u32 = 1;
+
+    while search_from < body_xml.len() {
+        let paragraph_pos = find_docx_open_tag(body_xml, search_from, "w:p");
+        let table_pos = find_docx_open_tag(body_xml, search_from, "w:tbl");
+
+        let Some((kind, start)) = (match (paragraph_pos, table_pos) {
+            (Some(p), Some(t)) if p < t => Some(("paragraph", p)),
+            (_, Some(t)) => Some(("table", t)),
+            (Some(p), None) => Some(("paragraph", p)),
+            (None, None) => None,
+        }) else {
+            break;
+        };
+
+        if kind == "paragraph" {
+            let Some(open_end) = body_xml[start..].find('>').map(|end| start + end + 1) else {
+                break;
+            };
+            let Some(close_start) = body_xml[open_end..].find("</w:p>").map(|end| open_end + end) else {
+                break;
+            };
+            let close_end = close_start + "</w:p>".len();
+            let paragraph_full = &body_xml[start..close_end];
+            let paragraph_inner = &body_xml[open_end..close_start];
+            let parts = parse_docx_block_parts(paragraph_inner, &rel_to_media);
+            let plain_text = block_plain_text(&parts);
+
+            if paragraph_is_heading(paragraph_full) && !plain_text.is_empty() {
+                let heading_level = paragraph_heading_level(paragraph_full).unwrap_or(1);
+                current_heading_path.truncate(heading_level.saturating_sub(1));
+                current_heading_path.push(plain_text.clone());
+                current_section_title = Some(plain_text.clone());
+            }
+
+            if !parts.is_empty() || !plain_text.is_empty() {
+                blocks.push(DocxParsedBlock {
+                    section_title: current_section_title.clone(),
+                    heading_path: current_heading_path.clone(),
+                    container_kind: if paragraph_is_list_item(paragraph_full) {
+                        "list_item"
+                    } else {
+                        "paragraph"
+                    },
+                    table_id: None,
+                    row_index: None,
+                    col_index: None,
+                    plain_text: plain_text.clone(),
+                    row_text: plain_text.clone(),
+                    cell_text: plain_text.clone(),
+                    row_header_text: String::new(),
+                    table_text_snapshot: String::new(),
+                    row_image_count: count_images(&parts),
+                    table_image_count: count_images(&parts),
+                    table_row_count: 1,
+                    table_col_count: 1,
+                    parts,
+                });
+            }
+
+            search_from = close_end;
+            continue;
+        }
+
+        let Some(open_end) = body_xml[start..].find('>').map(|end| start + end + 1) else {
+            break;
+        };
+        let Some(close_start) = body_xml[open_end..].find("</w:tbl>").map(|end| open_end + end) else {
+            break;
+        };
+        let close_end = close_start + "</w:tbl>".len();
+        let table_inner = &body_xml[open_end..close_start];
+        let table_id = next_table_id;
+        next_table_id += 1;
+        let mut table_rows: Vec<Vec<(Vec<DocxBlockPart>, String)>> = Vec::new();
+
+        let mut row_search = 0;
+        while let Some(row_pos) = find_docx_open_tag(table_inner, row_search, "w:tr") {
+            let Some(row_open_end) = table_inner[row_pos..].find('>').map(|end| row_pos + end + 1) else {
+                break;
+            };
+            let Some(row_close_start) = table_inner[row_open_end..]
+                .find("</w:tr>")
+                .map(|end| row_open_end + end)
+            else {
+                break;
+            };
+            let row_close_end = row_close_start + "</w:tr>".len();
+            let row_inner = &table_inner[row_open_end..row_close_start];
+            let mut row_cells: Vec<(Vec<DocxBlockPart>, String)> = Vec::new();
+
+            let mut cell_search = 0;
+            while let Some(cell_pos) = find_docx_open_tag(row_inner, cell_search, "w:tc") {
+                let Some(cell_open_end) = row_inner[cell_pos..].find('>').map(|end| cell_pos + end + 1) else {
+                    break;
+                };
+                let Some(cell_close_start) = row_inner[cell_open_end..]
+                    .find("</w:tc>")
+                    .map(|end| cell_open_end + end)
+                else {
+                    break;
+                };
+                let cell_close_end = cell_close_start + "</w:tc>".len();
+                let cell_inner = &row_inner[cell_open_end..cell_close_start];
+                let parts = parse_docx_block_parts(cell_inner, &rel_to_media);
+                let plain_text = block_plain_text(&parts);
+                row_cells.push((parts, plain_text));
+                cell_search = cell_close_end;
+            }
+
+            if !row_cells.is_empty() {
+                table_rows.push(row_cells);
+            }
+            row_search = row_close_end;
+        }
+
+        let table_row_count = table_rows.len() as u32;
+        let table_col_count = table_rows
+            .iter()
+            .map(|row| row.len() as u32)
+            .max()
+            .unwrap_or(0);
+        let table_image_count = table_rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|(parts, _)| count_images(parts))
+            .sum::<u32>();
+        let row_texts = table_rows
+            .iter()
+            .map(|row| {
+                normalize_text(
+                    &row.iter()
+                        .map(|(_, text)| text.as_str())
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_text_snapshot = normalize_text(
+            &row_texts
+                .iter()
+                .filter(|text| !text.is_empty())
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let header_row = table_rows
+            .first()
+            .map(|row| row.iter().map(|(_, text)| text.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for (row_index, row_cells) in table_rows.into_iter().enumerate() {
+            let row_text = row_texts.get(row_index).cloned().unwrap_or_default();
+            let row_image_count = row_cells
+                .iter()
+                .map(|(parts, _)| count_images(parts))
+                .sum::<u32>();
+            for (col_index, (parts, plain_text)) in row_cells.into_iter().enumerate() {
+                if !parts.is_empty() || !plain_text.is_empty() {
+                    let row_header_text = if row_index > 0 {
+                        header_row.get(col_index).cloned().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    blocks.push(DocxParsedBlock {
+                        section_title: current_section_title.clone(),
+                        heading_path: current_heading_path.clone(),
+                        container_kind: "table_cell",
+                        table_id: Some(table_id),
+                        row_index: Some(row_index as u32),
+                        col_index: Some(col_index as u32),
+                        plain_text: plain_text.clone(),
+                        row_text: row_text.clone(),
+                        cell_text: plain_text,
+                        row_header_text,
+                        table_text_snapshot: table_text_snapshot.clone(),
+                        row_image_count,
+                        table_image_count,
+                        table_row_count,
+                        table_col_count,
+                        parts,
+                    });
+                }
+            }
+        }
+
+        search_from = close_end;
+    }
+
+    let block_texts: Vec<String> = blocks
+        .iter()
+        .map(|block| block.plain_text.clone())
+        .collect();
+
+    let mut out = Vec::new();
+    let mut doc_order: u32 = 0;
+    for (block_index, block) in blocks.iter().enumerate() {
+        let before_blocks = block_texts[..block_index]
+            .iter()
+            .filter(|text| !text.is_empty())
+            .rev()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let after_blocks = block_texts[block_index + 1..]
+            .iter()
+            .filter(|text| !text.is_empty())
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for (part_index, part) in block.parts.iter().enumerate() {
+            let DocxBlockPart::Image(media_path) = part else {
+                continue;
+            };
+            doc_order += 1;
+            let local_text_before = nearest_block_text(&block.parts, part_index, true);
+            let local_text_after = nearest_block_text(&block.parts, part_index, false);
+            let context_before = join_context(
+                before_blocks
+                    .iter()
+                    .cloned()
+                    .chain(
+                        (!local_text_before.is_empty())
+                            .then_some(local_text_before.clone())
+                            .into_iter(),
+                    )
+                    .collect(),
+            );
+            let context_after = join_context(
+                (!local_text_after.is_empty())
+                    .then_some(local_text_after.clone())
+                    .into_iter()
+                    .chain(after_blocks.iter().cloned())
+                    .collect(),
+            );
+            let preceding_paragraph = before_blocks.last().cloned().unwrap_or_default();
+            let following_paragraph = after_blocks.first().cloned().unwrap_or_default();
+
+            out.push(DocxManualOccurrenceSeed {
+                media_path: media_path.clone(),
+                doc_order,
+                section_title: block.section_title.clone(),
+                heading_path: block.heading_path.clone(),
+                container_kind: block.container_kind,
+                table_id: block.table_id,
+                row_index: block.row_index,
+                col_index: block.col_index,
+                row_text: block.row_text.clone(),
+                cell_text: block.cell_text.clone(),
+                row_header_text: block.row_header_text.clone(),
+                table_text_snapshot: block.table_text_snapshot.clone(),
+                preceding_paragraph,
+                following_paragraph,
+                row_image_count: block.row_image_count,
+                table_image_count: block.table_image_count,
+                table_row_count: block.table_row_count,
+                table_col_count: block.table_col_count,
+                local_text_before,
+                local_text_after,
+                context_before,
+                context_after,
+            });
+        }
+    }
+
+    out
+}
+
+fn classify_document_manual_visual(
+    seed: &DocxManualOccurrenceSeed,
+    width: u32,
+    height: u32,
+) -> Option<&'static str> {
+    const TABLE_CELL_SMALL_VISUAL_MAX_DIMENSION: u32 = 360;
+    const TABLE_CELL_SMALL_VISUAL_MAX_AREA: u64 = 70_000;
+
+    if width < 12 || height < 12 {
+        return None;
+    }
+    // Manual DOCX tables often embed medium-sized status legends
+    // (solid color blocks, gauge fragments, state icons) that are
+    // semantically "small visuals" even when both axes exceed 100px.
+    // Keep this override narrow so full screenshots still remain
+    // regular visuals.
+    if seed.container_kind == "table_cell"
+        && width.max(height) <= TABLE_CELL_SMALL_VISUAL_MAX_DIMENSION
+        && u64::from(width) * u64::from(height) <= TABLE_CELL_SMALL_VISUAL_MAX_AREA
+    {
+        return Some("small_visual");
+    }
+    if width >= 100 && height >= 100 {
+        return Some("regular_visual");
+    }
+    if width.min(height) >= 12 && width.max(height) < 192 {
+        return Some("small_visual");
+    }
+    None
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedDocxManualVisualOccurrence {
+    pub occurrence_index: u32,
+    pub rel_path: String,
+    pub abs_path: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub sha256: String,
+    pub visual_class: String,
+    pub doc_order: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_title: Option<String>,
+    pub heading_path: Vec<String>,
+    pub container_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub col_index: Option<u32>,
+    pub row_text: String,
+    pub cell_text: String,
+    pub row_header_text: String,
+    pub table_text_snapshot: String,
+    pub preceding_paragraph: String,
+    pub following_paragraph: String,
+    pub row_image_count: u32,
+    pub table_image_count: u32,
+    pub table_row_count: u32,
+    pub table_col_count: u32,
+    pub local_text_before: String,
+    pub local_text_after: String,
+    pub context_before: String,
+    pub context_after: String,
+}
+
+pub fn extract_and_save_docx_manual_visuals(
+    path: &str,
+    dest_dir: &Path,
+    rel_to: &Path,
+) -> Result<Vec<SavedDocxManualVisualOccurrence>, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip '{path}': {e}"))?;
+    let Some(document_xml) = read_zip_text(&mut archive, "word/document.xml") else {
+        return Ok(Vec::new());
+    };
+    let Some(rels_xml) = read_zip_text(&mut archive, "word/_rels/document.xml.rels") else {
+        return Ok(Vec::new());
+    };
+
+    let seeds = build_docx_manual_occurrence_seeds_from_xml(&document_xml, &rels_xml);
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut saved_media: HashMap<String, (String, String, String, u32, u32, String)> =
+        HashMap::new();
+    let mut next_saved_index: u32 = 1;
+    let mut out = Vec::new();
+
+    for seed in seeds {
+        if !saved_media.contains_key(&seed.media_path) {
+            let Some(mime_type) = guess_mime_from_name(&seed.media_path) else {
+                continue;
+            };
+            let mut entry = match archive.by_name(&seed.media_path) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            if entry.read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            let (width, height) = match image::load_from_memory(&bytes) {
+                Ok(img) => (img.width(), img.height()),
+                Err(_) => continue,
+            };
+            let Some(_visual_class) = classify_document_manual_visual(&seed, width, height) else {
+                continue;
+            };
+            let ext = ext_for_mime(&mime_type);
+            let file_name = format!("img-{next_saved_index}.{ext}");
+            next_saved_index += 1;
+            let (rel_path, abs_path) = save_one_image(&bytes, dest_dir, rel_to, &file_name)?;
+            let sha256 = sha256_hex(&bytes);
+            saved_media.insert(
+                seed.media_path.clone(),
+                (
+                    rel_path,
+                    abs_path,
+                    mime_type,
+                    width,
+                    height,
+                    sha256,
+                ),
+            );
+        }
+
+        let Some((rel_path, abs_path, mime_type, width, height, sha256)) =
+            saved_media.get(&seed.media_path)
+        else {
+            continue;
+        };
+        let Some(visual_class) = classify_document_manual_visual(&seed, *width, *height) else {
+            continue;
+        };
+
+        out.push(SavedDocxManualVisualOccurrence {
+            occurrence_index: out.len() as u32 + 1,
+            rel_path: rel_path.clone(),
+            abs_path: abs_path.clone(),
+            mime_type: mime_type.clone(),
+            width: *width,
+            height: *height,
+            sha256: sha256.clone(),
+            visual_class: visual_class.to_string(),
+            doc_order: seed.doc_order,
+            section_title: seed.section_title.clone(),
+            heading_path: seed.heading_path.clone(),
+            container_kind: seed.container_kind.to_string(),
+            table_id: seed.table_id,
+            row_index: seed.row_index,
+            col_index: seed.col_index,
+            row_text: seed.row_text.clone(),
+            cell_text: seed.cell_text.clone(),
+            row_header_text: seed.row_header_text.clone(),
+            table_text_snapshot: seed.table_text_snapshot.clone(),
+            preceding_paragraph: seed.preceding_paragraph.clone(),
+            following_paragraph: seed.following_paragraph.clone(),
+            row_image_count: seed.row_image_count,
+            table_image_count: seed.table_image_count,
+            table_row_count: seed.table_row_count,
+            table_col_count: seed.table_col_count,
+            local_text_before: seed.local_text_before.clone(),
+            local_text_after: seed.local_text_after.clone(),
+            context_before: seed.context_before.clone(),
+            context_after: seed.context_after.clone(),
+        });
+    }
+
+    Ok(out)
+}
+
 // ── Extract-and-save: write to disk, skip the base64 round-trip ────────
 //
 // The base64-returning commands above are useful for future
@@ -1385,11 +2053,112 @@ pub async fn extract_and_save_office_images_cmd(
     .map_err(|e| format!("extract_and_save_office_images blocking task join error: {e}"))?
 }
 
+#[tauri::command]
+pub async fn extract_and_save_docx_manual_visuals_cmd(
+    source_path: String,
+    dest_dir: String,
+    rel_to: String,
+) -> Result<Vec<SavedDocxManualVisualOccurrence>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::panic_guard::run_guarded("extract_and_save_docx_manual_visuals", || {
+            extract_and_save_docx_manual_visuals(
+                &source_path,
+                Path::new(&dest_dir),
+                Path::new(&rel_to),
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("extract_and_save_docx_manual_visuals blocking task join error: {e}"))?
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn make_temp_dir(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "llm-wiki-extract-images-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should be creatable");
+        dir
+    }
+
+    fn solid_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            width,
+            height,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("test image should encode to png");
+        bytes
+    }
+
+    fn write_test_docx(
+        path: &Path,
+        document_xml: &str,
+        rels_xml: &str,
+        media_entries: &[(&str, &[u8])],
+    ) {
+        let file = File::create(path).expect("test docx should be creatable");
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        writer
+            .start_file(
+                "[Content_Types].xml",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("content types entry should start");
+        writer
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="png" ContentType="image/png"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>"#,
+            )
+            .expect("content types entry should write");
+
+        writer
+            .start_file("word/document.xml", options)
+            .expect("document.xml entry should start");
+        writer
+            .write_all(document_xml.as_bytes())
+            .expect("document.xml should write");
+
+        writer
+            .start_file("word/_rels/document.xml.rels", options)
+            .expect("document rels entry should start");
+        writer
+            .write_all(rels_xml.as_bytes())
+            .expect("document rels should write");
+
+        for (entry_name, bytes) in media_entries {
+            writer
+                .start_file(*entry_name, options)
+                .expect("media entry should start");
+            writer.write_all(bytes).expect("media entry should write");
+        }
+
+        writer.finish().expect("test docx should finish");
+    }
 
     #[test]
     fn is_media_path_recognizes_pptx_docx_xlsx() {
@@ -1519,5 +2288,276 @@ mod tests {
 
         assert!(ctx.context_before.contains("智慧低空政务场景总体架构"));
         assert!(ctx.context_after.contains("感知、调度和服务应用三层"));
+    }
+
+    #[test]
+    fn docx_manual_anchors_follow_document_order_and_keep_heading_context() {
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+              <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image2.png"/>
+              <Relationship Id="rId999" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/unused.png"/>
+            </Relationships>
+        "#;
+        let document = r#"
+            <w:document>
+              <w:body>
+                <w:p>
+                  <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+                  <w:r><w:t>设备状态</w:t></w:r>
+                </w:p>
+                <w:p>
+                  <w:pPr><w:numPr/></w:pPr>
+                  <w:r><w:t>未连接</w:t></w:r>
+                  <w:r><w:drawing><a:blip r:embed="rId1"/></w:drawing></w:r>
+                </w:p>
+                <w:p>
+                  <w:pPr><w:numPr/></w:pPr>
+                  <w:r><w:t>连接中</w:t></w:r>
+                  <w:r><w:drawing><a:blip r:embed="rId2"/></w:drawing></w:r>
+                </w:p>
+              </w:body>
+            </w:document>
+        "#;
+
+        let anchors = build_docx_manual_occurrence_seeds_from_xml(document, rels);
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].media_path, "word/media/image1.png");
+        assert_eq!(anchors[0].doc_order, 1);
+        assert_eq!(anchors[0].section_title.as_deref(), Some("设备状态"));
+        assert_eq!(anchors[0].heading_path, vec!["设备状态".to_string()]);
+        assert_eq!(anchors[0].container_kind, "list_item");
+        assert_eq!(anchors[0].row_text, "未连接");
+        assert_eq!(anchors[0].cell_text, "未连接");
+        assert_eq!(anchors[0].local_text_before, "未连接");
+
+        assert_eq!(anchors[1].media_path, "word/media/image2.png");
+        assert_eq!(anchors[1].doc_order, 2);
+        assert_eq!(anchors[1].section_title.as_deref(), Some("设备状态"));
+        assert_eq!(anchors[1].heading_path, vec!["设备状态".to_string()]);
+        assert_eq!(anchors[1].container_kind, "list_item");
+        assert_eq!(anchors[1].row_text, "连接中");
+        assert_eq!(anchors[1].local_text_before, "连接中");
+    }
+
+    #[test]
+    fn docx_manual_anchors_capture_table_coordinates() {
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image5.png"/>
+              <Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image6.png"/>
+            </Relationships>
+        "#;
+        let document = r#"
+            <w:document>
+              <w:body>
+                <w:p>
+                  <w:pPr><w:pStyle w:val="Heading3"/></w:pPr>
+                  <w:r><w:t>按钮状态</w:t></w:r>
+                </w:p>
+                <w:tbl>
+                  <w:tr>
+                    <w:tc>
+                      <w:p>
+                        <w:r><w:t>保存</w:t></w:r>
+                        <w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r>
+                      </w:p>
+                    </w:tc>
+                  </w:tr>
+                  <w:tr>
+                    <w:tc>
+                      <w:p>
+                        <w:r><w:t>取消</w:t></w:r>
+                        <w:r><w:drawing><a:blip r:embed="rId6"/></w:drawing></w:r>
+                      </w:p>
+                    </w:tc>
+                  </w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>
+        "#;
+
+        let anchors = build_docx_manual_occurrence_seeds_from_xml(document, rels);
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].container_kind, "table_cell");
+        assert_eq!(anchors[0].table_id, Some(1));
+        assert_eq!(anchors[0].row_index, Some(0));
+        assert_eq!(anchors[0].col_index, Some(0));
+        assert_eq!(anchors[0].section_title.as_deref(), Some("按钮状态"));
+        assert_eq!(anchors[0].heading_path, vec!["按钮状态".to_string()]);
+        assert_eq!(anchors[0].row_text, "保存");
+        assert_eq!(anchors[0].cell_text, "保存");
+        assert_eq!(anchors[0].table_row_count, 2);
+        assert_eq!(anchors[0].table_col_count, 1);
+        assert_eq!(anchors[0].local_text_before, "保存");
+
+        assert_eq!(anchors[1].container_kind, "table_cell");
+        assert_eq!(anchors[1].table_id, Some(1));
+        assert_eq!(anchors[1].row_index, Some(1));
+        assert_eq!(anchors[1].col_index, Some(0));
+        assert_eq!(anchors[1].row_text, "取消");
+        assert_eq!(anchors[1].row_header_text, "保存");
+        assert_eq!(anchors[1].table_text_snapshot, "保存 取消");
+        assert_eq!(anchors[1].local_text_before, "取消");
+    }
+
+    #[test]
+    fn docx_manual_visuals_classify_reused_medium_image_by_occurrence_context() {
+        let root = make_temp_dir("manual-visual-context");
+        let docx_path = root.join("manual.docx");
+        let wiki_root = root.join("wiki");
+        let media_dir = wiki_root.join("media/manual");
+        let image_bytes = solid_png(304, 202);
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+              <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+            </Relationships>
+        "#;
+        let document = r#"
+            <w:document>
+              <w:body>
+                <w:p>
+                  <w:r><w:t>主界面示意图</w:t></w:r>
+                  <w:r><w:drawing><a:blip r:embed="rId1"/></w:drawing></w:r>
+                </w:p>
+                <w:tbl>
+                  <w:tr>
+                    <w:tc>
+                      <w:p>
+                        <w:r><w:t>与前车通信中断</w:t></w:r>
+                        <w:r><w:drawing><a:blip r:embed="rId2"/></w:drawing></w:r>
+                      </w:p>
+                    </w:tc>
+                  </w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>
+        "#;
+        write_test_docx(
+            &docx_path,
+            document,
+            rels,
+            &[("word/media/image1.png", &image_bytes)],
+        );
+
+        let visuals = extract_and_save_docx_manual_visuals(
+            docx_path.to_str().expect("docx path should be valid utf-8"),
+            &media_dir,
+            &wiki_root,
+        )
+        .expect("manual visuals should extract");
+
+        assert_eq!(visuals.len(), 2);
+        assert_eq!(visuals[0].container_kind, "paragraph");
+        assert_eq!(visuals[0].visual_class, "regular_visual");
+        assert_eq!(visuals[1].container_kind, "table_cell");
+        assert_eq!(visuals[1].visual_class, "small_visual");
+        assert_eq!(visuals[0].rel_path, visuals[1].rel_path);
+        assert_eq!(visuals[0].sha256, visuals[1].sha256);
+
+        std::fs::remove_dir_all(root).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn docx_manual_visuals_keep_large_table_cell_screenshots_regular() {
+        let root = make_temp_dir("manual-visual-large-table");
+        let docx_path = root.join("manual.docx");
+        let wiki_root = root.join("wiki");
+        let media_dir = wiki_root.join("media/manual");
+        let image_bytes = solid_png(481, 359);
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image9.png"/>
+            </Relationships>
+        "#;
+        let document = r#"
+            <w:document>
+              <w:body>
+                <w:tbl>
+                  <w:tr>
+                    <w:tc>
+                      <w:p>
+                        <w:r><w:t>整页界面截图</w:t></w:r>
+                        <w:r><w:drawing><a:blip r:embed="rId9"/></w:drawing></w:r>
+                      </w:p>
+                    </w:tc>
+                  </w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>
+        "#;
+        write_test_docx(
+            &docx_path,
+            document,
+            rels,
+            &[("word/media/image9.png", &image_bytes)],
+        );
+
+        let visuals = extract_and_save_docx_manual_visuals(
+            docx_path.to_str().expect("docx path should be valid utf-8"),
+            &media_dir,
+            &wiki_root,
+        )
+        .expect("manual visuals should extract");
+
+        assert_eq!(visuals.len(), 1);
+        assert_eq!(visuals[0].container_kind, "table_cell");
+        assert_eq!(visuals[0].visual_class, "regular_visual");
+
+        std::fs::remove_dir_all(root).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn docx_manual_anchors_ignore_table_property_tags_when_scanning_cells() {
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image10.png"/>
+              <Relationship Id="rId11" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image11.png"/>
+            </Relationships>
+        "#;
+        let document = r#"
+            <w:document>
+              <w:body>
+                <w:tbl>
+                  <w:tblPr>
+                    <w:tblBorders/>
+                  </w:tblPr>
+                  <w:tblGrid>
+                    <w:gridCol w:w="1200"/>
+                    <w:gridCol w:w="1200"/>
+                  </w:tblGrid>
+                  <w:tr>
+                    <w:trPr><w:trHeight w:val="320"/></w:trPr>
+                    <w:tc>
+                      <w:tcPr><w:tcW w:w="1200" w:type="dxa"/></w:tcPr>
+                      <w:p>
+                        <w:r><w:t>图标一</w:t></w:r>
+                        <w:r><w:drawing><a:blip r:embed="rId10"/></w:drawing></w:r>
+                      </w:p>
+                    </w:tc>
+                    <w:tc>
+                      <w:tcPr><w:tcW w:w="1200" w:type="dxa"/></w:tcPr>
+                      <w:p>
+                        <w:r><w:t>图标二</w:t></w:r>
+                        <w:r><w:drawing><a:blip r:embed="rId11"/></w:drawing></w:r>
+                      </w:p>
+                    </w:tc>
+                  </w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>
+        "#;
+
+        let anchors = build_docx_manual_occurrence_seeds_from_xml(document, rels);
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].media_path, "word/media/image10.png");
+        assert_eq!(anchors[0].row_index, Some(0));
+        assert_eq!(anchors[0].col_index, Some(0));
+        assert_eq!(anchors[0].local_text_before, "图标一");
+        assert_eq!(anchors[1].media_path, "word/media/image11.png");
+        assert_eq!(anchors[1].row_index, Some(0));
+        assert_eq!(anchors[1].col_index, Some(1));
+        assert_eq!(anchors[1].local_text_before, "图标二");
     }
 }

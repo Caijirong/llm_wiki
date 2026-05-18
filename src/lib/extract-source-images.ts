@@ -16,6 +16,7 @@
 import { invoke } from "@tauri-apps/api/core"
 import { encodeMarkdownImageUrl } from "@/lib/markdown-image-url"
 import { getFileName, normalizePath } from "@/lib/path-utils"
+import type { DocumentManualVisualOccurrence } from "@/lib/document-manual-visuals"
 
 /** Mirrors `commands::extract_images::SavedImage` on the Rust side. */
 export interface SavedImage {
@@ -34,6 +35,20 @@ export interface SavedImage {
   contextBefore?: string
   /** Text immediately after this image in the source document, when available. */
   contextAfter?: string
+}
+
+function isDocumentManualOccurrence(
+  value: unknown,
+): value is DocumentManualVisualOccurrence {
+  if (!value || typeof value !== "object") return false
+  const obj = value as Record<string, unknown>
+  return (
+    typeof obj.occurrenceIndex === "number" &&
+    typeof obj.relPath === "string" &&
+    typeof obj.absPath === "string" &&
+    typeof obj.visualClass === "string" &&
+    typeof obj.docOrder === "number"
+  )
 }
 
 /** File extensions we currently extract images from. Excludes XLS/XLSX
@@ -101,6 +116,35 @@ export async function extractAndSaveSourceImages(
   } catch (err) {
     console.warn(
       `[ingest:images] extraction failed for "${fileName}":`,
+      err instanceof Error ? err.message : err,
+    )
+    return []
+  }
+}
+
+export async function extractAndSaveDocumentManualDocxVisuals(
+  projectPath: string,
+  sourcePath: string,
+): Promise<DocumentManualVisualOccurrence[]> {
+  const pp = normalizePath(projectPath)
+  const sp = normalizePath(sourcePath)
+  const fileName = getFileName(sp)
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? ""
+  if (ext !== "docx") return []
+
+  const slug = fileName.replace(/\.[^.]+$/, "")
+  const destDir = `${pp}/wiki/media/${slug}`
+  const relTo = `${pp}/wiki`
+
+  try {
+    const visuals = await invoke<unknown[]>(
+      "extract_and_save_docx_manual_visuals_cmd",
+      { sourcePath: sp, destDir, relTo },
+    )
+    return visuals.filter(isDocumentManualOccurrence)
+  } catch (err) {
+    console.warn(
+      `[ingest:manual-docx] extraction failed for "${fileName}":`,
       err instanceof Error ? err.message : err,
     )
     return []

@@ -82,6 +82,7 @@ pub fn run() {
             commands::extract_images::extract_office_images_cmd,
             commands::extract_images::extract_and_save_pdf_images_cmd,
             commands::extract_images::extract_and_save_office_images_cmd,
+            commands::extract_images::extract_and_save_docx_manual_visuals_cmd,
             mcp_server::mcp_status,
             mcp_server::mcp_start,
             mcp_server::mcp_stop,
