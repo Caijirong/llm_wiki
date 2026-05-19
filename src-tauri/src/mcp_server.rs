@@ -39,8 +39,6 @@ use crate::file_receiver_server::{
 const DEFAULT_MCP_HOST: &str = "127.0.0.1";
 const DEFAULT_MCP_PORT: u16 = 18765;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
-const DEFAULT_CONTEXT_PAGE_LIMIT: usize = 5;
-const DEFAULT_PAGE_CHAR_LIMIT: usize = 4000;
 const DEFAULT_INGEST_POLL_INTERVAL_SECONDS: u64 = 60;
 const MCP_ENDPOINT_PATH: &str = "/mcp";
 const UPLOADS_ENDPOINT_PATH: &str = "/uploads";
@@ -275,57 +273,23 @@ pub struct McpPage {
     pub exists: bool,
     pub title: String,
     pub relative_path: String,
+    pub total_chars: usize,
+    pub start_offset: usize,
+    pub end_offset: usize,
     pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct McpReadPageResponse {
-    pub project_id: String,
-    pub page: McpPage,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct McpContextResponse {
-    pub project_id: String,
-    pub warning: Option<String>,
-    pub purpose: String,
-    pub schema: String,
-    pub index: String,
-    pub image_usage_instructions: String,
-    pub knowledge_images: Vec<McpKnowledgeImage>,
-    pub pages: Vec<McpPage>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct McpKnowledgeImage {
-    pub id: usize,
-    pub title: String,
-    pub alt: String,
-    pub source_path: String,
-    pub url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum McpRendererRetrievalKind {
-    Search,
-    Context,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+    pub next_start_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct McpRendererRetrievalRequest {
     request_id: String,
-    kind: McpRendererRetrievalKind,
     project_id: String,
     project_path: String,
     query: String,
     limit: Option<usize>,
-    max_pages: Option<usize>,
-    page_char_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -335,12 +299,13 @@ pub struct McpRendererRetrievalResponse {
     pub query: String,
     pub warning: Option<String>,
     pub results: Vec<McpSearchHit>,
-    pub purpose: String,
-    pub schema: String,
-    pub index: String,
-    pub image_usage_instructions: String,
-    pub knowledge_images: Vec<McpKnowledgeImage>,
-    pub pages: Vec<McpPage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpReadPageResponse {
+    pub project_id: String,
+    pub page: McpPage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -469,15 +434,8 @@ struct SearchRequest {
 struct ReadPageRequest {
     path_or_id: String,
     project_id: Option<String>,
+    start_offset: Option<usize>,
     max_chars: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct GetContextRequest {
-    query: String,
-    project_id: Option<String>,
-    max_pages: Option<usize>,
-    page_char_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -570,13 +528,10 @@ impl EmbeddedMcpServer {
         let search_limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
         let request = McpRendererRetrievalRequest {
             request_id: new_retrieval_request_id(),
-            kind: McpRendererRetrievalKind::Search,
             project_id: resolved_project_id.clone(),
             project_path,
             query: query.to_string(),
             limit: Some(search_limit),
-            max_pages: None,
-            page_char_limit: None,
         };
 
         match self.retrieval_bridge.request(request).await {
@@ -589,55 +544,6 @@ impl EmbeddedMcpServer {
             Err(_) => {
                 let mut fallback =
                     EmbeddedMcpTools.llm_wiki_search(state, query, project_id, limit)?;
-                fallback.warning = Some(renderer_fallback_warning());
-                Ok(fallback)
-            }
-        }
-    }
-
-    async fn llm_wiki_get_context(
-        &self,
-        state: &McpRuntimeState,
-        query: &str,
-        project_id: Option<&str>,
-        max_pages: Option<usize>,
-        page_char_limit: Option<usize>,
-    ) -> Result<McpContextResponse, McpToolError> {
-        let (resolved_project_id, project_path) = resolve_retrieval_project(state, project_id)?;
-        let page_limit = max_pages.unwrap_or(DEFAULT_CONTEXT_PAGE_LIMIT).clamp(1, 10);
-        let chars_limit = page_char_limit
-            .unwrap_or(DEFAULT_PAGE_CHAR_LIMIT)
-            .clamp(200, 20_000);
-        let request = McpRendererRetrievalRequest {
-            request_id: new_retrieval_request_id(),
-            kind: McpRendererRetrievalKind::Context,
-            project_id: resolved_project_id.clone(),
-            project_path,
-            query: query.to_string(),
-            limit: Some(DEFAULT_SEARCH_LIMIT),
-            max_pages: Some(page_limit),
-            page_char_limit: Some(chars_limit),
-        };
-
-        match self.retrieval_bridge.request(request).await {
-            Ok(renderer) => Ok(McpContextResponse {
-                project_id: resolved_project_id,
-                warning: renderer.warning,
-                purpose: renderer.purpose,
-                schema: renderer.schema,
-                index: renderer.index,
-                image_usage_instructions: renderer.image_usage_instructions,
-                knowledge_images: renderer.knowledge_images,
-                pages: renderer.pages.into_iter().take(page_limit).collect(),
-            }),
-            Err(_) => {
-                let mut fallback = EmbeddedMcpTools.llm_wiki_get_context(
-                    state,
-                    query,
-                    project_id,
-                    max_pages,
-                    page_char_limit,
-                )?;
                 fallback.warning = Some(renderer_fallback_warning());
                 Ok(fallback)
             }
@@ -677,47 +583,28 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_read_page",
-        description = "Read a single wiki page by relative path like entities/openai.md or by page id like openai."
+        description = "Read a single wiki page by relative path like entities/openai.md or by page id like openai. Omit pagination fields to return the full page, or pass start_offset/max_chars to read a specific window."
     )]
     async fn read_page(
         &self,
         Parameters(ReadPageRequest {
             path_or_id,
             project_id,
+            start_offset,
             max_chars,
         }): Parameters<ReadPageRequest>,
     ) -> Result<Json<McpReadPageResponse>, CallToolResult> {
         let state = self.runtime_snapshot();
         EmbeddedMcpTools
-            .llm_wiki_read_page(&state, &path_or_id, project_id.as_deref(), max_chars)
+            .llm_wiki_read_page(
+                &state,
+                &path_or_id,
+                project_id.as_deref(),
+                start_offset,
+                max_chars,
+            )
             .map(Json)
             .map_err(tool_error_result)
-    }
-
-    #[tool(
-        name = "llm_wiki_get_context",
-        description = "Return a compact answering bundle using the same retrieval path as the in-app chat."
-    )]
-    async fn get_context(
-        &self,
-        Parameters(GetContextRequest {
-            query,
-            project_id,
-            max_pages,
-            page_char_limit,
-        }): Parameters<GetContextRequest>,
-    ) -> Result<Json<McpContextResponse>, CallToolResult> {
-        let state = self.runtime_snapshot();
-        self.llm_wiki_get_context(
-            &state,
-            &query,
-            project_id.as_deref(),
-            max_pages,
-            page_char_limit,
-        )
-        .await
-        .map(Json)
-        .map_err(tool_error_result)
     }
 
     #[tool(
@@ -1491,60 +1378,20 @@ impl EmbeddedMcpTools {
         state: &McpRuntimeState,
         path_or_id: &str,
         project_id: Option<&str>,
+        start_offset: Option<usize>,
         max_chars: Option<usize>,
     ) -> Result<McpReadPageResponse, McpToolError> {
         let project_path = resolve_project(state, project_id)?;
         ensure_valid_wiki_project(&project_path)?;
         let project_id = project_public_id(&project_path);
 
-        let mut page = read_wiki_page(&project_path, path_or_id)?;
-        page.content = truncate_chars(&page.content, max_chars.unwrap_or(12_000));
+        let page = paginate_wiki_page(
+            read_wiki_page(&project_path, path_or_id)?,
+            start_offset,
+            max_chars,
+        )?;
 
         Ok(McpReadPageResponse { project_id, page })
-    }
-
-    pub fn llm_wiki_get_context(
-        &self,
-        state: &McpRuntimeState,
-        query: &str,
-        project_id: Option<&str>,
-        max_pages: Option<usize>,
-        page_char_limit: Option<usize>,
-    ) -> Result<McpContextResponse, McpToolError> {
-        let project_path = resolve_project(state, project_id)?;
-        ensure_valid_wiki_project(&project_path)?;
-        let project_id = project_public_id(&project_path);
-
-        let page_limit = max_pages.unwrap_or(DEFAULT_CONTEXT_PAGE_LIMIT).clamp(1, 10);
-        let chars_limit = page_char_limit
-            .unwrap_or(DEFAULT_PAGE_CHAR_LIMIT)
-            .clamp(200, 20_000);
-
-        let search_results = keyword_search(&project_path, query, page_limit)?;
-        let project_root = Path::new(&project_path);
-
-        let purpose = fs::read_to_string(project_root.join("purpose.md")).unwrap_or_default();
-        let schema = fs::read_to_string(project_root.join("schema.md")).unwrap_or_default();
-        let index = fs::read_to_string(project_root.join("wiki/index.md")).unwrap_or_default();
-
-        let mut pages = Vec::new();
-        for hit in search_results {
-            if let Ok(mut page) = read_wiki_page(&project_path, &hit.relative_path) {
-                page.content = truncate_chars(&page.content, chars_limit);
-                pages.push(page);
-            }
-        }
-
-        Ok(McpContextResponse {
-            project_id,
-            warning: None,
-            purpose,
-            schema,
-            index,
-            image_usage_instructions: mcp_image_usage_instructions(),
-            knowledge_images: collect_mcp_knowledge_images(&project_path, &pages, query),
-            pages,
-        })
     }
 
     pub fn llm_wiki_get_upload_guide(
@@ -2006,7 +1853,15 @@ fn keyword_search(
     Ok(hits)
 }
 
-fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpToolError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WikiPageDocument {
+    exists: bool,
+    title: String,
+    relative_path: String,
+    content: String,
+}
+
+fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<WikiPageDocument, McpToolError> {
     let wiki_root = Path::new(project_path).join("wiki");
     let normalized = normalize_relative_page_path(path_or_id);
     let mut candidates = Vec::new();
@@ -2039,7 +1894,7 @@ fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpTo
                     .and_then(|name| name.to_str())
                     .unwrap_or(path_or_id),
             );
-            return Ok(McpPage {
+            return Ok(WikiPageDocument {
                 exists: true,
                 title,
                 relative_path,
@@ -2080,7 +1935,7 @@ fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpTo
                 .and_then(|name| name.to_str())
                 .unwrap_or(path_or_id),
         );
-        return Ok(McpPage {
+        return Ok(WikiPageDocument {
             exists: true,
             title,
             relative_path,
@@ -2088,11 +1943,43 @@ fn read_wiki_page(project_path: &str, path_or_id: &str) -> Result<McpPage, McpTo
         });
     }
 
-    Ok(McpPage {
+    Ok(WikiPageDocument {
         exists: false,
         title: path_or_id.to_string(),
         relative_path: normalized,
         content: String::new(),
+    })
+}
+
+fn paginate_wiki_page(
+    page: WikiPageDocument,
+    start_offset: Option<usize>,
+    max_chars: Option<usize>,
+) -> Result<McpPage, McpToolError> {
+    if matches!(max_chars, Some(0)) {
+        return Err(McpToolError::invalid_input(
+            "max_chars must be greater than 0 when provided",
+        ));
+    }
+
+    let total_chars = page.content.chars().count();
+    let start_offset = start_offset.unwrap_or(0).min(total_chars);
+    let end_offset = match max_chars {
+        Some(limit) => start_offset.saturating_add(limit).min(total_chars),
+        None => total_chars,
+    };
+
+    Ok(McpPage {
+        exists: page.exists,
+        title: page.title,
+        relative_path: page.relative_path,
+        total_chars,
+        start_offset,
+        end_offset,
+        content: slice_chars(&page.content, start_offset, end_offset),
+        has_more_before: start_offset > 0,
+        has_more_after: end_offset < total_chars,
+        next_start_offset: (end_offset < total_chars).then_some(end_offset),
     })
 }
 
@@ -2187,171 +2074,6 @@ fn build_snippet(content: &str, tokens: &[String]) -> String {
         .unwrap_or_default()
 }
 
-fn mcp_image_usage_instructions() -> String {
-    [
-        "Related images are available in knowledgeImages.",
-        "Use an image only when it materially helps answer the question.",
-        "If your client supports Markdown image rendering, you may inline it with ![title](url).",
-        "Do not invent image URLs.",
-        "Use each image at most once, in the single most relevant place.",
-        "If image rendering is not supported, cite the image title and URL in text instead.",
-    ]
-    .join(" ")
-}
-
-fn collect_mcp_knowledge_images(
-    project_path: &str,
-    pages: &[McpPage],
-    query: &str,
-) -> Vec<McpKnowledgeImage> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut ranked: Vec<(usize, McpKnowledgeImage)> = Vec::new();
-    let mut supporting: Vec<McpKnowledgeImage> = Vec::new();
-    let project_id = project_public_id(project_path);
-
-    for page in pages {
-        for (url, alt) in extract_markdown_images(&page.content) {
-            if !seen.insert(url.clone()) {
-                continue;
-            }
-            let image = McpKnowledgeImage {
-                id: 0,
-                title: extract_mcp_knowledge_image_title(&alt, &page.title, ranked.len() + supporting.len()),
-                alt: alt.clone(),
-                source_path: format!("wiki/{}", page.relative_path),
-                url: build_clip_server_image_url(&project_id, &url),
-            };
-            let score = mcp_image_query_score(&alt, query);
-            if score > 0 {
-                ranked.push((score, image));
-            } else {
-                supporting.push(image);
-            }
-        }
-    }
-
-    ranked.sort_by(|a, b| b.0.cmp(&a.0));
-    ranked
-        .into_iter()
-        .map(|(_, image)| image)
-        .chain(supporting)
-        .take(5)
-        .enumerate()
-        .map(|(index, mut image)| {
-            image.id = index + 1;
-            image
-        })
-        .collect()
-}
-
-fn extract_markdown_images(content: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut rest = content;
-    while let Some(start) = rest.find("![") {
-        let after_bang = &rest[start + 2..];
-        let Some(alt_end) = after_bang.find(']') else {
-            break;
-        };
-        let alt = after_bang[..alt_end].trim().to_string();
-        let after_alt = &after_bang[alt_end + 1..];
-        if !after_alt.starts_with('(') {
-            rest = after_alt;
-            continue;
-        }
-        let Some(url_end) = after_alt[1..].find(')') else {
-            break;
-        };
-        let url = after_alt[1..1 + url_end].trim().to_string();
-        if !url.is_empty() {
-            out.push((url, alt));
-        }
-        rest = &after_alt[1 + url_end + 1..];
-    }
-    out
-}
-
-fn extract_mcp_knowledge_image_title(alt: &str, source_title: &str, index: usize) -> String {
-    let normalized = alt.replace(['\r', '\n'], " ").trim().to_string();
-    if normalized.is_empty() {
-        return format!("Image {} from {}", index + 1, source_title);
-    }
-    let sentence_end = normalized
-        .find(['。', '！', '？'])
-        .or_else(|| normalized.find(". "))
-        .or_else(|| normalized.find("! "))
-        .or_else(|| normalized.find("? "));
-    let title = sentence_end
-        .map(|end| normalized[..end].trim().to_string())
-        .unwrap_or(normalized);
-    title.chars().take(80).collect()
-}
-
-fn build_clip_server_image_url(project_id: &str, raw_url: &str) -> String {
-    let encoded_project_id = percent_encode_path_segment(project_id);
-    let encoded_path = raw_url
-        .trim_start_matches("./")
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(percent_encode_path_segment)
-        .collect::<Vec<_>>()
-        .join("/");
-    format!(
-        "http://127.0.0.1:19827/wiki-media/{}/{}",
-        encoded_project_id, encoded_path
-    )
-}
-
-fn percent_encode_path_segment(segment: &str) -> String {
-    let mut out = String::new();
-    for byte in segment.as_bytes() {
-        let ch = *byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
-            out.push(ch);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{:02X}", byte));
-        }
-    }
-    out
-}
-
-fn mcp_image_query_score(image_alt: &str, query: &str) -> usize {
-    let alt_lower = image_alt.to_lowercase();
-    let normalized_query = normalize_query_phrase(query);
-    if alt_lower.is_empty() || normalized_query.is_empty() {
-        return 0;
-    }
-
-    let mut score = if alt_lower.contains(&normalized_query) {
-        10_000 + normalized_query.len()
-    } else {
-        0
-    };
-
-    for token in tokenize_query(query) {
-        if alt_lower.contains(&token) {
-            score += if token.len() > 1 { token.len() * 2 } else { 1 };
-        }
-    }
-
-    score
-}
-
-fn normalize_query_phrase(query: &str) -> String {
-    query
-        .trim()
-        .to_lowercase()
-        .trim_matches(|c: char| {
-            c.is_whitespace()
-                || matches!(
-                    c,
-                    ',' | '，' | '。' | '！' | '？' | '、' | '；' | '：' | '"' | '\'' | '（'
-                        | '）' | '(' | ')' | '-' | '_' | '/' | '\\' | '·' | '~' | '～' | '…'
-                )
-        })
-        .to_string()
-}
-
 fn tokenize_query(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
 
@@ -2427,6 +2149,18 @@ fn safe_wiki_join(wiki_root: &Path, relative: &str) -> Option<PathBuf> {
         }
     }
     Some(path)
+}
+
+fn slice_chars(content: &str, start_offset: usize, end_offset: usize) -> String {
+    if start_offset >= end_offset {
+        return String::new();
+    }
+
+    content
+        .chars()
+        .skip(start_offset)
+        .take(end_offset - start_offset)
+        .collect()
 }
 
 fn truncate_chars(content: &str, max_chars: usize) -> String {
@@ -2633,6 +2367,17 @@ OpenAI builds GPT models and AI systems.
         fn path_string(&self) -> String {
             self.path.to_string_lossy().to_string()
         }
+
+        fn write_page(&self, relative_path: &str, content: &str) {
+            let full_path = self.path.join("wiki").join(relative_path);
+            fs::create_dir_all(
+                full_path
+                    .parent()
+                    .expect("page path should have parent directory"),
+            )
+            .expect("page directory should be created");
+            fs::write(full_path, content).expect("page should be written");
+        }
     }
 
     impl Drop for TempWikiProject {
@@ -2703,7 +2448,6 @@ OpenAI builds GPT models and AI systems.
         assert_eq!(
             names,
             vec![
-                "llm_wiki_get_context",
                 "llm_wiki_get_ingest_queue",
                 "llm_wiki_get_ingest_task",
                 "llm_wiki_get_upload_guide",
@@ -3216,84 +2960,134 @@ OpenAI builds GPT models and AI systems.
     }
 
     #[test]
-    fn get_context_matches_chinese_topic_inside_natural_language_query() {
-        let project = TempWikiProject::new("chinese-query");
-        let concept_path = project.path.join("wiki/concepts");
-        fs::create_dir_all(&concept_path).expect("concept dir should be created");
-        fs::write(
-            concept_path.join("low-altitude-government.md"),
-            r#"---
-title: 低空政务一体化
----
-
-# 低空政务一体化
-
-低空政务一体化通过统一平台协同低空审批、监管、巡检和应急等政务场景。
-"#,
-        )
-        .expect("concept page should be written");
+    fn read_page_without_pagination_returns_full_page_content() {
+        let project = TempWikiProject::new("read-page-full");
+        let content = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        project.write_page("concepts/windowed.md", content);
         let state = state_with_current_project(&project.path_string());
 
         let response = EmbeddedMcpTools
-            .llm_wiki_get_context(
-                &state,
-                "基于之前的知识告诉我什么是低空政务一体化",
-                None,
-                Some(5),
-                Some(1_000),
-            )
-            .expect("context query should succeed");
+            .llm_wiki_read_page(&state, "concepts/windowed.md", None, None, None)
+            .expect("full-page read should succeed");
 
-        assert!(
-            response
-                .pages
-                .iter()
-                .any(|page| page.title == "低空政务一体化"),
-            "natural language Chinese query should return the page for the embedded topic"
-        );
+        assert_eq!(response.page.relative_path, "concepts/windowed.md");
+        assert_eq!(response.page.total_chars, content.chars().count());
+        assert_eq!(response.page.start_offset, 0);
+        assert_eq!(response.page.end_offset, content.chars().count());
+        assert_eq!(response.page.content, content);
+        assert!(!response.page.has_more_before);
+        assert!(!response.page.has_more_after);
+        assert_eq!(response.page.next_start_offset, None);
     }
 
     #[test]
-    fn get_context_includes_knowledge_images_with_clip_server_urls() {
-        let project = TempWikiProject::new("context-images");
-        let source_path = project.path.join("wiki/sources");
-        let media_path = project.path.join("wiki/media/project-plan");
-        fs::create_dir_all(&source_path).expect("source dir should be created");
-        fs::create_dir_all(&media_path).expect("media dir should be created");
-        fs::write(media_path.join("img-2.png"), b"png")
-            .expect("image file should be written");
-        fs::write(
-            source_path.join("project-plan.md"),
-            r#"---
-title: Project Plan
----
-
-# Project Plan
-
-![图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。](media/project-plan/img-2.png)
-"#,
-        )
-        .expect("source page should be written");
+    fn read_page_with_max_chars_returns_first_slice() {
+        let project = TempWikiProject::new("read-page-first-slice");
+        project.write_page(
+            "concepts/windowed.md",
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        );
         let state = state_with_current_project(&project.path_string());
 
         let response = EmbeddedMcpTools
-            .llm_wiki_get_context(&state, "无人机采集作业流程图", None, Some(5), Some(1_000))
-            .expect("context query should succeed");
+            .llm_wiki_read_page(&state, "concepts/windowed.md", None, None, Some(10))
+            .expect("windowed read should succeed");
 
-        assert_eq!(response.knowledge_images.len(), 1);
-        let image = &response.knowledge_images[0];
-        assert_eq!(image.id, 1);
-        assert_eq!(image.title, "图 3.2-5 无人机采集作业流程图");
-        assert_eq!(
-            image.url,
-            format!(
-                "http://127.0.0.1:19827/wiki-media/{}/media/project-plan/img-2.png",
-                project_public_id(&project.path_string())
-            )
+        assert_eq!(response.page.content, "0123456789");
+        assert_eq!(response.page.start_offset, 0);
+        assert_eq!(response.page.end_offset, 10);
+        assert!(!response.page.has_more_before);
+        assert!(response.page.has_more_after);
+        assert_eq!(response.page.next_start_offset, Some(10));
+    }
+
+    #[test]
+    fn read_page_with_start_offset_and_max_chars_returns_mid_page_window() {
+        let project = TempWikiProject::new("read-page-mid-window");
+        project.write_page(
+            "concepts/windowed.md",
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         );
-        assert!(response
-            .image_usage_instructions
-            .contains("If your client supports Markdown image rendering"));
+        let state = state_with_current_project(&project.path_string());
+
+        let response = EmbeddedMcpTools
+            .llm_wiki_read_page(&state, "concepts/windowed.md", None, Some(10), Some(8))
+            .expect("mid-page window should succeed");
+
+        assert_eq!(response.page.content, "ABCDEFGH");
+        assert_eq!(response.page.start_offset, 10);
+        assert_eq!(response.page.end_offset, 18);
+        assert!(response.page.has_more_before);
+        assert!(response.page.has_more_after);
+        assert_eq!(response.page.next_start_offset, Some(18));
+    }
+
+    #[test]
+    fn read_page_with_start_offset_and_no_limit_reads_to_eof() {
+        let project = TempWikiProject::new("read-page-tail");
+        project.write_page(
+            "concepts/windowed.md",
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        );
+        let state = state_with_current_project(&project.path_string());
+
+        let response = EmbeddedMcpTools
+            .llm_wiki_read_page(&state, "concepts/windowed.md", None, Some(30), None)
+            .expect("tail read should succeed");
+
+        assert_eq!(response.page.content, "UVWXYZ");
+        assert_eq!(response.page.start_offset, 30);
+        assert_eq!(response.page.end_offset, 36);
+        assert!(response.page.has_more_before);
+        assert!(!response.page.has_more_after);
+        assert_eq!(response.page.next_start_offset, None);
+    }
+
+    #[test]
+    fn read_page_continuation_metadata_handles_eof_boundary() {
+        let project = TempWikiProject::new("read-page-boundary");
+        project.write_page(
+            "concepts/windowed.md",
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        );
+        let state = state_with_current_project(&project.path_string());
+
+        let response = EmbeddedMcpTools
+            .llm_wiki_read_page(&state, "concepts/windowed.md", None, Some(36), Some(6))
+            .expect("boundary read should succeed");
+
+        assert_eq!(response.page.content, "");
+        assert_eq!(response.page.start_offset, 36);
+        assert_eq!(response.page.end_offset, 36);
+        assert!(response.page.has_more_before);
+        assert!(!response.page.has_more_after);
+        assert_eq!(response.page.next_start_offset, None);
+    }
+
+    #[test]
+    fn search_results_relative_path_chains_into_read_page() {
+        let project = TempWikiProject::new("search-read-chain");
+        let content = "Chainable search result content.";
+        project.write_page("concepts/search-chain.md", content);
+        let state = state_with_current_project(&project.path_string());
+
+        let search = EmbeddedMcpTools
+            .llm_wiki_search(&state, "Chainable search result content", None, Some(5))
+            .expect("search should succeed");
+        let first_hit = search
+            .results
+            .first()
+            .expect("search should return one hit");
+
+        assert_eq!(first_hit.relative_path, "concepts/search-chain.md");
+
+        let read = EmbeddedMcpTools
+            .llm_wiki_read_page(&state, &first_hit.relative_path, None, None, None)
+            .expect("read_page should accept llm_wiki_search.relative_path");
+
+        assert!(read.page.exists);
+        assert_eq!(read.page.relative_path, first_hit.relative_path);
+        assert_eq!(read.page.content, content);
     }
 
     #[test]
@@ -3410,7 +3204,7 @@ title: Project Plan
             .list_all_tools()
             .await
             .expect("tool listing should succeed");
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 6);
         let tool_names = tools
             .iter()
             .map(|tool| tool.name.as_ref())
@@ -3426,6 +3220,14 @@ title: Project Plan
         assert!(search_schema["properties"].get("mode").is_none());
         assert!(search_schema["properties"].get("project_path").is_none());
         assert!(search_schema["properties"].get("project_id").is_some());
+        let read_tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "llm_wiki_read_page")
+            .expect("read_page tool should be listed");
+        let read_schema =
+            serde_json::to_value(&read_tool.input_schema).expect("schema should serialize");
+        assert!(read_schema["properties"].get("start_offset").is_some());
+        assert!(read_schema["properties"].get("max_chars").is_some());
 
         let guide_result = client
             .call_tool(CallToolRequestParams::new("llm_wiki_get_upload_guide"))
@@ -3471,10 +3273,12 @@ title: Project Plan
         assert_eq!(structured["projectId"], project_public_id(&project_path));
         assert!(structured.get("mode").is_none());
         assert_eq!(structured["results"][0]["title"], "OpenAI");
+        let relative_path = structured["results"][0]["relativePath"]
+            .as_str()
+            .expect("search results should include relativePath");
 
         let read_arguments = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
-            "path_or_id": "openai",
-            "max_chars": 500
+            "path_or_id": relative_path
         }))
         .expect("read args should deserialize");
         let read_result = client
@@ -3492,6 +3296,17 @@ title: Project Plan
             read_structured["page"]["relativePath"],
             "entities/openai.md"
         );
+        assert_eq!(read_structured["page"]["startOffset"], 0);
+        assert_eq!(
+            read_structured["page"]["endOffset"],
+            read_structured["page"]["totalChars"]
+        );
+        assert_eq!(read_structured["page"]["hasMoreAfter"], false);
+        assert!(read_structured["page"]["nextStartOffset"].is_null());
+        assert!(read_structured["page"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("OpenAI builds GPT models and AI systems."));
 
         client.cancel().await.expect("client should cancel cleanly");
         token.cancel();
