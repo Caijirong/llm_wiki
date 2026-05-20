@@ -280,6 +280,20 @@ pub struct McpPage {
     pub has_more_before: bool,
     pub has_more_after: bool,
     pub next_start_offset: Option<usize>,
+    pub resources: Vec<McpPageResource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPageResource {
+    pub id: usize,
+    pub kind: String,
+    pub raw_ref: String,
+    pub url: String,
+    pub source_path: String,
+    pub title: Option<String>,
+    pub alt: Option<String>,
+    pub syntax: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -583,7 +597,7 @@ impl EmbeddedMcpServer {
 
     #[tool(
         name = "llm_wiki_read_page",
-        description = "Read a single wiki page by relative path like entities/openai.md or by page id like openai. Omit pagination fields to return the full page, or pass start_offset/max_chars to read a specific window."
+        description = "Read a single wiki page by relative path like entities/openai.md or by page id like openai. Omit pagination fields to return the full original wiki markdown, or pass start_offset/max_chars to read a specific original-markdown window. The response includes page.resources, a mapping of resource references found in the returned content window to directly accessible HTTP URLs."
     )]
     async fn read_page(
         &self,
@@ -1385,11 +1399,14 @@ impl EmbeddedMcpTools {
         ensure_valid_wiki_project(&project_path)?;
         let project_id = project_public_id(&project_path);
 
-        let page = paginate_wiki_page(
-            read_wiki_page(&project_path, path_or_id)?,
-            start_offset,
-            max_chars,
-        )?;
+        let document = read_wiki_page(&project_path, path_or_id)?;
+        let mut page = paginate_wiki_page(document, start_offset, max_chars)?;
+        page.resources = collect_mcp_page_resources(
+            &project_id,
+            &page.title,
+            &page.relative_path,
+            &page.content,
+        );
 
         Ok(McpReadPageResponse { project_id, page })
     }
@@ -1980,6 +1997,7 @@ fn paginate_wiki_page(
         has_more_before: start_offset > 0,
         has_more_after: end_offset < total_chars,
         next_start_offset: (end_offset < total_chars).then_some(end_offset),
+        resources: Vec::new(),
     })
 }
 
@@ -2072,6 +2090,200 @@ fn build_snippet(content: &str, tokens: &[String]) -> String {
         .find(|line| !line.is_empty())
         .map(|line| truncate_chars(line, 220))
         .unwrap_or_default()
+}
+
+fn collect_mcp_page_resources(
+    project_id: &str,
+    page_title: &str,
+    relative_path: &str,
+    content: &str,
+) -> Vec<McpPageResource> {
+    let mut seen = std::collections::BTreeSet::new();
+    extract_page_resource_refs(content)
+        .into_iter()
+        .filter(|resource| seen.insert((resource.raw_ref.clone(), resource.syntax.clone())))
+        .enumerate()
+        .map(|(index, resource)| McpPageResource {
+            id: index + 1,
+            kind: "image".to_string(),
+            raw_ref: resource.raw_ref.clone(),
+            url: resolve_mcp_page_image_url(project_id, &resource.raw_ref),
+            source_path: format!("wiki/{}", relative_path),
+            title: resource
+                .alt
+                .as_deref()
+                .map(|alt| extract_mcp_page_image_title(alt, page_title, index)),
+            alt: resource.alt,
+            syntax: resource.syntax,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpPageResourceRef {
+    raw_ref: String,
+    alt: Option<String>,
+    syntax: String,
+}
+
+fn extract_page_resource_refs(content: &str) -> Vec<McpPageResourceRef> {
+    let mut out = Vec::new();
+    out.extend(
+        extract_markdown_images(content)
+            .into_iter()
+            .map(|(raw_ref, alt)| McpPageResourceRef {
+                raw_ref,
+                alt: Some(alt),
+                syntax: "markdown_image".to_string(),
+            }),
+    );
+    out.extend(
+        extract_visual_group_image_refs(content)
+            .into_iter()
+            .map(|raw_ref| McpPageResourceRef {
+                raw_ref,
+                alt: None,
+                syntax: "visual_group_image_field".to_string(),
+            }),
+    );
+    out
+}
+
+fn extract_markdown_images(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("![") {
+        let after_bang = &rest[start + 2..];
+        let Some(alt_end) = after_bang.find(']') else {
+            break;
+        };
+        let alt = after_bang[..alt_end].trim().to_string();
+        let after_alt = &after_bang[alt_end + 1..];
+        if !after_alt.starts_with('(') {
+            rest = after_alt;
+            continue;
+        }
+        let Some(url_end) = after_alt[1..].find(')') else {
+            break;
+        };
+        let url = after_alt[1..1 + url_end].trim().to_string();
+        if !url.is_empty() {
+            out.push((url, alt));
+        }
+        rest = &after_alt[1 + url_end + 1..];
+    }
+    out
+}
+
+fn extract_visual_group_image_refs(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_visual_group = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```llm-wiki-visual-group") {
+            in_visual_group = true;
+            continue;
+        }
+        if in_visual_group && trimmed == "```" {
+            in_visual_group = false;
+            continue;
+        }
+        if !in_visual_group {
+            continue;
+        }
+        let Some(raw_ref) = trimmed.strip_prefix("image:") else {
+            continue;
+        };
+        let raw_ref = raw_ref.trim();
+        if !raw_ref.is_empty() {
+            out.push(raw_ref.to_string());
+        }
+    }
+    out
+}
+
+fn extract_mcp_page_image_title(alt: &str, page_title: &str, index: usize) -> String {
+    let normalized = alt.replace(['\r', '\n'], " ").trim().to_string();
+    if normalized.is_empty() {
+        return format!("Image {} from {}", index + 1, page_title);
+    }
+    let sentence_end = normalized
+        .find(['。', '！', '？'])
+        .or_else(|| normalized.find(". "))
+        .or_else(|| normalized.find("! "))
+        .or_else(|| normalized.find("? "));
+    let title = sentence_end
+        .map(|end| normalized[..end].trim().to_string())
+        .unwrap_or(normalized);
+    title.chars().take(80).collect()
+}
+
+fn resolve_mcp_page_image_url(project_id: &str, raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("data:")
+    {
+        return trimmed.to_string();
+    }
+    build_clip_server_image_url(project_id, trimmed)
+}
+
+fn build_clip_server_image_url(project_id: &str, raw_url: &str) -> String {
+    let encoded_project_id = percent_encode_path_segment(project_id);
+    let encoded_path = raw_url
+        .trim_start_matches("./")
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| percent_encode_path_segment(&decode_percent_component(segment)))
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "http://127.0.0.1:19827/wiki-media/{}/{}",
+        encoded_project_id, encoded_path
+    )
+}
+
+fn percent_encode_path_segment(segment: &str) -> String {
+    let mut out = String::new();
+    for byte in segment.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            out.push(ch);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", byte));
+        }
+    }
+    out
+}
+
+fn decode_percent_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = match std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                    Ok(hex) => hex,
+                    Err(_) => return value.to_string(),
+                };
+                let byte = match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => byte,
+                    Err(_) => return value.to_string(),
+                };
+                out.push(byte);
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).unwrap_or_else(|_| value.to_string())
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
@@ -3091,6 +3303,91 @@ OpenAI builds GPT models and AI systems.
     }
 
     #[test]
+    fn read_page_exposes_resource_urls_for_returned_content_window() {
+        let project = TempWikiProject::new("read-page-resources");
+        let media_dir = project.path.join("wiki/media/project-plan");
+        fs::create_dir_all(&media_dir).expect("media dir should be created");
+        fs::write(media_dir.join("img-2.png"), b"png").expect("image should be written");
+        fs::write(media_dir.join("icon-1.png"), b"png").expect("icon should be written");
+        project.write_page(
+            "sources/project-plan.md",
+            r#"---
+title: Project Plan
+---
+
+# Project Plan
+
+![图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。](media/project-plan/img-2.png)
+
+## UI Visual Elements
+
+```llm-wiki-visual-group
+id: status-icons
+source: project-plan.docx
+heading-path: 21区 > 设备状态
+title: 设备状态图标
+summary: 设备状态的小图标。
+table-context: 状态说明表
+item:
+  image: media/project-plan/icon-1.png
+  description: 故障状态图标
+  row-text: 故障
+  cell-text: 故障
+  header-text: 状态
+```
+"#,
+        );
+        let state = state_with_current_project(&project.path_string());
+
+        let response = EmbeddedMcpTools
+            .llm_wiki_read_page(&state, "sources/project-plan.md", None, None, None)
+            .expect("read_page should succeed");
+        let serialized = serde_json::to_value(&response).expect("response should serialize");
+
+        assert_eq!(serialized["page"]["resources"][0]["id"], 1);
+        assert_eq!(serialized["page"]["resources"][0]["kind"], "image");
+        assert_eq!(
+            serialized["page"]["resources"][0]["rawRef"],
+            "media/project-plan/img-2.png"
+        );
+        assert_eq!(
+            serialized["page"]["resources"][0]["title"],
+            "图 3.2-5 无人机采集作业流程图"
+        );
+        assert_eq!(
+            serialized["page"]["resources"][0]["syntax"],
+            "markdown_image"
+        );
+        assert_eq!(
+            serialized["page"]["resources"][0]["url"],
+            format!(
+                "http://127.0.0.1:19827/wiki-media/{}/media/project-plan/img-2.png",
+                project_public_id(&project.path_string())
+            )
+        );
+        assert_eq!(
+            serialized["page"]["resources"][0]["sourcePath"],
+            "wiki/sources/project-plan.md"
+        );
+        assert_eq!(serialized["page"]["resources"][1]["id"], 2);
+        assert_eq!(
+            serialized["page"]["resources"][1]["rawRef"],
+            "media/project-plan/icon-1.png"
+        );
+        assert_eq!(
+            serialized["page"]["resources"][1]["syntax"],
+            "visual_group_image_field"
+        );
+        assert_eq!(
+            serialized["page"]["resources"][1]["url"],
+            format!(
+                "http://127.0.0.1:19827/wiki-media/{}/media/project-plan/icon-1.png",
+                project_public_id(&project.path_string())
+            )
+        );
+    }
+
+    #[test]
     fn project_public_id_canonicalizes_dot_segments() {
         let project = TempWikiProject::new("project-id-canonical");
         let dotted_path = format!("{}/.", project.path_string());
@@ -3151,6 +3448,20 @@ OpenAI builds GPT models and AI systems.
     #[tokio::test]
     async fn streamable_http_service_calls_embedded_tools() {
         let project = TempWikiProject::new("streamable-http");
+        let media_dir = project.path.join("wiki/media/project-plan");
+        fs::create_dir_all(&media_dir).expect("media dir should be created");
+        fs::write(media_dir.join("img-2.png"), b"png").expect("image should be written");
+        project.write_page(
+            "sources/project-plan.md",
+            r#"---
+title: Project Plan
+---
+
+# Project Plan
+
+![图 3.2-5 无人机采集作业流程图。该流程图展示无人机数据采集的完整步骤。](media/project-plan/img-2.png)
+"#,
+        );
         let uploads = FileReceiverRuntimeManager::default();
         uploads
             .update_config(FileReceiverConfig::default())
@@ -3307,6 +3618,32 @@ OpenAI builds GPT models and AI systems.
             .as_str()
             .unwrap_or_default()
             .contains("OpenAI builds GPT models and AI systems."));
+
+        let image_read_arguments =
+            serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                "path_or_id": "sources/project-plan.md"
+            }))
+            .expect("image read args should deserialize");
+        let image_read_result = client
+            .call_tool(
+                CallToolRequestParams::new("llm_wiki_read_page")
+                    .with_arguments(image_read_arguments),
+            )
+            .await
+            .expect("image read tool call should succeed");
+
+        assert_eq!(image_read_result.is_error, Some(false));
+        let image_read_structured = image_read_result
+            .structured_content
+            .expect("image read should include structured content");
+        assert_eq!(image_read_structured["page"]["resources"][0]["id"], 1);
+        assert_eq!(
+            image_read_structured["page"]["resources"][0]["url"],
+            format!(
+                "http://127.0.0.1:19827/wiki-media/{}/media/project-plan/img-2.png",
+                project_public_id(&project_path)
+            )
+        );
 
         client.cancel().await.expect("client should cancel cleanly");
         token.cancel();
