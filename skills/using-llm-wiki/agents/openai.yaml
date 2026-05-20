@@ -1,7 +1,7 @@
 interface:
   display_name: "Knowledge Base"
   short_description: "Ground answers and drafts in wiki knowledge"
-  default_prompt: "Use $using-llm-wiki for daily questions, internal standards, prior-solution reuse, document drafting, and project-specific terms. First call llm_wiki_get_context before answering or drafting; for imports, first call llm_wiki_get_upload_guide."
+  default_prompt: "Use $using-llm-wiki for daily questions, internal standards, prior-solution reuse, document drafting, and project-specific terms. First call llm_wiki_search before answering or drafting, then llm_wiki_read_page for the best page when needed. If the first hit is a concept/entity page and the question mentions visuals, follow its sources into the matching source page by default instead of stopping at the concept page. For image or icon requests, inspect page.resources, Embedded Images, and llm-wiki-visual-group / UI Visual Elements on the source page, using paginated read_page windows when the source page is long. Never use raw media/... paths directly; resolve them through page.resources[].url. For imports, first call llm_wiki_get_upload_guide."
 
 dependencies:
   tools:

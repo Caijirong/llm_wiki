@@ -11,8 +11,9 @@ Use this skill for knowledge-base workflows backed by an `llm-wiki` MCP server. 
 
 For query, writing, explanation, or context-completion intent, the next substantive action after loading this skill is a knowledge-base lookup. Do not answer from memory first.
 
-- If `llm_wiki_get_context` is exposed, call it first with the user's original query.
-- If `llm_wiki_get_context` is unavailable but `llm_wiki_search` is exposed, call `llm_wiki_search`.
+- If `llm_wiki_search` is exposed, call it first with the user's original query.
+- If an exact page path or page id is already known, `llm_wiki_read_page` is also a valid first lookup.
+- If the first useful hit is a concept/entity page, do not stop there for visual questions. Continue to the related source page indicated by that page's `sources:` evidence or by a follow-up source-page lookup.
 - If a full-sentence query returns no pages but the topic is clear, retry once with the concise core topic phrase.
 - If no first-class MCP tool is exposed, inspect the registered `llm-wiki` MCP server or use the HTTP MCP fallback before answering.
 - If the lookup cannot be performed, report the exact missing tool, endpoint, or connection failure.
@@ -27,6 +28,7 @@ For query, writing, explanation, or context-completion intent, the next substant
 - Reuse prior project knowledge, standards, terminology, and historical solutions
 - Import files into the knowledge base through the upload/ingest flow
 - Route knowledge-base-oriented tasks through the `llm-wiki` MCP tools
+- Retrieve source-page visual evidence such as screenshots, figures, icons, and small UI states
 
 ## What this skill does NOT cover
 
@@ -100,6 +102,7 @@ Activate this skill when the user intent matches any of these:
 - If the user asks for writing help and the requested document could use wiki knowledge, query first, then draft from the evidence.
 - If the user asks to add material to the knowledge base, treat that as **file upload/import** only.
 - If the task needs current KB evidence, do not answer from memory or generic web results before checking `llm-wiki`.
+- If the user asks about 图示 / 图标 / 图片 / 截图 / 界面 / 颜色 / 样式 / 显示示意, switch into the visual-retrieval branch immediately and prioritize source-page evidence over concept-page summaries.
 - For imports, call `llm_wiki_get_upload_guide` first and follow the returned upload contract.
 - If the upload service is stopped, unavailable, or unauthorized, report that runtime state directly.
 - If no first-class MCP tool exists, inspect the configured MCP server through the host client or use the HTTP MCP fallback.
@@ -111,15 +114,37 @@ Activate this skill when the user intent matches any of these:
 - If wiki evidence is thin, say so and separate "wiki says" from "general inference".
 - Do not invent internal standards, project history, page names, or source coverage.
 - For document drafts, reuse relevant wiki concepts and source titles instead of writing empty templates.
+- For visual evidence, treat source pages under `wiki/sources/` as canonical. Concept/entity pages may explain the knowledge, but extracted document media is usually attached to the source page that ingested the original file.
+- Separate “concept summary” from “source-document visual evidence”. Concept/entity pages often explain meaning, priority, or linkage; source pages carry the concrete images, icons, colors, screenshots, and media URLs.
 
 ## Image Usage Policy
 
-- Treat `knowledgeImages` returned by `llm_wiki_get_context` as optional supporting evidence, not as a requirement to always render images.
+- Do not assume concept pages or entity pages are where document images live. After ingest, extracted images and most document-media references are canonically attached to the source wiki page, usually `wiki/sources/<slug>.md`.
+- When a concept/entity page matches, treat it as the semantic entry point, not the final visual answer. Default to following its `sources:` trail into the relevant source page before concluding anything about images or icons.
+- Treat `sources:` as a source-location clue, not necessarily a ready-to-read wiki path. It often stores the original source filename, so you may need a follow-up source-page lookup by filename, title, or source slug.
+- For screenshots, figures, diagrams, charts, and regular extracted media, inspect the source page's `## Embedded Images` section.
+- For manual icons, status indicators, and small UI visuals, inspect the source page's `## UI Visual Elements` section.
+- `llm_wiki_read_page.page.content` is the original wiki markdown window. Treat it as source text, not as a rendered or URL-rewritten document.
+- `llm_wiki_read_page.page.resources` maps resource references found in the returned `content` window to directly accessible HTTP URLs. Use `resources[].url` when citing, rendering, or fetching media.
+- Do not use raw `media/...` paths directly. They are wiki-relative source references and must be resolved through `page.resources` before being shown or fetched.
+- Do not assume `## Embedded Images` fully covers `## UI Visual Elements`. Some icon/state rows may only be represented inside the structured `llm-wiki-visual-group` block or may have blank `image:` fields, so you must read that section's content directly when icon lookup matters and then match its `image:` reference against `page.resources`.
+- Once you open a source page, the minimum visual checks are:
+  1. `page.resources`
+  2. `## Embedded Images`
+  3. `llm-wiki-visual-group` blocks inside `## UI Visual Elements`
+- If the source page is long, continue reading with `start_offset` / `max_chars` windows until you either find the target `heading-path`, `title`, `table-context`, image label, or exhaust the relevant visual sections. Do not read only the first window and then conclude there is no matching visual.
+- Before saying “没有图标 / 没有图片 / 没有图示”, complete all three checks:
+  1. the relevant concept/entity page
+  2. the corresponding source page
+  3. the source page's visual groups or image lists
+- When the user asks for “这个知识对应的图/图标/截图”, first locate the relevant knowledge page, then follow through to the matching source page and inspect `## Embedded Images` and `## UI Visual Elements` there.
+- Search for visual evidence using the label/context users are likely to cite: figure caption text, icon meaning, state label, table context, UI section title, source document title, or explicit visual keywords such as `图标`, `截图`, `visual-group`, `heading-path: ...`, and `image: media/`.
+- Visual retrieval should use second-pass queries when helpful. Good examples: `21区 图标`, `设备故障状态 显示`, `heading-path: 21区`, `image: media/`, `visual-group`.
+- Add a naming-difference warning when the concept page and the source-page visual section are not at the same naming granularity. If a concept is broader or narrower than the visual label found in the source page, tell the user explicitly instead of silently treating them as a perfect name match.
 - Use an image only when it materially improves the answer. Do not append every related image by default.
 - When an image is used, place it at the single most relevant point in the answer so the response reads as one coherent flow instead of text followed by an image dump.
 - Do not repeat the same image more than once in a single answer.
-- Prefer the most relevant matching image first. Additional images are allowed only when each one adds distinct value and is placed intentionally.
-- If the client supports Markdown image rendering, inline the image with the title and the exact `url` returned by `MCP`.
+- If the client supports Markdown image rendering, inline the image with the exact `url` returned by MCP.
 - If the client does not support image rendering, cite the image title and URL in text instead.
 - Do not invent image URLs, rewrite them into guessed local paths, or claim an image was shown if it was only cited.
 
@@ -127,7 +152,7 @@ Activate this skill when the user intent matches any of these:
 
 Use the best available access path in this order:
 
-1. First-class MCP tools exposed in the current agent session, such as `llm_wiki_get_context`, `llm_wiki_search`, or `llm_wiki_get_upload_guide`.
+1. First-class MCP tools exposed in the current agent session, such as `llm_wiki_search`, `llm_wiki_read_page`, or `llm_wiki_get_upload_guide`.
 2. The agent host's MCP registry or diagnostics. In OpenClaw, `openclaw mcp list` and `openclaw mcp show llm-wiki` are required checks when first-class tools are absent.
 3. A configured MCP HTTP endpoint. Use the Streamable HTTP flow only when direct MCP tools are unavailable.
 
