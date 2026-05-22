@@ -19,6 +19,7 @@ import { convertLatexToUnicode } from "@/lib/latex-to-unicode"
 import { normalizePath, getFileName } from "@/lib/path-utils"
 import { makeQueryFileName } from "@/lib/wiki-filename"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
+import { markdownUrlTransform } from "@/lib/markdown-url-transform"
 import { findRawSourceForImage, imageUrlToAbsolute } from "@/lib/raw-source-resolver"
 
 // Module-level cache of source file names
@@ -660,6 +661,7 @@ function MarkdownContent({ content }: { content: string }) {
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkMath]}
           rehypePlugins={[rehypeKatex]}
+          urlTransform={markdownUrlTransform}
           components={{
             a: ({ href, children }) => {
               if (href?.startsWith("wikilink:")) {
