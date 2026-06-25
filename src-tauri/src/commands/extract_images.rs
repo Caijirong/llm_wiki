@@ -492,7 +492,9 @@ fn encode_uri_component_like(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for &byte in segment.as_bytes() {
         let ch = byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')') {
+        if ch.is_ascii_alphanumeric()
+            || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')')
+        {
             out.push(ch);
         } else {
             out.push('%');
@@ -913,17 +915,72 @@ fn build_docx_relationship_map(rels_xml: &str) -> HashMap<String, String> {
     out
 }
 
-fn find_embed_ids(xml: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocxImageRelationRef {
+    start: usize,
+    end: usize,
+    rel_id: String,
+}
+
+fn find_next_docx_embed_ref(xml: &str, search_from: usize) -> Option<DocxImageRelationRef> {
+    const EMBED_ATTR: &str = "r:embed=\"";
+    if let Some(pos) = xml[search_from..].find(EMBED_ATTR) {
+        let start = search_from + pos;
+        let value_start = start + EMBED_ATTR.len();
+        let Some(value_end) = xml[value_start..].find('"').map(|end| value_start + end) else {
+            return None;
+        };
+        Some(DocxImageRelationRef {
+            start,
+            end: value_end + 1,
+            rel_id: xml[value_start..value_end].to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+fn find_next_docx_vml_image_ref(xml: &str, search_from: usize) -> Option<DocxImageRelationRef> {
+    let mut current = search_from;
+    while let Some(tag_start) = find_docx_open_tag(xml, current, "v:imagedata") {
+        let Some(tag_end) = xml[tag_start..].find('>').map(|end| tag_start + end + 1) else {
+            return None;
+        };
+        let tag = &xml[tag_start..tag_end];
+        if let Some(rel_id) = xml_attr_value(tag, "r:id") {
+            return Some(DocxImageRelationRef {
+                start: tag_start,
+                end: tag_end,
+                rel_id,
+            });
+        }
+        current = tag_end;
+    }
+    None
+}
+
+fn find_next_docx_image_relation_ref(
+    xml: &str,
+    search_from: usize,
+) -> Option<DocxImageRelationRef> {
+    let embed_ref = find_next_docx_embed_ref(xml, search_from);
+    let vml_ref = find_next_docx_vml_image_ref(xml, search_from);
+
+    match (embed_ref, vml_ref) {
+        (Some(embed), Some(vml)) if embed.start <= vml.start => Some(embed),
+        (Some(_), Some(vml)) => Some(vml),
+        (Some(embed), None) => Some(embed),
+        (None, Some(vml)) => Some(vml),
+        (None, None) => None,
+    }
+}
+
+fn find_docx_image_relation_ids(xml: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut search_from = 0;
-    while let Some(pos) = xml[search_from..].find("r:embed=\"") {
-        let start = search_from + pos + "r:embed=\"".len();
-        let end = match xml[start..].find('"') {
-            Some(end) => start + end,
-            None => break,
-        };
-        out.push(xml[start..end].to_string());
-        search_from = end + 1;
+    while let Some(image_ref) = find_next_docx_image_relation_ref(xml, search_from) {
+        out.push(image_ref.rel_id);
+        search_from = image_ref.end;
     }
     out
 }
@@ -970,7 +1027,7 @@ fn build_docx_media_context_map_from_xml(
             parts.push(text);
         }
 
-        for rel_id in find_embed_ids(paragraph) {
+        for rel_id in find_docx_image_relation_ids(paragraph) {
             if let Some(media_path) = rel_to_media.get(&rel_id) {
                 let idx = parts.len();
                 parts.push(format!("[image:{media_path}]"));
@@ -1082,7 +1139,8 @@ fn paragraph_is_list_item(paragraph_xml: &str) -> bool {
 }
 
 fn count_images(parts: &[DocxBlockPart]) -> u32 {
-    parts.iter()
+    parts
+        .iter()
         .filter(|part| matches!(part, DocxBlockPart::Image(_)))
         .count() as u32
 }
@@ -1102,52 +1160,45 @@ fn find_docx_open_tag(xml: &str, search_from: usize, tag: &str) -> Option<usize>
     }
 }
 
-fn find_next_docx_event(xml: &str, search_from: usize) -> Option<(usize, usize, &'static str)> {
-    let text_pos = find_docx_open_tag(xml, search_from, "w:t");
-    let embed_pos = xml[search_from..]
-        .find("r:embed=\"")
-        .map(|p| search_from + p);
+enum DocxEventKind {
+    Text,
+    Image(String),
+}
 
-    match (text_pos, embed_pos) {
-        (Some(t), Some(e)) if t < e => {
+fn find_next_docx_event(xml: &str, search_from: usize) -> Option<(usize, usize, DocxEventKind)> {
+    let text_pos = find_docx_open_tag(xml, search_from, "w:t");
+    let image_ref = find_next_docx_image_relation_ref(xml, search_from);
+
+    match (text_pos, image_ref) {
+        (Some(t), Some(image)) if t < image.start => {
             let close = xml[t..].find("</w:t>")? + t + "</w:t>".len();
-            Some((t, close, "text"))
+            Some((t, close, DocxEventKind::Text))
         }
         (Some(t), None) => {
             let close = xml[t..].find("</w:t>")? + t + "</w:t>".len();
-            Some((t, close, "text"))
+            Some((t, close, DocxEventKind::Text))
         }
-        (_, Some(e)) => {
-            let start = e + "r:embed=\"".len();
-            let end = xml[start..].find('"')? + start + 1;
-            Some((e, end, "image"))
-        }
+        (_, Some(image)) => Some((image.start, image.end, DocxEventKind::Image(image.rel_id))),
         (None, None) => None,
     }
 }
 
-fn parse_docx_block_parts(
-    xml: &str,
-    rel_to_media: &HashMap<String, String>,
-) -> Vec<DocxBlockPart> {
+fn parse_docx_block_parts(xml: &str, rel_to_media: &HashMap<String, String>) -> Vec<DocxBlockPart> {
     let mut parts = Vec::new();
     let mut search_from = 0;
 
     while let Some((start, end, kind)) = find_next_docx_event(xml, search_from) {
-        if kind == "text" {
-            let text = normalize_text(&extract_text_runs(&xml[start..end]));
-            if !text.is_empty() {
-                parts.push(DocxBlockPart::Text(text));
+        match kind {
+            DocxEventKind::Text => {
+                let text = normalize_text(&extract_text_runs(&xml[start..end]));
+                if !text.is_empty() {
+                    parts.push(DocxBlockPart::Text(text));
+                }
             }
-        } else {
-            let rel_id_start = start + "r:embed=\"".len();
-            let Some(rel_id_end) = xml[rel_id_start..].find('"').map(|p| rel_id_start + p) else {
-                search_from = end;
-                continue;
-            };
-            let rel_id = &xml[rel_id_start..rel_id_end];
-            if let Some(media_path) = rel_to_media.get(rel_id) {
-                parts.push(DocxBlockPart::Image(media_path.clone()));
+            DocxEventKind::Image(rel_id) => {
+                if let Some(media_path) = rel_to_media.get(&rel_id) {
+                    parts.push(DocxBlockPart::Image(media_path.clone()));
+                }
             }
         }
         search_from = end;
@@ -1240,7 +1291,10 @@ fn build_docx_manual_occurrence_seeds_from_xml(
             let Some(open_end) = body_xml[start..].find('>').map(|end| start + end + 1) else {
                 break;
             };
-            let Some(close_start) = body_xml[open_end..].find("</w:p>").map(|end| open_end + end) else {
+            let Some(close_start) = body_xml[open_end..]
+                .find("</w:p>")
+                .map(|end| open_end + end)
+            else {
                 break;
             };
             let close_end = close_start + "</w:p>".len();
@@ -1288,7 +1342,10 @@ fn build_docx_manual_occurrence_seeds_from_xml(
         let Some(open_end) = body_xml[start..].find('>').map(|end| start + end + 1) else {
             break;
         };
-        let Some(close_start) = body_xml[open_end..].find("</w:tbl>").map(|end| open_end + end) else {
+        let Some(close_start) = body_xml[open_end..]
+            .find("</w:tbl>")
+            .map(|end| open_end + end)
+        else {
             break;
         };
         let close_end = close_start + "</w:tbl>".len();
@@ -1299,7 +1356,10 @@ fn build_docx_manual_occurrence_seeds_from_xml(
 
         let mut row_search = 0;
         while let Some(row_pos) = find_docx_open_tag(table_inner, row_search, "w:tr") {
-            let Some(row_open_end) = table_inner[row_pos..].find('>').map(|end| row_pos + end + 1) else {
+            let Some(row_open_end) = table_inner[row_pos..]
+                .find('>')
+                .map(|end| row_pos + end + 1)
+            else {
                 break;
             };
             let Some(row_close_start) = table_inner[row_open_end..]
@@ -1314,7 +1374,10 @@ fn build_docx_manual_occurrence_seeds_from_xml(
 
             let mut cell_search = 0;
             while let Some(cell_pos) = find_docx_open_tag(row_inner, cell_search, "w:tc") {
-                let Some(cell_open_end) = row_inner[cell_pos..].find('>').map(|end| cell_pos + end + 1) else {
+                let Some(cell_open_end) = row_inner[cell_pos..]
+                    .find('>')
+                    .map(|end| cell_pos + end + 1)
+                else {
                     break;
                 };
                 let Some(cell_close_start) = row_inner[cell_open_end..]
@@ -1616,14 +1679,7 @@ pub fn extract_and_save_docx_manual_visuals(
             let sha256 = sha256_hex(&bytes);
             saved_media.insert(
                 seed.media_path.clone(),
-                (
-                    rel_path,
-                    abs_path,
-                    mime_type,
-                    width,
-                    height,
-                    sha256,
-                ),
+                (rel_path, abs_path, mime_type, width, height, sha256),
             );
         }
 
@@ -2263,6 +2319,40 @@ mod tests {
     }
 
     #[test]
+    fn docx_image_context_recognizes_vml_imagedata_relation_ids() {
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId12" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/legacy.png"/>
+            </Relationships>
+        "#;
+        let document = r#"
+            <w:document>
+              <w:body>
+                <w:p><w:r><w:t>Before legacy screenshot</w:t></w:r></w:p>
+                <w:p>
+                  <w:r>
+                    <w:pict>
+                      <v:shape>
+                        <v:imagedata r:id="rId12" o:title="legacy"/>
+                      </v:shape>
+                    </w:pict>
+                  </w:r>
+                </w:p>
+                <w:p><w:r><w:t>After legacy screenshot</w:t></w:r></w:p>
+              </w:body>
+            </w:document>
+        "#;
+
+        let contexts = build_docx_media_context_map_from_xml(document, rels);
+        let ctx = contexts
+            .get("word/media/legacy.png")
+            .expect("VML image context should be keyed by canonical media path");
+
+        assert!(ctx.context_before.contains("Before legacy screenshot"));
+        assert!(ctx.context_after.contains("After legacy screenshot"));
+    }
+
+    #[test]
     fn pptx_image_context_uses_same_slide_text() {
         let rels = r#"
             <Relationships>
@@ -2399,6 +2489,46 @@ mod tests {
         assert_eq!(anchors[1].row_header_text, "保存");
         assert_eq!(anchors[1].table_text_snapshot, "保存 取消");
         assert_eq!(anchors[1].local_text_before, "取消");
+    }
+
+    #[test]
+    fn docx_manual_anchors_capture_vml_images_in_table_cells() {
+        let rels = r#"
+            <Relationships>
+              <Relationship Id="rId21" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/legacy-cell.png"/>
+            </Relationships>
+        "#;
+        let document = r#"
+            <w:document>
+              <w:body>
+                <w:tbl>
+                  <w:tr>
+                    <w:tc>
+                      <w:p>
+                        <w:r><w:t>Legacy cell visual</w:t></w:r>
+                        <w:r>
+                          <w:pict>
+                            <v:shape>
+                              <v:imagedata r:id="rId21" o:title="legacy-cell"/>
+                            </v:shape>
+                          </w:pict>
+                        </w:r>
+                      </w:p>
+                    </w:tc>
+                  </w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>
+        "#;
+
+        let anchors = build_docx_manual_occurrence_seeds_from_xml(document, rels);
+
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].media_path, "word/media/legacy-cell.png");
+        assert_eq!(anchors[0].container_kind, "table_cell");
+        assert_eq!(anchors[0].row_index, Some(0));
+        assert_eq!(anchors[0].col_index, Some(0));
+        assert_eq!(anchors[0].local_text_before, "Legacy cell visual");
     }
 
     #[test]
